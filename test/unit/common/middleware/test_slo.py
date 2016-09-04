@@ -16,12 +16,15 @@
 
 from six.moves import range
 
+import base64
 import hashlib
 import json
 import time
 import unittest
+
 from mock import patch
 from StringIO import StringIO
+
 from swift.common import swob, utils
 from swift.common.exceptions import ListingIterError, SegmentError
 from swift.common.header_key_dict import HeaderKeyDict
@@ -503,6 +506,90 @@ class TestSloPutManifest(SloTestCase):
             self.slo.handle_multipart_put(req, fake_start_response)
         self.assertEqual(catcher.exception.status_int, 400)
 
+    def test_handle_multipart_put_invalid_preamble(self):
+        test_json_data = json.dumps([{'path': '/cont/object',
+                                      'etag': 'etagoftheobjectsegment',
+                                      'size_bytes': 100,
+                                      'preamble': 'invalid'}])
+        req = Request.blank('/v1/a/c/o', body=test_json_data)
+        with self.assertRaises(HTTPException) as catcher:
+            self.slo.handle_multipart_put(req, fake_start_response)
+        self.assertEqual(catcher.exception.status_int, 400)
+
+        test_json_data = json.dumps([{'path': '/cont/object',
+                                      'etag': 'etagoftheobjectsegment',
+                                      'size_bytes': 100,
+                                      'preamble': 12345}])
+        req = Request.blank('/v1/a/c/o', body=test_json_data)
+        with self.assertRaises(HTTPException) as catcher:
+            self.slo.handle_multipart_put(req, fake_start_response)
+        self.assertEqual(catcher.exception.status_int, 400)
+
+    def test_handle_multipart_put_invalid_postamble(self):
+        test_json_data = json.dumps([{'path': '/cont/object',
+                                      'etag': 'etagoftheobjectsegment',
+                                      'size_bytes': 100,
+                                      'postamble': 'invalid'}])
+        req = Request.blank('/v1/a/c/o', body=test_json_data)
+        with self.assertRaises(HTTPException) as catcher:
+            self.slo.handle_multipart_put(req, fake_start_response)
+        self.assertEqual(catcher.exception.status_int, 400)
+
+        test_json_data = json.dumps([{'path': '/cont/object',
+                                      'etag': 'etagoftheobjectsegment',
+                                      'size_bytes': 100,
+                                      'postamble': 0}])
+        req = Request.blank('/v1/a/c/o', body=test_json_data)
+        with self.assertRaises(HTTPException) as catcher:
+            self.slo.handle_multipart_put(req, fake_start_response)
+        self.assertEqual(catcher.exception.status_int, 400)
+
+    def test_handle_multipart_put_empty_preamble(self):
+        # covers empty preamble and 1st way to produce empty valid b64decode
+        test_json_data = json.dumps([{'path': '/cont/object',
+                                      'etag': 'etagoftheobjectsegment',
+                                      'size_bytes': 100,
+                                      'preamble': b''}])
+        req = Request.blank(
+            '/v1/AUTH_test/c/man?multipart-manifest=put',
+            environ={'REQUEST_METHOD': 'PUT'}, body=test_json_data)
+        status, headers, body = self.call_slo(req)
+
+        # go behind SLO's back and see what actually got stored
+        req = Request.blank(
+            # this string looks weird, but it's just an artifact
+            # of FakeSwift
+            '/v1/AUTH_test/c/man?multipart-manifest=put',
+            environ={'REQUEST_METHOD': 'GET'})
+        status, headers, body = self.call_app(req)
+        headers = dict(headers)
+        manifest_data = json.loads(body)
+        self.assertEqual(len(manifest_data), 1)
+        self.assertNotIn('preamble', manifest_data[0])
+
+    def test_handle_multipart_put_empty_postamble(self):
+        # covers empty postamble and 2nd way to produce empty valid b64decode
+        test_json_data = json.dumps([{'path': '/cont/object',
+                                      'etag': 'etagoftheobjectsegment',
+                                      'size_bytes': 100,
+                                      'postamble': b'==='}])
+        req = Request.blank(
+            '/v1/AUTH_test/c/man?multipart-manifest=put',
+            environ={'REQUEST_METHOD': 'PUT'}, body=test_json_data)
+        status, headers, body = self.call_slo(req)
+
+        # go behind SLO's back and see what actually got stored
+        req = Request.blank(
+            # this string looks weird, but it's just an artifact
+            # of FakeSwift
+            '/v1/AUTH_test/c/man?multipart-manifest=put',
+            environ={'REQUEST_METHOD': 'GET'})
+        status, headers, body = self.call_app(req)
+        headers = dict(headers)
+        manifest_data = json.loads(body)
+        self.assertEqual(len(manifest_data), 1)
+        self.assertNotIn('postamble', manifest_data[0])
+
     def test_handle_multipart_put_success_unicode(self):
         test_json_data = json.dumps([{'path': u'/cont/object\u2661',
                                       'etag': 'etagoftheobjectsegment',
@@ -686,6 +773,100 @@ class TestSloPutManifest(SloTestCase):
         manifest_data = json.loads(body)
         self.assertEqual('a', manifest_data[0]['hash'])
         self.assertEqual('b', manifest_data[1]['hash'])
+
+    def test_handle_multipart_put_zero_byte_pre_okay(self):
+        """
+        Test that zero byte segments are accepted in an SLO manifest when
+        preamble data is also provided
+        """
+        test_json_pre_data = json.dumps([{
+            'path': '/cont/empty_object',
+            'preamble': base64.b64encode('pre')
+        }])
+        req = Request.blank(
+            '/v1/AUTH_test/c/man?multipart-manifest=put',
+            environ={'REQUEST_METHOD': 'PUT'},
+            body=test_json_pre_data
+        )
+        status, headers, body = self.call_slo(req)
+        self.assertEqual(self.app.call_count, 2)
+
+        # go behind SLO's back and see what actually got stored
+        req = Request.blank(
+            # this string looks weird, but it's just an artifact
+            # of FakeSwift
+            '/v1/AUTH_test/c/man?multipart-manifest=put',
+            environ={'REQUEST_METHOD': 'GET'})
+        status, headers, body = self.call_app(req)
+        headers = dict(headers)
+        print(status)
+        manifest_data = json.loads(body)
+        self.assertTrue(headers['Content-Type'].endswith(';swift_bytes=3'))
+        self.assertEqual(len(manifest_data), 1)
+        self.assertEqual(manifest_data[0]['bytes'], 0)
+
+    def test_handle_multipart_put_zero_byte_post_okay(self):
+        """
+        Test that zero byte segments are accepted in an SLO manifest when
+        postamble data is also provided
+        """
+        test_json_post_data = json.dumps([{
+            'path': '/cont/empty_object',
+            'postamble': base64.b64encode('post')
+        }])
+        req = Request.blank(
+            '/v1/AUTH_test/c/man?multipart-manifest=put',
+            environ={'REQUEST_METHOD': 'PUT'},
+            body=test_json_post_data
+        )
+        status, headers, body = self.call_slo(req)
+        self.assertEqual(self.app.call_count, 2)
+
+        # go behind SLO's back and see what actually got stored
+        req = Request.blank(
+            # this string looks weird, but it's just an artifact
+            # of FakeSwift
+            '/v1/AUTH_test/c/man?multipart-manifest=put',
+            environ={'REQUEST_METHOD': 'GET'})
+        status, headers, body = self.call_app(req)
+        headers = dict(headers)
+        print(status)
+        manifest_data = json.loads(body)
+        self.assertTrue(headers['Content-Type'].endswith(';swift_bytes=4'))
+        self.assertEqual(len(manifest_data), 1)
+        self.assertEqual(manifest_data[0]['bytes'], 0)
+
+    def test_handle_multipart_put_zero_byte_pre_post_okay(self):
+        """
+        Test that zero byte segments are accepted in an SLO manifest when
+        pre & postamble data is also provided
+        """
+        test_json_pre_post_data = json.dumps([{
+            'path': '/cont/empty_object',
+            'preamble': base64.b64encode('pre'),
+            'postamble': base64.b64encode('post')
+        }])
+        req = Request.blank(
+            '/v1/AUTH_test/c/man?multipart-manifest=put',
+            environ={'REQUEST_METHOD': 'PUT'},
+            body=test_json_pre_post_data
+        )
+        status, headers, body = self.call_slo(req)
+        self.assertEqual(self.app.call_count, 2)
+
+        # go behind SLO's back and see what actually got stored
+        req = Request.blank(
+            # this string looks weird, but it's just an artifact
+            # of FakeSwift
+            '/v1/AUTH_test/c/man?multipart-manifest=put',
+            environ={'REQUEST_METHOD': 'GET'})
+        status, headers, body = self.call_app(req)
+        headers = dict(headers)
+        print(status)
+        manifest_data = json.loads(body)
+        self.assertTrue(headers['Content-Type'].endswith(';swift_bytes=7'))
+        self.assertEqual(len(manifest_data), 1)
+        self.assertEqual(manifest_data[0]['bytes'], 0)
 
     def test_handle_unsatisfiable_ranges(self):
         bad_data = json.dumps(
@@ -2160,8 +2341,10 @@ class TestSloGetManifest(SloTestCase):
             'bytes=0-3,8-11'])
         # we set swift.source for everything but the first request
         self.assertIsNone(self.app.swift_sources[0])
-        self.assertEqual(self.app.swift_sources[1:],
-                         ['SLO'] * (len(self.app.swift_sources) - 1))
+        self.assertEqual(
+            self.app.swift_sources[1:],
+            ['SLO'] * (len(self.app.swift_sources) - 1)
+        )
         self.assertEqual(md5hex(''.join([
             md5hex('a' * 5), ':0-3;',
             md5hex('a' * 5), ':1-4;',
@@ -2825,6 +3008,297 @@ class TestSloGetManifest(SloTestCase):
         self.assertEqual(len(error_lines), 1)
         self.assertTrue(error_lines[0].startswith(
             'ERROR: An error occurred while retrieving segments'))
+
+    def test_single_segment_preamble(self):
+        slo_etag = md5hex(
+            md5hex('preamble') +
+            md5hex('a' * 5)
+        )
+        preamble = base64.b64encode('preamble')
+        self.app.register(
+            'GET', '/v1/AUTH_test/gettest/manifest-single-preamble',
+            swob.HTTPOk,
+            {
+                'Content-Type': 'application/json',
+                'X-Static-Large-Object': 'true'
+            },
+            json.dumps([{
+                'name': '/gettest/a_5',
+                'hash': md5hex('a' * 5),
+                'content_type': 'text/plain',
+                'bytes': '5',
+                'preamble': preamble
+            }])
+        )
+
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-single-preamble',
+            environ={'REQUEST_METHOD': 'GET'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('200 OK', status)
+        self.assertEqual(body, 'preambleaaaaa')
+        self.assertIn(('Etag', '"%s"' % slo_etag), headers)
+        self.assertIn(('Content-Length', '13'), headers)
+
+    def test_single_segment_preamble_empty_postamble(self):
+        slo_etag = md5hex(
+            md5hex('preamble') +
+            md5hex('a' * 5)
+        )
+        preamble = base64.b64encode('preamble')
+        postamble = base64.b64encode('')
+        self.app.register(
+            'GET', '/v1/AUTH_test/gettest/manifest-single-preamble',
+            swob.HTTPOk,
+            {
+                'Content-Type': 'application/json',
+                'X-Static-Large-Object': 'true'
+            },
+            json.dumps([{
+                'name': '/gettest/a_5',
+                'hash': md5hex('a' * 5),
+                'content_type': 'text/plain',
+                'bytes': '5',
+                'preamble': preamble,
+                'postamble': postamble
+            }])
+        )
+
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-single-preamble',
+            environ={'REQUEST_METHOD': 'GET'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('200 OK', status)
+        self.assertEqual(body, 'preambleaaaaa')
+        self.assertIn(('Etag', '"%s"' % slo_etag), headers)
+        self.assertIn(('Content-Length', '13'), headers)
+
+    def test_single_segment_postamble(self):
+        slo_etag = md5hex(
+            md5hex('a' * 5) +
+            md5hex('postamble')
+        )
+        postamble = base64.b64encode('postamble')
+        self.app.register(
+            'GET', '/v1/AUTH_test/gettest/manifest-single-postamble',
+            swob.HTTPOk,
+            {
+                'Content-Type': 'application/json',
+                'X-Static-Large-Object': 'true'
+            },
+            json.dumps([{
+                'name': '/gettest/a_5',
+                'hash': md5hex('a' * 5),
+                'content_type': 'text/plain',
+                'bytes': '5',
+                'postamble': postamble
+            }])
+        )
+
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-single-postamble',
+            environ={'REQUEST_METHOD': 'GET'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('200 OK', status)
+        self.assertEqual(body, 'aaaaapostamble')
+        self.assertIn(('Etag', '"%s"' % slo_etag), headers)
+        self.assertIn(('Content-Length', '14'), headers)
+
+    def test_single_segment_pre_and_postamble(self):
+        slo_etag = md5hex(
+            md5hex('preamble') +
+            md5hex('a' * 5) +
+            md5hex('postamble')
+        )
+        preamble = base64.b64encode('preamble')
+        postamble = base64.b64encode('postamble')
+        self.app.register(
+            'GET', '/v1/AUTH_test/gettest/manifest-single-prepostamble',
+            swob.HTTPOk,
+            {
+                'Content-Type': 'application/json',
+                'X-Static-Large-Object': 'true'
+            },
+            json.dumps([{
+                'name': '/gettest/a_5',
+                'hash': md5hex('a' * 5),
+                'content_type': 'text/plain',
+                'bytes': '5',
+                'preamble': preamble,
+                'postamble': postamble
+            }])
+        )
+
+        # Test the whole SLO
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-single-prepostamble',
+            environ={'REQUEST_METHOD': 'GET'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('200 OK', status)
+        self.assertEqual(body, 'preambleaaaaapostamble')
+        self.assertIn(('Etag', '"%s"' % slo_etag), headers)
+        self.assertIn(('Content-Length', '22'), headers)
+
+        # Test complete preamble only
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-single-prepostamble',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Range': 'bytes=0-7'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('206 Partial Content', status)
+        self.assertEqual(body, 'preamble')
+
+        # Test range within preamble only
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-single-prepostamble',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Range': 'bytes=1-5'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('206 Partial Content', status)
+        self.assertEqual(body, 'reamb')
+
+        # Test complete postamble only
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-single-prepostamble',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Range': 'bytes=13-21'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('206 Partial Content', status)
+        self.assertEqual(body, 'postamble')
+
+        # Test partial pre and postamble
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-single-prepostamble',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Range': 'bytes=4-16'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('206 Partial Content', status)
+        self.assertEqual(body, 'mbleaaaaapost')
+
+        # Test partial preamble and first byte of data
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-single-prepostamble',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Range': 'bytes=1-8'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('206 Partial Content', status)
+        self.assertEqual(body, 'reamblea')
+
+        # Test last byte of segment data and partial postamble
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-single-prepostamble',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Range': 'bytes=12-16'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('206 Partial Content', status)
+        self.assertEqual(body, 'apost')
+
+    def test_multi_segment_pre_and_postamble(self):
+        slo_etag = md5hex(
+            md5hex('ABCDEF') +
+            md5hex('a' * 5) +
+            md5hex('123456') +
+            md5hex('GHIJKL') +
+            md5hex('b' * 10) +
+            md5hex('7890@#')
+        )
+        self.app.register(
+            'GET', '/v1/AUTH_test/gettest/manifest-multi-prepostamble',
+            swob.HTTPOk,
+            {
+                'Content-Type': 'application/json',
+                'X-Static-Large-Object': 'true'
+            },
+            json.dumps([
+                {
+                    'name': '/gettest/a_5',
+                    'hash': md5hex('a' * 5),
+                    'content_type': 'text/plain',
+                    'bytes': '5',
+                    'preamble': base64.b64encode('ABCDEF'),
+                    'postamble': base64.b64encode('123456')
+                },
+                {
+                    'name': '/gettest/b_10',
+                    'hash': md5hex('b' * 10),
+                    'content_type': 'text/plain',
+                    'bytes': '10',
+                    'preamble': base64.b64encode('GHIJKL'),
+                    'postamble': base64.b64encode('7890@#')
+                }
+            ])
+        )
+
+        # Test the whole SLO
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-multi-prepostamble',
+            environ={'REQUEST_METHOD': 'GET'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('200 OK', status)
+        self.assertEqual(body, 'ABCDEFaaaaa123456GHIJKLbbbbbbbbbb7890@#')
+        self.assertIn(('Etag', '"%s"' % slo_etag), headers)
+        self.assertIn(('Content-Length', '39'), headers)
+
+        # Test last byte first pre-amble to first byte of second postamble
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-multi-prepostamble',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Range': 'bytes=5-33'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('206 Partial Content', status)
+        self.assertEqual(body, 'Faaaaa123456GHIJKLbbbbbbbbbb7')
+
+        # Test only second complete preamble
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-multi-prepostamble',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Range': 'bytes=17-22'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('206 Partial Content', status)
+        self.assertEqual(body, 'GHIJKL')
+
+        # Test only first complete postamble
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-multi-prepostamble',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Range': 'bytes=11-16'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('206 Partial Content', status)
+        self.assertEqual(body, '123456')
+
+        # Test only range within first postamble
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-multi-prepostamble',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Range': 'bytes=12-15'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('206 Partial Content', status)
+        self.assertEqual(body, '2345')
+
+        # Test only range within first postamble and second preamble
+        req = Request.blank(
+            '/v1/AUTH_test/gettest/manifest-multi-prepostamble',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers={'Range': 'bytes=12-18'})
+        status, headers, body = self.call_slo(req)
+
+        self.assertEqual('206 Partial Content', status)
+        self.assertEqual(body, '23456GH')
 
 
 class TestSloConditionalGetOldManifest(SloTestCase):

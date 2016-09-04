@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import email.parser
 import hashlib
 import itertools
@@ -205,6 +206,21 @@ class TestSloEnv(BaseEnv):
                 {'path': seg_info['seg_b']['path'], 'etag': None,
                  'size_bytes': None, 'range': '-1048578'},
             ]), parms={'multipart-manifest': 'put'})
+
+        file_item = cls.container.file("pre-postamble-manifest")
+        file_item.write(
+            json.dumps([
+                {'path': seg_info['seg_a']['path'], 'etag': None,
+                 'size_bytes': None, 'preamble': base64.b64encode('APRE' * 8),
+                 'postamble': base64.b64encode('APOS' * 16)},
+                {'path': seg_info['seg_b']['path'], 'etag': None,
+                 'size_bytes': None,
+                 'postamble': base64.b64encode('BPOS' * 32)},
+                {'path': seg_info['seg_c']['path'], 'etag': None,
+                 'size_bytes': None,
+                 'preamble': base64.b64encode('CPRE' * 64)},
+            ]), parms={'multipart-manifest': 'put'}
+        )
 
 
 class TestSlo(Base):
@@ -672,6 +688,25 @@ class TestSlo(Base):
         self.assertEqual('application/octet-stream', actual['content_type'])
         self.assertEqual(copied.etag, actual['hash'])
 
+        # Test copy manifest including pre/post-ambles
+        source = self.env.container.file("pre-postamble-manifest")
+        source_contents = source.read(parms={'multipart-manifest': 'get'})
+        source_json = json.loads(source_contents)
+        source.copy(
+            self.env.container.name,
+            "copied-pre-postamble-manifest",
+            parms={'multipart-manifest': 'get'})
+
+        copied = self.env.container.file("copied-pre-postamble-manifest")
+        copied_contents = copied.read(parms={'multipart-manifest': 'get'})
+        try:
+            copied_json = json.loads(copied_contents)
+        except ValueError:
+            self.fail("COPY didn't copy the manifest (invalid json on GET)")
+        self.assertEqual(source_contents, copied_contents)
+        self.assertIn('preamble', copied_json[0])
+        self.assertIn('postamble', copied_json[0])
+
     def test_slo_copy_the_manifest_updating_metadata(self):
         source = self.env.container.file("manifest-abcde")
         source.content_type = 'application/octet-stream'
@@ -1010,6 +1045,32 @@ class TestSlo(Base):
         self.assertEqual('b', contents[1024 * 1024])
         self.assertEqual('d', contents[-2])
         self.assertEqual('e', contents[-1])
+
+    def test_slo_pre_post_amble(self):
+        # len('APRE' * 8) == 32
+        # len('APOS' * 16) == 64
+        # len('BPOS' * 32) == 128
+        # len('CPRE' * 64) == 256
+        # len(a_pre + seg_a + post_a) == 32 + 1024 ** 2 + 64
+        # len(seg_b + post_b) == 1024 ** 2 + 128
+        # len(c_pre + seg_c) == 256 + 1024 ** 2
+        # len(total) == 3146208
+
+        file_item = self.env.container.file("pre-postamble-manifest")
+        file_contents = file_item.read(size=3 * 1024 ** 2 + 256,
+                                       offset=28)
+        self.assertEqual('APRE', file_contents[0:4])
+        self.assertEqual('a', file_contents[4])
+        self.assertEqual('a', file_contents[1024 ** 2 + 4 - 1])
+        self.assertEqual('APOS', file_contents[1024 ** 2 + 4:1024 ** 2 + 8])
+        self.assertEqual('b', file_contents[1024 ** 2 + 68])
+        self.assertEqual('b', file_contents[2 * 1024 ** 2 + 68 - 1])
+        self.assertEqual(
+            'BPOS', file_contents[2 * 1024 ** 2 + 68:2 * 1024 ** 2 + 72])
+        self.assertEqual(
+            'CPRE', file_contents[2 * 1024 ** 2 + 196:2 * 1024 ** 2 + 200])
+        self.assertEqual('c', file_contents[2 * 1024 ** 2 + 452])
+        self.assertEqual('c', file_contents[-1])
 
 
 class TestSloUTF8(Base2, TestSlo):
