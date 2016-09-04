@@ -22,26 +22,30 @@ from swob in here without creating circular imports.
 
 import hashlib
 import itertools
+import six
 import sys
 import time
 
-import six
 from six.moves.urllib.parse import unquote
-from swift.common.header_key_dict import HeaderKeyDict
 
-from swift import gettext_ as _
-from swift.common.storage_policy import POLICIES
 from swift.common.constraints import FORMAT2CONTENT_TYPE
 from swift.common.exceptions import ListingIterError, SegmentError
+from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.http import is_success
-from swift.common.swob import HTTPBadRequest, HTTPNotAcceptable, \
-    HTTPServiceUnavailable, Range, is_chunked, multi_range_iterator
-from swift.common.utils import split_path, validate_device_partition, \
-    close_if_possible, maybe_multipart_byteranges_to_document_iters, \
-    multipart_byteranges_to_document_iters, parse_content_type, \
+from swift.common.storage_policy import POLICIES
+from swift.common.swob import (
+    HTTPBadRequest, HTTPNotAcceptable, HTTPServiceUnavailable, Range,
+    is_chunked, multi_range_iterator
+)
+from swift.common.utils import (
+    split_path, validate_device_partition, close_if_possible,
+    maybe_multipart_byteranges_to_document_iters,
+    multipart_byteranges_to_document_iters, parse_content_type,
     parse_content_range, csv_append, list_from_csv, Spliterator
-
+)
 from swift.common.wsgi import make_subrequest
+
+from swift import gettext_ as _
 
 
 OBJECT_TRANSIENT_SYSMETA_PREFIX = 'x-object-transient-sysmeta-'
@@ -305,16 +309,20 @@ class SegmentedIterable(object):
     :param req: original request object
     :param app: WSGI application from which segments will come
 
-    :param listing_iter: iterable yielding the object segments to fetch,
-        along with the byte subranges to fetch, in the form of a 5-tuple
-        (object-path, object-etag, object-size, first-byte, last-byte).
+    :param listing_iter: iterable yielding dicts describing the object
+        segments to fetch, and containing the following keys: ['path',
+        'hash', 'bytes', 'first-byte', 'last-byte', 'preamble', 'postamble']
 
-        If object-etag is None, no MD5 verification will be done.
+        If seg_dict['hash'] is None, no MD5 verification will be done.
 
-        If object-size is None, no length verification will be done.
+        If seg_dict['bytes'] is None, no length verification will be done.
 
-        If first-byte and last-byte are None, then the entire object will be
-        fetched.
+        If seg_dict['first-byte'] and seg_dict['last-byte'] are None, then
+        the entire object will be fetched.
+
+        if seg_dict['preamble'] or seg_dict['postamble'] are not None, then
+        the object will be prefixed by the preamble data, and suffixed by the
+        postamble data.
 
     :param max_get_time: maximum permitted duration of a GET request (seconds)
     :param logger: logger object
@@ -343,22 +351,28 @@ class SegmentedIterable(object):
         self.validated_first_segment = False
         self.current_resp = None
 
-    def _coalesce_requests(self):
-        start_time = time.time()
+    def _coalescing_iter(self):
+        """
+        The _coalescing_iter is responsible for combining sequential range
+        requests into the same object into a single request where possible.
+        Note that coalescing requests to the same object may not be possible
+        depending on the presence of pre/post amble data, or when the number
+        of ranges would cause the request to fail
+        """
         pending_req = None
-        pending_etag = None
-        pending_size = None
+        pending_dict = None
+
         try:
-            for seg_path, seg_etag, seg_size, first_byte, last_byte \
-                    in self.listing_iter:
-                first_byte = first_byte or 0
-                go_to_end = last_byte is None or (
-                    seg_size is not None and last_byte == seg_size - 1)
-                if time.time() - start_time > self.max_get_time:
-                    raise SegmentError(
-                        'ERROR: While processing manifest %s, '
-                        'max LO GET time of %ds exceeded' %
-                        (self.name, self.max_get_time))
+            for seg_dict in self.listing_iter:
+                seg_path = seg_dict['path']
+                seg_size = seg_dict.get('bytes')
+                if seg_size is not None:
+                    seg_size = int(seg_size)
+                first_byte = seg_dict.get('first_byte') or 0
+                last_byte = seg_dict.get('last_byte')
+                seg_preamble = seg_dict.get('preamble')
+                seg_postamble = seg_dict.get('postamble')
+
                 # The "multipart-manifest=get" query param ensures that the
                 # segment is a plain old object, not some flavor of large
                 # object; therefore, its etag is its MD5sum and hence we can
@@ -366,22 +380,42 @@ class SegmentedIterable(object):
                 path = seg_path + '?multipart-manifest=get'
                 seg_req = make_subrequest(
                     self.req.environ, path=path, method='GET',
-                    headers={'x-auth-token': self.req.headers.get(
-                        'x-auth-token')},
+                    headers={
+                        'x-auth-token': self.req.headers.get('x-auth-token')
+                    },
                     agent=('%(orig)s ' + self.ua_suffix),
-                    swift_source=self.swift_source)
+                    swift_source=self.swift_source
+                )
 
-                seg_req_rangeval = None
-                if first_byte != 0 or not go_to_end:
-                    seg_req_rangeval = "%s-%s" % (
-                        first_byte, '' if go_to_end else last_byte)
-                    seg_req.headers['Range'] = "bytes=" + seg_req_rangeval
+                # Only add a range here if we can potentially coalesce the
+                # requests. Otherwise, let the pre_post_amble_iter handle it
+                # later and let it deal with calculating the ranges within the
+                # segment after the preamble and postamble sizes are factored
+                # in.
+                if not seg_preamble and not seg_postamble:
+                    go_to_end = (
+                        last_byte is None or
+                        (seg_size is not None and last_byte == seg_size - 1)
+                    )
+                    seg_req_rangeval = None
+                    if first_byte != 0 or not go_to_end:
+                        seg_req_rangeval = "%s-%s" % (
+                            first_byte, '' if go_to_end else last_byte
+                        )
+                        seg_req.headers['Range'] = "bytes=" + seg_req_rangeval
 
-                # We can only coalesce if paths match and we know the segment
-                # size (so we can check that the ranges will be allowed)
-                if pending_req and pending_req.path == seg_req.path and \
-                        seg_size is not None:
-
+                # We can only coalesce if
+                #  - there is no segment preamble
+                #  - there is no segment postamble
+                #  - we have a previous request and the paths match
+                #  - we know the segment size (so we can validate the ranges)
+                can_coalesce = (
+                    not seg_preamble and
+                    not seg_postamble and
+                    (pending_req and pending_req.path == seg_req.path) and
+                    seg_size is not None
+                )
+                if can_coalesce:
                     # Make a new Range object so that we don't goof up the
                     # existing one in case of invalid ranges. Note that a
                     # range set with too many individual byteranges is
@@ -397,6 +431,7 @@ class SegmentedIterable(object):
                     else:
                         new_range_str += ",0-%d" % (seg_size - 1)
 
+                    # Try to make a range object with the extended range
                     if Range(new_range_str).ranges_for_length(seg_size):
                         # Good news! We can coalesce the requests
                         pending_req.headers['Range'] = new_range_str
@@ -404,104 +439,341 @@ class SegmentedIterable(object):
                     # else, Too many ranges, or too much backtracking, or ...
 
                 if pending_req:
-                    yield pending_req, pending_etag, pending_size
+                    yield pending_req, pending_dict
+
                 pending_req = seg_req
-                pending_etag = seg_etag
-                pending_size = seg_size
+                pending_dict = seg_dict
 
         except ListingIterError:
             e_type, e_value, e_traceback = sys.exc_info()
-            if time.time() - start_time > self.max_get_time:
-                raise SegmentError(
-                    'ERROR: While processing manifest %s, '
-                    'max LO GET time of %ds exceeded' %
-                    (self.name, self.max_get_time))
             if pending_req:
-                yield pending_req, pending_etag, pending_size
+                yield pending_req, seg_dict
             six.reraise(e_type, e_value, e_traceback)
 
-        if time.time() - start_time > self.max_get_time:
-            raise SegmentError(
-                'ERROR: While processing manifest %s, '
-                'max LO GET time of %ds exceeded' %
-                (self.name, self.max_get_time))
         if pending_req:
-            yield pending_req, pending_etag, pending_size
+            yield pending_req, pending_dict
 
-    def _internal_iter(self):
+    def _pre_post_amble_iter(self):
+        """
+        The _pre_post_amble_iter is responsible for yielding data from segment
+        preambles, segment objects, and from segment postambles. Given a
+        first_byte and last_byte in each segment dict, the _pre_post_amble_iter
+        yields the appropriate range within preamble + segment_data + postamble
+
+        The _pre_post_amble_iter wraps the _coalescing_iter so that segment
+        requests are combined where possible
+        """
         bytes_left = self.response_body_length
 
-        try:
-            for seg_req, seg_etag, seg_size in self._coalesce_requests():
+        for seg_req, seg_dict in self._coalescing_iter():
+            seg_path = seg_dict['path']
+            seg_etag = seg_dict.get('hash')
+            seg_size = seg_dict.get('bytes')
+            if seg_size is not None:
+                seg_size = int(seg_size)
+            first_byte = seg_dict.get('first_byte') or 0
+            last_byte = seg_dict.get('last_byte')
+            preamble = seg_dict.get('preamble', b'')
+            preamble_size = len(preamble)
+            postamble = seg_dict.get('postamble', b'')
+            postamble_size = len(postamble)
+
+            # Handle any bytes required from the tar header
+            if first_byte < preamble_size:
+                first_preamble_byte = first_byte
+                if last_byte is None:
+                    last_preamble_byte = preamble_size
+                else:
+                    last_preamble_byte = min(last_byte + 1, preamble_size)
+                if (last_preamble_byte - first_preamble_byte) > 0:
+                    preamble_data = preamble[
+                        first_preamble_byte:last_preamble_byte
+                    ]
+                    if bytes_left is not None:
+                        bytes_left -= len(preamble_data)
+                    yield preamble_data
+
+            # Break the loop if we already have everything we need
+            if last_byte is not None and last_byte < preamble_size:
+                continue
+
+            if bytes_left is not None and bytes_left <= 0:
+                continue
+
+            # Handle bytes required from the object itself.
+            # If we've already coalesced this request, then we know
+            # that no pre/postamble handling is required and the range
+            # header has already been dealt with.
+            go_to_end = (
+                last_byte is None or
+                (seg_size is not None and last_byte == seg_size - 1)
+            )
+            handle_segment_range = (
+                seg_req.headers.get('Range') is None and
+                not go_to_end
+            )
+            first_seg_byte = None
+            if handle_segment_range:
+                first_seg_byte = max(0, first_byte - preamble_size)
+                last_seg_byte = None
+                if last_byte is not None:
+                    last_seg_byte = max(0, last_byte - preamble_size)
+                if seg_size is not None and last_seg_byte is not None:
+                    last_seg_byte = min(last_seg_byte, seg_size - 1)
+
+                # We really need to exit here or risk making requests
+                # for segment data that return 416. When dealing with
+                # pre/postambles and range requests we just have to know
+                # the size of the segment.
+                cannot_make_range_request = (
+                    seg_size is None and
+                    first_seg_byte and
+                    (preamble or postamble)
+                )
+                if cannot_make_range_request:
+                    raise SegmentError(
+                        'ERROR: While processing manifest %s, '
+                        'Cannot omit segment size when specifying preamble '
+                        'or postamble' % self.name
+                    )
+
+                add_range = first_seg_byte > 0 or last_seg_byte is not None
+                if add_range:
+                    if last_seg_byte is None:
+                        last_seg_byte = ''
+                    else:
+                        last_seg_byte_is_end = (
+                            seg_size is not None and
+                            last_seg_byte == seg_size - 1
+                        )
+                        if last_seg_byte_is_end:
+                            last_seg_byte = ''
+
+                    seg_range_val = "%s-%s" % (first_seg_byte, last_seg_byte)
+                    seg_req.headers['Range'] = "bytes=%s" % seg_range_val
+
+            # Don't make unnecessary requests that we never read from.
+            # Unspecified segment size means we have to try anyway.
+            # If the segment size is given we can decide whether to perform
+            # the request by making sure that the requested range lies within
+            # the segment body
+            segment_bytes_served = 0
+            segment_request_required = (
+                seg_size is None or
+                (
+                    (
+                        first_seg_byte is not None and
+                        first_seg_byte < seg_size
+                    ) or
+                    (
+                        first_byte < preamble_size + seg_size and
+                        (
+                            last_byte is None or
+                            last_byte >= preamble_size
+                        )
+                    )
+                )
+            )
+            if segment_request_required:
                 seg_resp = seg_req.get_response(self.app)
+                self.current_resp = seg_resp
+
                 if not is_success(seg_resp.status_int):
                     close_if_possible(seg_resp.app_iter)
                     raise SegmentError(
                         'ERROR: While processing manifest %s, '
                         'got %d while retrieving %s' %
-                        (self.name, seg_resp.status_int, seg_req.path))
+                        (
+                            self.name,
+                            seg_resp.status_int,
+                            seg_path
+                        )
+                    )
 
-                elif ((seg_etag and (seg_resp.etag != seg_etag)) or
-                        (seg_size and (seg_resp.content_length != seg_size) and
-                         not seg_req.range)):
-                    # The content-length check is for security reasons. Seems
-                    # possible that an attacker could upload a >1mb object and
-                    # then replace it with a much smaller object with same
-                    # etag. Then create a big nested SLO that calls that
-                    # object many times which would hammer our obj servers. If
-                    # this is a range request, don't check content-length
-                    # because it won't match.
+                # The content-length check is for security reasons. It
+                # seems possible that an attacker could upload a >1MiB
+                # object and then replace it with a much smaller object
+                # with the same etag. They could then create a big
+                # nested SLO that calls that object many times which
+                # would hammer the object servers.
+                # If this is a range request, don't check content-length
+                # because it won't match.
+                segment_invalid = (
+                    (
+                        seg_etag is not None and
+                        (seg_resp.etag != seg_etag)
+                    ) or
+                    (
+                        seg_size is not None and
+                        (seg_resp.content_length != seg_size) and
+                        seg_req.headers.get('Range') is None
+                    )
+                )
+                if segment_invalid:
                     close_if_possible(seg_resp.app_iter)
                     raise SegmentError(
-                        'Object segment no longer valid: '
-                        '%(path)s etag: %(r_etag)s != %(s_etag)s or '
+                        'Sub-Object no longer valid: '
+                        '%(name)s etag: %(r_etag)s != %(s_etag)s or '
                         '%(r_size)s != %(s_size)s.' %
-                        {'path': seg_req.path, 'r_etag': seg_resp.etag,
-                         'r_size': seg_resp.content_length,
-                         's_etag': seg_etag,
-                         's_size': seg_size})
-                else:
-                    self.current_resp = seg_resp
+                        {
+                            'name': seg_req.path,
+                            'r_etag': seg_resp.etag,
+                            'r_size': seg_resp.content_length,
+                            's_etag': seg_etag,
+                            's_size': seg_size
+                        }
+                    )
 
                 seg_hash = None
                 if seg_resp.etag and not seg_req.headers.get('Range'):
-                    # Only calculate the MD5 if it we can use it to validate
+                    # Only calculate the MD5 if we can use it to validate
                     seg_hash = hashlib.md5()
 
-                document_iters = maybe_multipart_byteranges_to_document_iters(
+                doc_iters = maybe_multipart_byteranges_to_document_iters(
                     seg_resp.app_iter,
                     seg_resp.headers['Content-Type'])
 
-                for chunk in itertools.chain.from_iterable(document_iters):
+                for chunk in itertools.chain.from_iterable(doc_iters):
                     if seg_hash:
                         seg_hash.update(chunk)
-
                     if bytes_left is None:
+                        segment_bytes_served += len(chunk)
                         yield chunk
                     elif bytes_left >= len(chunk):
                         yield chunk
+                        segment_bytes_served += len(chunk)
                         bytes_left -= len(chunk)
                     else:
                         yield chunk[:bytes_left]
+                        segment_bytes_served += len(chunk[:bytes_left])
                         bytes_left -= len(chunk)
-                        close_if_possible(seg_resp.app_iter)
                         raise SegmentError(
                             'Too many bytes for %(name)s; truncating in '
                             '%(seg)s with %(left)d bytes left' %
-                            {'name': self.name, 'seg': seg_req.path,
-                             'left': bytes_left})
+                            {
+                                'name': self.name, 'seg': seg_req.path,
+                                'left': bytes_left
+                            }
+                        )
+
                 close_if_possible(seg_resp.app_iter)
 
-                if seg_hash and seg_hash.hexdigest() != seg_resp.etag:
-                    raise SegmentError(
-                        "Bad MD5 checksum in %(name)s for %(seg)s: headers had"
-                        " %(etag)s, but object MD5 was actually %(actual)s" %
-                        {'seg': seg_req.path, 'etag': seg_resp.etag,
-                         'name': self.name, 'actual': seg_hash.hexdigest()})
+                # Validate the data we received against the response headers
+                if seg_resp is not None:
+                    etag_invalid = (
+                        seg_resp.etag and
+                        (
+                            # Only check the etag when no range is given
+                            seg_hash and
+                            (seg_hash.hexdigest() != seg_resp.etag)
+                        )
+                    )
+                    if etag_invalid:
+                        raise SegmentError(
+                            "Bad MD5 checksum in %(name)s for %(obj)s: "
+                            "headers had %(etag)s, but object MD5 was "
+                            "actually %(actual)s" %
+                            {
+                                'obj': seg_req.path,
+                                'etag': seg_resp.etag,
+                                'name': self.name,
+                                'actual': seg_hash.hexdigest()
+                            }
+                        )
 
-            if bytes_left:
+                    size_invalid = (
+                        first_seg_byte == 0 and
+                        last_seg_byte == '' and
+                        seg_resp.content_length and
+                        segment_bytes_served != seg_resp.content_length
+                    )
+                    if size_invalid:
+                        raise SegmentError(
+                            "Incorrect number of bytes received for %(name)s "
+                            "in %(obj)s: content_length header was %(length)s"
+                            ", but byte count received was actually %(actual)s"
+                            % {
+                                'obj': seg_req.path,
+                                'length': seg_resp.content_length,
+                                'name': self.name,
+                                'actual': segment_bytes_served
+                            }
+                        )
+
+            # Break the loop if we already have everything we need.
+            all_bytes_served = (
+                postamble_size == 0 or
+                (
+                    last_byte is not None and
+                    last_byte < preamble_size + (
+                        seg_size or segment_bytes_served
+                    )
+                )
+            )
+            if all_bytes_served:
+                continue
+
+            # Handle any bytes required from the postamble.
+            # If we're here, then an earlier check guarantees
+            # that seg_size is not None
+            first_postamble_byte = max(
+                0, first_byte - (preamble_size + seg_size)
+            )
+            num_postamble_bytes = last_byte - (
+                preamble_size + seg_size
+            ) + 1
+            if num_postamble_bytes > postamble_size:
                 raise SegmentError(
-                    'Not enough bytes for %s; closing connection' % self.name)
+                    'Not enough bytes (%s > %s) in postamble for %s; '
+                    'closing connection' %
+                    (num_postamble_bytes, postamble_size, self.name)
+                )
+            # Because we didn't 'continue' before testing the postamble
+            # we know we are serving at least one byte here
+            postamble_data = postamble[
+                first_postamble_byte:num_postamble_bytes
+            ]
+            yield postamble_data
+            if bytes_left is not None:
+                bytes_left -= len(postamble_data)
+
+        if bytes_left:  # Error if bytes_left is not None and non-zero
+            raise SegmentError(
+                'Not enough bytes for %s; closing connection' % self.name
+            )
+
+    def _time_limit_iter(self):
+        """
+        The _time_limit_iter wraps the _pre_post_amble_iter and simply ensures
+        that a request does not exceed the time limit for a single request.
+        """
+        start_time = time.time()
+
+        def _check_time_exceeded():
+            if time.time() - start_time > self.max_get_time:
+                raise SegmentError(
+                    'ERROR: While processing manifest %s, '
+                    'max LO GET time of %ds exceeded' %
+                    (self.name, self.max_get_time)
+                )
+        try:
+            for res in self._pre_post_amble_iter():
+                yield res
+                _check_time_exceeded()
+        except ListingIterError:
+            e_type, e_value, e_traceback = sys.exc_info()
+            _check_time_exceeded()
+            six.reraise(e_type, e_value, e_traceback)
+
+    def _internal_iter(self):
+        """
+        The _internal_iter is the top level iterator within SegmentedIterable.
+        Its only responsibility is to yield results from the _time_limit_iter,
+        log exceptions and attempt to close the response iterator.
+        """
+        try:
+            for chunk in self._time_limit_iter():
+                yield chunk
         except (ListingIterError, SegmentError):
             self.logger.exception(_('ERROR: An error occurred '
                                     'while retrieving segments'))
