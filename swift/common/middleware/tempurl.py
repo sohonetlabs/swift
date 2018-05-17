@@ -506,6 +506,8 @@ class TempURL(object):
         if temp_url_ip_range:
             req = Request(env)
             client_address = get_remote_client(req)
+            if client_address is None:
+                return self._invalid(env, start_response)
             allowed_ip_ranges = ip_network(six.u(temp_url_ip_range))
             if ip_address(six.u(client_address)) not in allowed_ip_ranges:
                 return self._invalid(env, start_response)
@@ -522,8 +524,8 @@ class TempURL(object):
                                             temp_url_prefix)
         if env['REQUEST_METHOD'] == 'HEAD':
             hmac_vals = [
-                hmac for method in ('HEAD', 'GET', 'POST', 'PUT')
-                for hmac in self._get_hmacs(
+                _hmac for method in ('HEAD', 'GET', 'POST', 'PUT')
+                for _hmac in self._get_hmacs(
                     env, temp_url_expires, path, keys, hash_algorithm,
                     request_method=method, ip_range=temp_url_ip_range)]
         else:
@@ -533,11 +535,11 @@ class TempURL(object):
 
         is_valid_hmac = False
         hmac_scope = None
-        for hmac, scope in hmac_vals:
+        for _hmac, scope in hmac_vals:
             # While it's true that we short-circuit, this doesn't affect the
             # timing-attack resistance since the only way this will
             # short-circuit is when a valid signature is passed in.
-            if streq_const_time(temp_url_sig, hmac):
+            if streq_const_time(temp_url_sig, _hmac):
                 is_valid_hmac = True
                 hmac_scope = scope
                 break
@@ -641,7 +643,8 @@ class TempURL(object):
         :returns: (sig, expires, prefix, filename, inline) as described above.
         """
         temp_url_sig = temp_url_expires = temp_url_prefix = filename =\
-            inline, temp_url_ip_range = None
+            inline = None
+        temp_url_ip_range = None
         qs = parse_qs(env.get('QUERY_STRING', ''), keep_blank_values=True)
         if 'temp_url_ip_range' in qs:
             temp_url_ip_range = qs['temp_url_ip_range'][0]
@@ -720,7 +723,7 @@ class TempURL(object):
         if ip_range:
             return [
                 (get_hmac_ip(
-                    request_method, path, expires, key, digest, ip_range
+                    request_method, path, expires, key, ip_range, digest,
                 ), scope)
                 for (key, scope) in scoped_keys]
         else:
