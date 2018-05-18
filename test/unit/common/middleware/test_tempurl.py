@@ -846,7 +846,8 @@ class TestTempURL(unittest.TestCase):
         req = self._make_request(
             path, keys=[key],
             environ={
-                'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&temp_url_ip_range=%s'
+                'QUERY_STRING':
+                'temp_url_sig=%s&temp_url_expires=%s&temp_url_ip_range=%s'
                 % (sig, expires, ip),
             },
             headers={'x-forwarded-for': bad_ip}
@@ -1183,7 +1184,8 @@ class TestTempURL(unittest.TestCase):
             self.assertEqual(
                 self.tempurl._get_temp_url_info(
                     {'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
-                     'filename=bobisyouruncle&inline=&temp_url_ip_range=127.0.0.1' % (s, e)}),
+                     'filename=bobisyouruncle&inline='
+                     '&temp_url_ip_range=127.0.0.1' % (s, e)}),
                 (s, e_ts, None, 'bobisyouruncle', True, '127.0.0.1'))
 
         e_ts = int(time() - 1)
