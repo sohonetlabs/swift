@@ -252,9 +252,7 @@ import binascii
 from calendar import timegm
 import functools
 import hashlib
-import hmac
 import six
-from hashlib import sha1
 from os.path import basename
 from time import time, strftime, strptime, gmtime
 from ipaddress import ip_address, ip_network
