@@ -548,8 +548,8 @@ class TempURL(object):
                                             temp_url_prefix)
         if env['REQUEST_METHOD'] == 'HEAD':
             hmac_vals = [
-                _hmac for method in ('HEAD', 'GET', 'POST', 'PUT')
-                for _hmac in self._get_hmacs(
+                hmac for method in ('HEAD', 'GET', 'POST', 'PUT')
+                for hmac in self._get_hmacs(
                     env, temp_url_expires, path, keys, hash_algorithm,
                     request_method=method, ip_range=temp_url_ip_range)]
         else:
@@ -559,11 +559,11 @@ class TempURL(object):
 
         is_valid_hmac = False
         hmac_scope = None
-        for _hmac, scope in hmac_vals:
+        for hmac, scope in hmac_vals:
             # While it's true that we short-circuit, this doesn't affect the
             # timing-attack resistance since the only way this will
             # short-circuit is when a valid signature is passed in.
-            if streq_const_time(temp_url_sig, _hmac):
+            if streq_const_time(temp_url_sig, hmac):
                 is_valid_hmac = True
                 hmac_scope = scope
                 break
