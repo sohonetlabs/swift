@@ -304,30 +304,6 @@ ACCOUNT_SCOPE = 'account'
 EXPIRES_ISO8601_FORMAT = '%Y-%m-%dT%H:%M:%SZ'
 
 
-def get_hmac_ip(request_method, path, expires, key, ip_range, digest=sha1):
-    """
-    Returns the hexdigest string of the HMAC (see RFC 2104) for
-    the request.
-    :param request_method: Request method to allow.
-    :param path: The path to the resource to allow access to.
-    :param expires: Unix timestamp as an int for when the URL
-                    expires.
-    :param key: HMAC shared secret.
-    :param digest: constructor for the digest to use in calculating the HMAC
-                   Defaults to SHA1
-    :returns: hexdigest str of the HMAC for the request using the specified
-              digest algorithm.
-    """
-    parts = (request_method, str(expires), path, ip_range)
-    if not isinstance(key, six.binary_type):
-        key = key.encode('utf8')
-    return hmac.new(
-        key, b'\n'.join(
-            x if isinstance(x, six.binary_type) else x.encode('utf8')
-            for x in parts),
-        digest).hexdigest()
-
-
 def get_tempurl_keys_from_metadata(meta):
     """
     Extracts the tempurl keys from metadata.
@@ -713,7 +689,8 @@ class TempURL(object):
                                does not match, you may wish to
                                override with GET to still allow the
                                HEAD.
-
+        :param ip_range: The ip range from which the resource is allowed
+                         to be accessed
         :returns: a list of (hmac, scope) 2-tuples
         """
         if not request_method:
@@ -722,13 +699,15 @@ class TempURL(object):
         digest = functools.partial(hashlib.new, hash_algorithm)
         if ip_range:
             return [
-                (get_hmac_ip(
-                    request_method, path, expires, key, ip_range, digest,
+                (get_hmac(
+                    request_method, path, expires, key,
+                    ip_range=ip_range, digest=digest,
                 ), scope)
                 for (key, scope) in scoped_keys]
         else:
             return [
-                (get_hmac(request_method, path, expires, key, digest), scope)
+                (get_hmac(request_method, path, expires, key,
+                          digest=digest), scope)
                 for (key, scope) in scoped_keys]
 
     def _invalid(self, env, start_response):
