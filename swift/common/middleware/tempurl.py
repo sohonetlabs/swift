@@ -49,6 +49,10 @@ contain signatures which are valid for all objects which share a
 common prefix. These prefix-based URLs are useful for sharing a set
 of objects.
 
+Restrictions can also be placed on the ip that the resource is allowed
+to be accessed from. This can be useful for locking down where the urls
+can be used from.
+
 ------------
 Client Usage
 ------------
@@ -147,6 +151,52 @@ Another valid URL::
     temp_url_sig=da39a3ee5e6b4b0d3255bfef95601890afd80709&
     temp_url_expires=1323479485&
     temp_url_prefix=pre
+
+If you wish to lock down the ip ranges from where the resource can be accessed
+to the ip 1.2.3.4::
+
+    import hmac
+    from hashlib import sha1
+    from time import time
+    method = 'GET'
+    expires = int(time() + 60)
+    path = '/v1/AUTH_account/container/object'
+    ip_range = '1.2.3.4'
+    key = 'mykey'
+    hmac_body = '%s\n%s\n%s\n%s' % (method, expires, path, ip_range)
+    sig = hmac.new(key, hmac_body, sha1).hexdigest()
+
+The generated signature would only be valid from the ip ``1.2.3.4``. The
+middleware detects a ip-based temporary URL by a query parameter called
+``temp_url_ip_range``. So, if ``sig`` and ``expires`` would end up like
+above, following URL would be valid::
+
+    https://swift-cluster.example.com/v1/AUTH_account/container/object?
+    temp_url_sig=da39a3ee5e6b4b0d3255bfef95601890afd80709&
+    temp_url_expires=1323479485&
+    temp_url_ip_range=1.2.3.4
+
+Similarly to lock down the ip to a range of ``1.2.3.X`` so starting
+from the ip ``1.2.3.0`` to ``1.2.3.254``
+
+    import hmac
+    from hashlib import sha1
+    from time import time
+    method = 'GET'
+    expires = int(time() + 60)
+    path = '/v1/AUTH_account/container/object'
+    ip_range = '1.2.3.0/24'
+    key = 'mykey'
+    hmac_body = '%s\n%s\n%s\n%s' % (method, expires, path, ip_range)
+    sig = hmac.new(key, hmac_body, sha1).hexdigest()
+
+Then the following url would be valid
+
+    https://swift-cluster.example.com/v1/AUTH_account/container/object?
+    temp_url_sig=da39a3ee5e6b4b0d3255bfef95601890afd80709&
+    temp_url_expires=1323479485&
+    temp_url_ip_range=1.2.3.0/24
+
 
 Any alteration of the resource path or query arguments of a temporary URL
 would result in ``401 Unauthorized``. Similarly, a ``PUT`` where ``GET`` was

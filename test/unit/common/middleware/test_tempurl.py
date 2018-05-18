@@ -226,7 +226,53 @@ class TestTempURL(unittest.TestCase):
         self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
 
     @mock.patch('swift.common.middleware.tempurl.time', return_value=0)
-    def test_get_valid_with_ip(self, mock_time):
+    def test_get_valid_with_ip_from_remote_addr(self, mock_time):
+        method = 'GET'
+        expires = (((24 + 1) * 60 + 1) * 60) + 1
+        path = '/v1/a/c/o'
+        key = 'abc'
+        ip = '127.0.0.1'
+        hmac_body = '%s\n%s\n%s\n%s' % (method, expires, path, ip)
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
+        req = self._make_request(path, keys=[key], environ={
+            'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
+            'temp_url_ip_range=%s' % (sig, expires, ip),
+            'REMOTE_ADDR': ip},
+        )
+        self.tempurl.app = FakeApp(iter([('200 Ok', (), '123')]))
+        resp = req.get_response(self.tempurl)
+        self.assertEqual(resp.status_int, 200)
+        self.assertIn('expires', resp.headers)
+        self.assertEqual('Fri, 02 Jan 1970 01:01:01 GMT',
+                         resp.headers['expires'])
+        self.assertEqual(req.environ['swift.authorize_override'], True)
+        self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+
+    @mock.patch('swift.common.middleware.tempurl.time', return_value=0)
+    def test_get_valid_with_ip_from_x_forwarded_for(self, mock_time):
+        method = 'GET'
+        expires = (((24 + 1) * 60 + 1) * 60) + 1
+        path = '/v1/a/c/o'
+        key = 'abc'
+        ip = '127.0.0.1'
+        remote_addr = '127.0.0.2'
+        hmac_body = '%s\n%s\n%s\n%s' % (method, expires, path, ip)
+        sig = hmac.new(key, hmac_body, hashlib.sha1).hexdigest()
+        req = self._make_request(path, keys=[key], environ={
+            'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
+            'temp_url_ip_range=%s' % (sig, expires, ip),
+            'REMOTE_ADDR': remote_addr},
+            headers={'x-forwarded-for': ip})
+        self.tempurl.app = FakeApp(iter([('200 Ok', (), '123')]))
+        resp = req.get_response(self.tempurl)
+        self.assertEqual(resp.status_int, 200)
+        self.assertIn('expires', resp.headers)
+        self.assertEqual('Fri, 02 Jan 1970 01:01:01 GMT',
+                         resp.headers['expires'])
+        self.assertEqual(req.environ['swift.authorize_override'], True)
+        self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+
+    def test_get_valid_with_no_client_address(self):
         method = 'GET'
         expires = (((24 + 1) * 60 + 1) * 60) + 1
         path = '/v1/a/c/o'
@@ -237,15 +283,12 @@ class TestTempURL(unittest.TestCase):
         req = self._make_request(path, keys=[key], environ={
             'QUERY_STRING': 'temp_url_sig=%s&temp_url_expires=%s&'
             'temp_url_ip_range=%s' % (sig, expires, ip)},
-            headers={'x-forwarded-for': ip})
+        )
         self.tempurl.app = FakeApp(iter([('200 Ok', (), '123')]))
         resp = req.get_response(self.tempurl)
-        self.assertEqual(resp.status_int, 200)
-        self.assertIn('expires', resp.headers)
-        self.assertEqual('Fri, 02 Jan 1970 01:01:01 GMT',
-                         resp.headers['expires'])
-        self.assertEqual(req.environ['swift.authorize_override'], True)
-        self.assertEqual(req.environ['REMOTE_USER'], '.wsgi.tempurl')
+        self.assertEqual(resp.status_int, 401)
+        self.assertIn('Temp URL invalid', resp.body)
+        self.assertIn('Www-Authenticate', resp.headers)
 
     def test_head_valid_with_filename(self):
         method = 'HEAD'
