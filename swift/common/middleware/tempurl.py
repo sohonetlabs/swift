@@ -745,18 +745,13 @@ class TempURL(object):
             request_method = env['REQUEST_METHOD']
 
         digest = functools.partial(hashlib.new, hash_algorithm)
-        if ip_range:
-            return [
-                (get_hmac(
-                    request_method, path, expires, key,
-                    ip_range=ip_range, digest=digest,
-                ), scope)
-                for (key, scope) in scoped_keys]
-        else:
-            return [
-                (get_hmac(request_method, path, expires, key,
-                          digest=digest), scope)
-                for (key, scope) in scoped_keys]
+        hmac_kwargs = dict(digest=digest, ip_range=ip_range)
+
+        return [
+            (get_hmac(
+                request_method, path, expires, key, **hmac_kwargs
+            ), scope)
+            for (key, scope) in scoped_keys]
 
     def _invalid(self, env, start_response):
         """
