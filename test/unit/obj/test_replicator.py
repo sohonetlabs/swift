@@ -1798,10 +1798,10 @@ class TestObjectReplicator(unittest.TestCase):
         self.replicator.sync_method.assert_called_once_with(
             'node', 'job', 'suffixes')
 
-    @mock.patch('swift.obj.replicator.tpool_reraise')
+    @mock.patch('swift.obj.replicator.tpool.execute')
     @mock.patch('swift.obj.replicator.http_connect', autospec=True)
     @mock.patch('swift.obj.replicator._do_listdir')
-    def test_update(self, mock_do_listdir, mock_http, mock_tpool_reraise):
+    def test_update(self, mock_do_listdir, mock_http, mock_tpool_execute):
 
         def set_default(self):
             self.replicator.suffix_count = 0
@@ -1813,7 +1813,7 @@ class TestObjectReplicator(unittest.TestCase):
 
         self.headers = {'Content-Length': '0',
                         'user-agent': 'object-replicator %s' % os.getpid()}
-        mock_tpool_reraise.return_value = (0, {})
+        mock_tpool_execute.return_value = (0, {})
 
         all_jobs = self.replicator.collect_jobs()
         jobs = [job for job in all_jobs if not job['delete']]
@@ -1868,7 +1868,7 @@ class TestObjectReplicator(unittest.TestCase):
             mock_http.reset_mock()
             self.logger.clear()
         mock_do_listdir.assert_has_calls(expected_listdir_calls)
-        mock_tpool_reraise.assert_has_calls(expected_tpool_calls)
+        mock_tpool_execute.assert_has_calls(expected_tpool_calls)
         mock_do_listdir.side_effect = None
         mock_do_listdir.return_value = False
         # Check incorrect http_connect with status 400 != HTTP_OK
@@ -1920,7 +1920,7 @@ class TestObjectReplicator(unittest.TestCase):
             self.logger.clear()
 
         # Check successful http_connect and sync for local node
-        mock_tpool_reraise.return_value = (1, {'a83': 'ba47fd314242ec8c'
+        mock_tpool_execute.return_value = (1, {'a83': 'ba47fd314242ec8c'
                                                       '7efb91f5d57336e4'})
         resp.read.return_value = pickle.dumps({'a83': 'c130a2c17ed45102a'
                                                       'ada0f4eee69494ff'})
@@ -2074,6 +2074,7 @@ class TestObjectReplicator(unittest.TestCase):
                         mock_http_connect(200)), \
                 mock.patch.object(self.replicator, 'rsync_timeout', 0.01), \
                 mock.patch('eventlet.green.subprocess.Popen', new_mock):
+            self.replicator.rsync_error_log_line_length = 20
             self.replicator.run_once()
         for proc in mock_procs:
             self.assertEqual(proc._calls, [
@@ -2082,6 +2083,10 @@ class TestObjectReplicator(unittest.TestCase):
                 ('wait', 'killed'),
             ])
         self.assertEqual(len(mock_procs), 2)
+        error_lines = self.replicator.logger.get_lines_for_level('error')
+        # verify logs are truncated to rsync_error_log_line_length
+        self.assertEqual('Killing long-running', error_lines[0])
+        self.assertEqual('Killing long-running', error_lines[1])
 
     def test_replicate_rsync_timeout_wedged(self):
         cur_part = '0'
@@ -2114,6 +2119,31 @@ class TestObjectReplicator(unittest.TestCase):
                 ('wait', 'killed'),
             ])
         self.assertEqual(len(mock_procs), 2)
+
+    def test_limit_rsync_log(self):
+        def do_test(length_limit, log_line, expected):
+            self.replicator.rsync_error_log_line_length = length_limit
+            result = self.replicator._limit_rsync_log(log_line)
+            self.assertEqual(result, expected)
+
+        tests = [{'length_limit': 20,
+                  'log_line': 'a' * 20,
+                  'expected': 'a' * 20},
+                 {'length_limit': 20,
+                  'log_line': 'a' * 19,
+                  'expected': 'a' * 19},
+                 {'length_limit': 20,
+                  'log_line': 'a' * 21,
+                  'expected': 'a' * 20},
+                 {'length_limit': None,
+                  'log_line': 'a' * 50,
+                  'expected': 'a' * 50},
+                 {'length_limit': 0,
+                  'log_line': 'a' * 50,
+                  'expected': 'a' * 50}]
+
+        for params in tests:
+            do_test(**params)
 
 
 @patch_policies([StoragePolicy(0, 'zero', False),

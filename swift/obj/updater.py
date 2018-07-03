@@ -28,12 +28,14 @@ from swift.common.constraints import check_drive
 from swift.common.exceptions import ConnectionTimeout
 from swift.common.ring import Ring
 from swift.common.utils import get_logger, renamer, write_pickle, \
-    dump_recon_cache, config_true_value, ratelimit_sleep, eventlet_monkey_patch
+    dump_recon_cache, config_true_value, RateLimitedIterator, split_path, \
+    eventlet_monkey_patch, get_redirect_data, ContextPool
 from swift.common.daemon import Daemon
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.storage_policy import split_policy_string, PolicyError
 from swift.obj.diskfile import get_tmp_dir, ASYNCDIR_BASE
-from swift.common.http import is_success, HTTP_INTERNAL_SERVER_ERROR
+from swift.common.http import is_success, HTTP_INTERNAL_SERVER_ERROR, \
+    HTTP_MOVED_PERMANENTLY
 
 
 class SweepStats(object):
@@ -41,12 +43,13 @@ class SweepStats(object):
     Stats bucket for an update sweep
     """
     def __init__(self, errors=0, failures=0, quarantines=0, successes=0,
-                 unlinks=0):
+                 unlinks=0, redirects=0):
         self.errors = errors
         self.failures = failures
         self.quarantines = quarantines
         self.successes = successes
         self.unlinks = unlinks
+        self.redirects = redirects
 
     def copy(self):
         return type(self)(self.errors, self.failures, self.quarantines,
@@ -57,7 +60,8 @@ class SweepStats(object):
                           self.failures - other.failures,
                           self.quarantines - other.quarantines,
                           self.successes - other.successes,
-                          self.unlinks - other.unlinks)
+                          self.unlinks - other.unlinks,
+                          self.redirects - other.redirects)
 
     def reset(self):
         self.errors = 0
@@ -65,6 +69,7 @@ class SweepStats(object):
         self.quarantines = 0
         self.successes = 0
         self.unlinks = 0
+        self.redirects = 0
 
     def __str__(self):
         keys = (
@@ -73,6 +78,7 @@ class SweepStats(object):
             (self.quarantines, 'quarantines'),
             (self.unlinks, 'unlinks'),
             (self.errors, 'errors'),
+            (self.redirects, 'redirects'),
         )
         return ', '.join('%d %s' % pair for pair in keys)
 
@@ -88,7 +94,8 @@ class ObjectUpdater(Daemon):
         self.swift_dir = conf.get('swift_dir', '/etc/swift')
         self.interval = int(conf.get('interval', 300))
         self.container_ring = None
-        self.concurrency = int(conf.get('concurrency', 1))
+        self.concurrency = int(conf.get('concurrency', 8))
+        self.updater_workers = int(conf.get('updater_workers', 1))
         if 'slowdown' in conf:
             self.logger.warning(
                 'The slowdown option is deprecated in favor of '
@@ -137,14 +144,16 @@ class ObjectUpdater(Daemon):
             # read from container ring to ensure it's fresh
             self.get_container_ring().get_nodes('')
             for device in self._listdir(self.devices):
-                if not check_drive(self.devices, device, self.mount_check):
+                try:
+                    dev_path = check_drive(self.devices, device,
+                                           self.mount_check)
+                except ValueError as err:
                     # We don't count this as an error. The occasional
                     # unmounted drive is part of normal cluster operations,
                     # so a simple warning is sufficient.
-                    self.logger.warning(
-                        _('Skipping %s as it is not mounted'), device)
+                    self.logger.warning('Skipping: %s', err)
                     continue
-                while len(pids) >= self.concurrency:
+                while len(pids) >= self.updater_workers:
                     pids.remove(os.wait()[0])
                 pid = os.fork()
                 if pid:
@@ -154,7 +163,7 @@ class ObjectUpdater(Daemon):
                     eventlet_monkey_patch()
                     self.stats.reset()
                     forkbegin = time.time()
-                    self.object_sweep(os.path.join(self.devices, device))
+                    self.object_sweep(dev_path)
                     elapsed = time.time() - forkbegin
                     self.logger.info(
                         ('Object update sweep of %(device)s '
@@ -178,14 +187,15 @@ class ObjectUpdater(Daemon):
         begin = time.time()
         self.stats.reset()
         for device in self._listdir(self.devices):
-            if not check_drive(self.devices, device, self.mount_check):
+            try:
+                dev_path = check_drive(self.devices, device, self.mount_check)
+            except ValueError as err:
                 # We don't count this as an error. The occasional unmounted
                 # drive is part of normal cluster operations, so a simple
                 # warning is sufficient.
-                self.logger.warning(
-                    _('Skipping %s as it is not mounted'), device)
+                self.logger.warning('Skipping: %s', err)
                 continue
-            self.object_sweep(os.path.join(self.devices, device))
+            self.object_sweep(dev_path)
         elapsed = time.time() - begin
         self.logger.info(
             ('Object update single-threaded sweep completed: '
@@ -194,27 +204,22 @@ class ObjectUpdater(Daemon):
         dump_recon_cache({'object_updater_sweep': elapsed},
                          self.rcache, self.logger)
 
-    def object_sweep(self, device):
+    def _iter_async_pendings(self, device):
         """
-        If there are async pendings on the device, walk each one and update.
+        Locate and yield all the async pendings on the device. Multiple updates
+        for the same object will come out in reverse-chronological order
+        (i.e. newest first) so that callers can skip stale async_pendings.
 
-        :param device: path to device
+        Tries to clean up empty directories as it goes.
         """
-        start_time = time.time()
-        last_status_update = start_time
-        start_stats = self.stats.copy()
-        my_pid = os.getpid()
-        self.logger.info("Object update sweep starting on %s (pid: %d)",
-                         device, my_pid)
-
         # loop through async pending dirs for all policies
         for asyncdir in self._listdir(device):
             # we only care about directories
             async_pending = os.path.join(device, asyncdir)
-            if not os.path.isdir(async_pending):
-                continue
             if not asyncdir.startswith(ASYNCDIR_BASE):
                 # skip stuff like "accounts", "containers", etc.
+                continue
+            if not os.path.isdir(async_pending):
                 continue
             try:
                 base, policy = split_policy_string(asyncdir)
@@ -244,51 +249,87 @@ class ObjectUpdater(Daemon):
                               'name %s')
                             % (update_path))
                         continue
+                    # Async pendings are stored on disk like this:
+                    #
+                    # <device>/async_pending/<suffix>/<obj_hash>-<timestamp>
+                    #
+                    # If there are multiple updates for a given object,
+                    # they'll look like this:
+                    #
+                    # <device>/async_pending/<obj_suffix>/<obj_hash>-<timestamp1>
+                    # <device>/async_pending/<obj_suffix>/<obj_hash>-<timestamp2>
+                    # <device>/async_pending/<obj_suffix>/<obj_hash>-<timestamp3>
+                    #
+                    # Async updates also have the property that newer
+                    # updates contain all the information in older updates.
+                    # Since we sorted the directory listing in reverse
+                    # order, we'll see timestamp3 first, yield it, and then
+                    # unlink timestamp2 and timestamp1 since we know they
+                    # are obsolete.
+                    #
+                    # This way, our caller only gets useful async_pendings.
                     if obj_hash == last_obj_hash:
                         self.stats.unlinks += 1
                         self.logger.increment('unlinks')
                         os.unlink(update_path)
                     else:
-                        self.process_object_update(update_path, device,
-                                                   policy)
                         last_obj_hash = obj_hash
+                        yield {'device': device, 'policy': policy,
+                               'path': update_path,
+                               'obj_hash': obj_hash, 'timestamp': timestamp}
 
-                    self.objects_running_time = ratelimit_sleep(
-                        self.objects_running_time,
-                        self.max_objects_per_second)
+    def object_sweep(self, device):
+        """
+        If there are async pendings on the device, walk each one and update.
 
-                    now = time.time()
-                    if now - last_status_update >= self.report_interval:
-                        this_sweep = self.stats.since(start_stats)
-                        self.logger.info(
-                            ('Object update sweep progress on %(device)s: '
-                             '%(elapsed).02fs, %(stats)s (pid: %(pid)d)'),
-                            {'device': device,
-                             'elapsed': now - start_time,
-                             'pid': my_pid,
-                             'stats': this_sweep})
-                        last_status_update = now
-                try:
-                    os.rmdir(prefix_path)
-                except OSError:
-                    pass
-            self.logger.timing_since('timing', start_time)
-            sweep_totals = self.stats.since(start_stats)
-            self.logger.info(
-                ('Object update sweep completed on %(device)s '
-                 'in %(elapsed).02fs seconds:, '
-                 '%(successes)d successes, %(failures)d failures, '
-                 '%(quarantines)d quarantines, '
-                 '%(unlinks)d unlinks, %(errors)d errors '
-                 '(pid: %(pid)d)'),
-                {'device': device,
-                 'elapsed': time.time() - start_time,
-                 'pid': my_pid,
-                 'successes': sweep_totals.successes,
-                 'failures': sweep_totals.failures,
-                 'quarantines': sweep_totals.quarantines,
-                 'unlinks': sweep_totals.unlinks,
-                 'errors': sweep_totals.errors})
+        :param device: path to device
+        """
+        start_time = time.time()
+        last_status_update = start_time
+        start_stats = self.stats.copy()
+        my_pid = os.getpid()
+        self.logger.info("Object update sweep starting on %s (pid: %d)",
+                         device, my_pid)
+
+        ap_iter = RateLimitedIterator(
+            self._iter_async_pendings(device),
+            elements_per_second=self.max_objects_per_second)
+        with ContextPool(self.concurrency) as pool:
+            for update in ap_iter:
+                pool.spawn(self.process_object_update,
+                           update['path'], update['device'], update['policy'])
+                now = time.time()
+                if now - last_status_update >= self.report_interval:
+                    this_sweep = self.stats.since(start_stats)
+                    self.logger.info(
+                        ('Object update sweep progress on %(device)s: '
+                         '%(elapsed).02fs, %(stats)s (pid: %(pid)d)'),
+                        {'device': device,
+                         'elapsed': now - start_time,
+                         'pid': my_pid,
+                         'stats': this_sweep})
+                    last_status_update = now
+            pool.waitall()
+
+        self.logger.timing_since('timing', start_time)
+        sweep_totals = self.stats.since(start_stats)
+        self.logger.info(
+            ('Object update sweep completed on %(device)s '
+             'in %(elapsed).02fs seconds:, '
+             '%(successes)d successes, %(failures)d failures, '
+             '%(quarantines)d quarantines, '
+             '%(unlinks)d unlinks, %(errors)d errors, '
+             '%(redirects)d redirects '
+             '(pid: %(pid)d)'),
+            {'device': device,
+             'elapsed': time.time() - start_time,
+             'pid': my_pid,
+             'successes': sweep_totals.successes,
+             'failures': sweep_totals.failures,
+             'quarantines': sweep_totals.quarantines,
+             'unlinks': sweep_totals.unlinks,
+             'errors': sweep_totals.errors,
+             'redirects': sweep_totals.redirects})
 
     def process_object_update(self, update_path, device, policy):
         """
@@ -309,44 +350,90 @@ class ObjectUpdater(Daemon):
                                        os.path.basename(update_path))
             renamer(update_path, target_path, fsync=False)
             return
-        successes = update.get('successes', [])
-        part, nodes = self.get_container_ring().get_nodes(
-            update['account'], update['container'])
-        obj = '/%s/%s/%s' % \
-              (update['account'], update['container'], update['obj'])
-        headers_out = HeaderKeyDict(update['headers'])
-        headers_out['user-agent'] = 'object-updater %s' % os.getpid()
-        headers_out.setdefault('X-Backend-Storage-Policy-Index',
-                               str(int(policy)))
-        events = [spawn(self.object_update,
-                        node, part, update['op'], obj, headers_out)
-                  for node in nodes if node['id'] not in successes]
-        success = True
-        new_successes = False
-        for event in events:
-            event_success, node_id = event.wait()
-            if event_success is True:
-                successes.append(node_id)
-                new_successes = True
+
+        def do_update():
+            successes = update.get('successes', [])
+            headers_out = HeaderKeyDict(update['headers'].copy())
+            headers_out['user-agent'] = 'object-updater %s' % os.getpid()
+            headers_out.setdefault('X-Backend-Storage-Policy-Index',
+                                   str(int(policy)))
+            headers_out.setdefault('X-Backend-Accept-Redirect', 'true')
+            container_path = update.get('container_path')
+            if container_path:
+                acct, cont = split_path('/' + container_path, minsegs=2)
             else:
-                success = False
-        if success:
-            self.stats.successes += 1
-            self.logger.increment('successes')
-            self.logger.debug('Update sent for %(obj)s %(path)s',
-                              {'obj': obj, 'path': update_path})
-            self.stats.unlinks += 1
-            self.logger.increment('unlinks')
-            os.unlink(update_path)
-        else:
-            self.stats.failures += 1
-            self.logger.increment('failures')
-            self.logger.debug('Update failed for %(obj)s %(path)s',
-                              {'obj': obj, 'path': update_path})
-            if new_successes:
-                update['successes'] = successes
-                write_pickle(update, update_path, os.path.join(
-                    device, get_tmp_dir(policy)))
+                acct, cont = update['account'], update['container']
+            part, nodes = self.get_container_ring().get_nodes(acct, cont)
+            obj = '/%s/%s/%s' % (acct, cont, update['obj'])
+            events = [spawn(self.object_update,
+                            node, part, update['op'], obj, headers_out)
+                      for node in nodes if node['id'] not in successes]
+            success = True
+            new_successes = rewrite_pickle = False
+            redirect = None
+            redirects = set()
+            for event in events:
+                event_success, node_id, redirect = event.wait()
+                if event_success is True:
+                    successes.append(node_id)
+                    new_successes = True
+                else:
+                    success = False
+                if redirect:
+                    redirects.add(redirect)
+
+            if success:
+                self.stats.successes += 1
+                self.logger.increment('successes')
+                self.logger.debug('Update sent for %(obj)s %(path)s',
+                                  {'obj': obj, 'path': update_path})
+                self.stats.unlinks += 1
+                self.logger.increment('unlinks')
+                os.unlink(update_path)
+                try:
+                    # If this was the last async_pending in the directory,
+                    # then this will succeed. Otherwise, it'll fail, and
+                    # that's okay.
+                    os.rmdir(os.path.dirname(update_path))
+                except OSError:
+                    pass
+            elif redirects:
+                # erase any previous successes
+                update.pop('successes', None)
+                redirect = max(redirects, key=lambda x: x[-1])[0]
+                redirect_history = update.setdefault('redirect_history', [])
+                if redirect in redirect_history:
+                    # force next update to be sent to root, reset history
+                    update['container_path'] = None
+                    update['redirect_history'] = []
+                else:
+                    update['container_path'] = redirect
+                    redirect_history.append(redirect)
+                self.stats.redirects += 1
+                self.logger.increment("redirects")
+                self.logger.debug(
+                    'Update redirected for %(obj)s %(path)s to %(shard)s',
+                    {'obj': obj, 'path': update_path,
+                     'shard': update['container_path']})
+                rewrite_pickle = True
+            else:
+                self.stats.failures += 1
+                self.logger.increment('failures')
+                self.logger.debug('Update failed for %(obj)s %(path)s',
+                                  {'obj': obj, 'path': update_path})
+                if new_successes:
+                    update['successes'] = successes
+                    rewrite_pickle = True
+
+            return rewrite_pickle, redirect
+
+        rewrite_pickle, redirect = do_update()
+        if redirect:
+            # make one immediate retry to the redirect location
+            rewrite_pickle, redirect = do_update()
+        if rewrite_pickle:
+            write_pickle(update, update_path, os.path.join(
+                device, get_tmp_dir(policy)))
 
     def object_update(self, node, part, op, obj, headers_out):
         """
@@ -357,7 +444,12 @@ class ObjectUpdater(Daemon):
         :param op: operation performed (ex: 'PUT' or 'DELETE')
         :param obj: object name being updated
         :param headers_out: headers to send with the update
+        :return: a tuple of (``success``, ``node_id``, ``redirect``)
+            where ``success`` is True if the update succeeded, ``node_id`` is
+            the_id of the node updated and ``redirect`` is either None or a
+            tuple of (a path, a timestamp string).
         """
+        redirect = None
         try:
             with ConnectionTimeout(self.conn_timeout):
                 conn = http_connect(node['ip'], node['port'], node['device'],
@@ -365,15 +457,24 @@ class ObjectUpdater(Daemon):
             with Timeout(self.node_timeout):
                 resp = conn.getresponse()
                 resp.read()
-                success = is_success(resp.status)
-                if not success:
-                    self.logger.debug(
-                        _('Error code %(status)d is returned from remote '
-                          'server %(ip)s: %(port)s / %(device)s'),
-                        {'status': resp.status, 'ip': node['ip'],
-                         'port': node['port'], 'device': node['device']})
-                return (success, node['id'])
+
+            if resp.status == HTTP_MOVED_PERMANENTLY:
+                try:
+                    redirect = get_redirect_data(resp)
+                except ValueError as err:
+                    self.logger.error(
+                        'Container update failed for %r; problem with '
+                        'redirect location: %s' % (obj, err))
+
+            success = is_success(resp.status)
+            if not success:
+                self.logger.debug(
+                    _('Error code %(status)d is returned from remote '
+                      'server %(ip)s: %(port)s / %(device)s'),
+                    {'status': resp.status, 'ip': node['ip'],
+                     'port': node['port'], 'device': node['device']})
+            return success, node['id'], redirect
         except (Exception, Timeout):
             self.logger.exception(_('ERROR with remote server '
                                     '%(ip)s:%(port)s/%(device)s'), node)
-        return HTTP_INTERNAL_SERVER_ERROR, node['id']
+        return HTTP_INTERNAL_SERVER_ERROR, node['id'], redirect

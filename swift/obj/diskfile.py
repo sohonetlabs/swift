@@ -50,7 +50,7 @@ from contextlib import contextmanager
 from collections import defaultdict
 from datetime import timedelta
 
-from eventlet import Timeout
+from eventlet import Timeout, tpool
 from eventlet.hubs import trampoline
 import six
 from pyeclib.ec_iface import ECDriverError, ECInvalidFragmentMetadata, \
@@ -64,7 +64,7 @@ from swift.common.utils import mkdirs, Timestamp, \
     fsync_dir, drop_buffer_cache, lock_path, write_pickle, \
     config_true_value, listdir, split_path, remove_file, \
     get_md5_socket, F_SETPIPE_SZ, decode_timestamps, encode_timestamps, \
-    tpool_reraise, MD5_OF_EMPTY_STRING, link_fd_to_path, o_tmpfile_supported, \
+    MD5_OF_EMPTY_STRING, link_fd_to_path, o_tmpfile_supported, \
     O_TMPFILE, makedirs_count, replace_partition_in_path
 from swift.common.splice import splice, tee
 from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist, \
@@ -99,6 +99,14 @@ get_tmp_dir = partial(get_policy_string, TMP_BASE)
 MIN_TIME_UPDATE_AUDITOR_STATUS = 60
 # This matches rsync tempfiles, like ".<timestamp>.data.Xy095a"
 RE_RSYNC_TEMPFILE = re.compile(r'^\..*\.([a-zA-Z0-9_]){6}$')
+
+
+def _unlink_if_present(filename):
+    try:
+        os.unlink(filename)
+    except OSError as err:
+        if err.errno != errno.ENOENT:
+            raise
 
 
 def _get_filename(fd):
@@ -484,11 +492,11 @@ def object_audit_location_generator(devices, datadir, mount_check=True,
 
     base, policy = split_policy_string(datadir)
     for device in device_dirs:
-        if not check_drive(devices, device, mount_check):
+        try:
+            check_drive(devices, device, mount_check)
+        except ValueError as err:
             if logger:
-                logger.debug(
-                    'Skipping %s as it is not %s', device,
-                    'mounted' if mount_check else 'a dir')
+                logger.debug('Skipping: %s', err)
             continue
 
         datadir_path = os.path.join(devices, device, datadir)
@@ -1023,7 +1031,17 @@ class BaseDiskFileManager(object):
         def is_reclaimable(timestamp):
             return (time.time() - float(timestamp)) > self.reclaim_age
 
-        files = listdir(hsh_path)
+        try:
+            files = os.listdir(hsh_path)
+        except OSError as err:
+            if err.errno == errno.ENOENT:
+                results = self.get_ondisk_files(
+                    [], hsh_path, verify=False, **kwargs)
+                results['files'] = []
+                return results
+            else:
+                raise
+
         files.sort(reverse=True)
         results = self.get_ondisk_files(
             files, hsh_path, verify=False, **kwargs)
@@ -1039,6 +1057,15 @@ class BaseDiskFileManager(object):
             remove_file(join(hsh_path, file_info['filename']))
             files.remove(file_info['filename'])
         results['files'] = files
+        if not files:  # everything got unlinked
+            try:
+                os.rmdir(hsh_path)
+            except OSError as err:
+                if err.errno not in (errno.ENOENT, errno.ENOTEMPTY):
+                    self.logger.debug(
+                        'Error cleaning up empty hash directory %s: %s',
+                        hsh_path, err)
+                # else, no real harm; pass
         return results
 
     def _update_suffix_hashes(self, hashes, ondisk_info):
@@ -1081,10 +1108,6 @@ class BaseDiskFileManager(object):
                     continue
                 raise
             if not ondisk_info['files']:
-                try:
-                    os.rmdir(hsh_path)
-                except OSError:
-                    pass
                 continue
 
             # ondisk_info has info dicts containing timestamps for those
@@ -1248,11 +1271,11 @@ class BaseDiskFileManager(object):
             # explicitly forbidden from syscall, just return path
             return join(self.devices, device)
         # we'll do some kind of check if not explicitly forbidden
-        if mount_check or self.mount_check:
-            mount_check = True
-        else:
-            mount_check = False
-        return check_drive(self.devices, device, mount_check)
+        try:
+            return check_drive(self.devices, device,
+                               mount_check or self.mount_check)
+        except ValueError:
+            return None
 
     @contextmanager
     def replication_lock(self, device):
@@ -1419,7 +1442,7 @@ class BaseDiskFileManager(object):
         partition_path = get_part_path(dev_path, policy, partition)
         if not os.path.exists(partition_path):
             mkdirs(partition_path)
-        _junk, hashes = tpool_reraise(
+        _junk, hashes = tpool.execute(
             self._get_hashes, device, partition, policy, recalculate=suffixes)
         return hashes
 
@@ -1486,25 +1509,37 @@ class BaseDiskFileManager(object):
         dev_path = self.get_dev_path(device)
         if not dev_path:
             raise DiskFileDeviceUnavailable()
+
+        partition_path = get_part_path(dev_path, policy, partition)
         if suffixes is None:
             suffixes = self.yield_suffixes(device, partition, policy)
+            considering_all_suffixes = True
         else:
-            partition_path = get_part_path(dev_path, policy, partition)
             suffixes = (
                 (os.path.join(partition_path, suffix), suffix)
                 for suffix in suffixes)
+            considering_all_suffixes = False
+
         key_preference = (
             ('ts_meta', 'meta_info', 'timestamp'),
             ('ts_data', 'data_info', 'timestamp'),
             ('ts_data', 'ts_info', 'timestamp'),
             ('ts_ctype', 'ctype_info', 'ctype_timestamp'),
         )
+
+        # We delete as many empty directories as we can.
+        # cleanup_ondisk_files() takes care of the hash dirs, and we take
+        # care of the suffix dirs and possibly even the partition dir.
+        have_nonempty_suffix = False
         for suffix_path, suffix in suffixes:
+            have_nonempty_hashdir = False
             for object_hash in self._listdir(suffix_path):
                 object_path = os.path.join(suffix_path, object_hash)
                 try:
                     results = self.cleanup_ondisk_files(
                         object_path, **kwargs)
+                    if results['files']:
+                        have_nonempty_hashdir = True
                     timestamps = {}
                     for ts_key, info_key, info_ts_key in key_preference:
                         if info_key not in results:
@@ -1523,6 +1558,37 @@ class BaseDiskFileManager(object):
                     self.logger.debug(
                         'Invalid diskfile filename in %r (%s)' % (
                             object_path, err))
+
+            if have_nonempty_hashdir:
+                have_nonempty_suffix = True
+            else:
+                try:
+                    os.rmdir(suffix_path)
+                except OSError as err:
+                    if err.errno not in (errno.ENOENT, errno.ENOTEMPTY):
+                        self.logger.debug(
+                            'Error cleaning up empty suffix directory %s: %s',
+                            suffix_path, err)
+                    # cleanup_ondisk_files tries to remove empty hash dirs,
+                    # but if it fails, so will we. An empty directory
+                    # structure won't cause errors (just slowdown), so we
+                    # ignore the exception.
+        if considering_all_suffixes and not have_nonempty_suffix:
+            # There's nothing of interest in the partition, so delete it
+            try:
+                # Remove hashes.pkl *then* hashes.invalid; otherwise, if we
+                # remove hashes.invalid but leave hashes.pkl, that makes it
+                # look as though the invalidations in hashes.invalid never
+                # occurred.
+                _unlink_if_present(os.path.join(partition_path, HASH_FILE))
+                _unlink_if_present(os.path.join(partition_path,
+                                                HASH_INVALIDATIONS_FILE))
+                # This lock is only held by people dealing with the hashes
+                # or the hash invalidations, and we've just removed those.
+                _unlink_if_present(os.path.join(partition_path, ".lock"))
+                os.rmdir(partition_path)
+            except OSError as err:
+                self.logger.debug("Error cleaning up empty partition: %s", err)
 
 
 class BaseDiskFileWriter(object):
@@ -1598,7 +1664,7 @@ class BaseDiskFileWriter(object):
         # For large files sync every 512MB (by default) written
         diff = self._upload_size - self._last_sync
         if diff >= self._bytes_per_sync:
-            tpool_reraise(fdatasync, self._fd)
+            tpool.execute(fdatasync, self._fd)
             drop_buffer_cache(self._fd, self._last_sync, diff)
             self._last_sync = self._upload_size
 
@@ -1678,7 +1744,7 @@ class BaseDiskFileWriter(object):
         metadata['name'] = self._name
         target_path = join(self._datadir, filename)
 
-        tpool_reraise(self._finalize_put, metadata, target_path, cleanup)
+        tpool.execute(self._finalize_put, metadata, target_path, cleanup)
 
     def put(self, metadata):
         """
@@ -2203,7 +2269,7 @@ class BaseDiskFile(object):
         return cls(mgr, device_path, None, partition, _datadir=hash_dir_path,
                    policy=policy)
 
-    def open(self, modernize=False):
+    def open(self, modernize=False, current_time=None):
         """
         Open the object.
 
@@ -2214,6 +2280,9 @@ class BaseDiskFile(object):
         :param modernize: if set, update this diskfile to the latest format.
              Currently, this means adding metadata checksums if none are
              present.
+
+        :param current_time: Unix time used in checking expiration. If not
+             present, the current time will be used.
 
         .. note::
 
@@ -2254,7 +2323,7 @@ class BaseDiskFile(object):
         if not self._data_file:
             raise self._construct_exception_from_ts_file(**file_info)
         self._fp = self._construct_from_data_file(
-            modernize=modernize, **file_info)
+            current_time=current_time, modernize=modernize, **file_info)
         # This method must populate the internal _metadata attribute.
         self._metadata = self._metadata or {}
         return self
@@ -2353,7 +2422,7 @@ class BaseDiskFile(object):
                 data_file,
                 "Hash of name in metadata does not match directory name")
 
-    def _verify_data_file(self, data_file, fp):
+    def _verify_data_file(self, data_file, fp, current_time):
         """
         Verify the metadata's name value matches what we think the object is
         named.
@@ -2362,6 +2431,7 @@ class BaseDiskFile(object):
                           occur
         :param fp: open file pointer so that we can `fstat()` the file to
                    verify the on-disk size with Content-Length metadata value
+        :param current_time: Unix time used in checking expiration
         :raises DiskFileCollision: if the metadata stored name does not match
                                    the referenced name of the file
         :raises DiskFileExpired: if the object has expired
@@ -2392,7 +2462,9 @@ class BaseDiskFile(object):
                 data_file, "bad metadata x-delete-at value %s" % (
                     self._metadata['X-Delete-At']))
         else:
-            if x_delete_at <= time.time() and not self._open_expired:
+            if current_time is None:
+                current_time = time.time()
+            if x_delete_at <= current_time and not self._open_expired:
                 raise DiskFileExpired(metadata=self._metadata)
         try:
             metadata_size = int(self._metadata['Content-Length'])
@@ -2466,7 +2538,7 @@ class BaseDiskFile(object):
                 ctypefile_metadata.get('Content-Type-Timestamp')
 
     def _construct_from_data_file(self, data_file, meta_file, ctype_file,
-                                  modernize=False,
+                                  current_time, modernize=False,
                                   **kwargs):
         """
         Open the `.data` file to fetch its metadata, and fetch the metadata
@@ -2477,6 +2549,7 @@ class BaseDiskFile(object):
         :param meta_file: on-disk fast-POST `.meta` file being considered
         :param ctype_file: on-disk fast-POST `.meta` file being considered that
                            contains content-type and content-type timestamp
+        :param current_time: Unix time used in checking expiration
         :param modernize: whether to update the on-disk files to the newest
                           format
         :returns: an opened data file pointer
@@ -2524,7 +2597,7 @@ class BaseDiskFile(object):
             # to us
             self._name = self._metadata['name']
             self._verify_name_matches_hash(data_file)
-        self._verify_data_file(data_file, fp)
+        self._verify_data_file(data_file, fp, current_time)
         return fp
 
     def get_metafile_metadata(self):
@@ -2571,16 +2644,18 @@ class BaseDiskFile(object):
             raise DiskFileNotOpen()
         return self._metadata
 
-    def read_metadata(self):
+    def read_metadata(self, current_time=None):
         """
         Return the metadata for an object without requiring the caller to open
         the object first.
 
+        :param current_time: Unix time used in checking expiration. If not
+             present, the current time will be used.
         :returns: metadata dictionary for an object
         :raises DiskFileError: this implementation will raise the same
                             errors as the `open()` method.
         """
-        with self.open():
+        with self.open(current_time=current_time):
             return self.get_metadata()
 
     def reader(self, keep_cache=False,
@@ -2958,7 +3033,7 @@ class ECDiskFileWriter(BaseDiskFileWriter):
         durable_data_file_path = os.path.join(
             self._datadir, self.manager.make_on_disk_filename(
                 timestamp, '.data', self._diskfile._frag_index, durable=True))
-        tpool_reraise(
+        tpool.execute(
             self._finalize_durable, data_file_path, durable_data_file_path)
 
     def put(self, metadata):

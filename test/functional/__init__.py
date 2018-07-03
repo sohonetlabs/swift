@@ -53,7 +53,8 @@ from test.unit import SkipTest
 
 from swift.common import constraints, utils, ring, storage_policy
 from swift.common.ring import Ring
-from swift.common.wsgi import monkey_patch_mimetools, loadapp
+from swift.common.wsgi import (
+    monkey_patch_mimetools, loadapp, SwiftHttpProtocol)
 from swift.common.utils import config_true_value, split_path
 from swift.account import server as account_server
 from swift.container import server as container_server
@@ -380,26 +381,33 @@ def _load_domain_remap_staticweb(proxy_conf_file, swift_conf_file, **kwargs):
     """
     _debug('Setting configuration for domain_remap')
 
+    # add a domain_remap storage_domain to the test configuration
+    storage_domain = 'example.net'
+    global config
+    config['storage_domain'] = storage_domain
+
     # The global conf dict cannot be used to modify the pipeline.
     # The pipeline loader requires the pipeline to be set in the local_conf.
     # If pipeline is set in the global conf dict (which in turn populates the
     # DEFAULTS options) then it prevents pipeline being loaded into the local
     # conf during wsgi load_app.
     # Therefore we must modify the [pipeline:main] section.
-
     conf = ConfigParser()
     conf.read(proxy_conf_file)
     try:
         section = 'pipeline:main'
         old_pipeline = conf.get(section, 'pipeline')
         pipeline = old_pipeline.replace(
-            "tempauth",
-            "domain_remap tempauth staticweb")
+            " tempauth ",
+            " domain_remap tempauth staticweb ")
         if pipeline == old_pipeline:
             raise InProcessException(
                 "Failed to insert domain_remap and staticweb into pipeline: %s"
                 % old_pipeline)
         conf.set(section, 'pipeline', pipeline)
+        # set storage_domain in domain_remap middleware to match test config
+        section = 'filter:domain_remap'
+        conf.set(section, 'storage_domain', storage_domain)
     except NoSectionError as err:
         msg = 'Error problem with proxy conf file %s: %s' % \
               (proxy_conf_file, err)
@@ -530,6 +538,7 @@ def in_process_setup(the_object_server=object_server):
         storage_policy.reload_storage_policies()
 
     global config
+    config['__file__'] = 'in_process_setup()'
     if constraints.SWIFT_CONSTRAINTS_LOADED:
         # Use the swift constraints that are loaded for the test framework
         # configuration
@@ -626,13 +635,6 @@ def in_process_setup(the_object_server=object_server):
                       'port': con2lis.getsockname()[1]}], 30),
                     f)
 
-    eventlet.wsgi.HttpProtocol.default_request_version = "HTTP/1.0"
-    # Turn off logging requests by the underlying WSGI software.
-    eventlet.wsgi.HttpProtocol.log_request = lambda *a: None
-    logger = utils.get_logger(config, 'wsgi-server', log_route='wsgi')
-    # Redirect logging other messages by the underlying WSGI software.
-    eventlet.wsgi.HttpProtocol.log_message = \
-        lambda s, f, *a: logger.error('ERROR WSGI: ' + f % a)
     # Default to only 4 seconds for in-process functional test runs
     eventlet.wsgi.WRITE_TIMEOUT = 4
 
@@ -659,7 +661,9 @@ def in_process_setup(the_object_server=object_server):
     ]
 
     if show_debug_logs:
-        logger = debug_logger('proxy')
+        logger = get_logger_name('proxy')
+    else:
+        logger = utils.get_logger(config, 'wsgi-server', log_route='wsgi')
 
     def get_logger(name, *args, **kwargs):
         return logger
@@ -675,13 +679,19 @@ def in_process_setup(the_object_server=object_server):
     nl = utils.NullLogger()
     global proxy_srv
     proxy_srv = prolis
-    prospa = eventlet.spawn(eventlet.wsgi.server, prolis, app, nl)
-    acc1spa = eventlet.spawn(eventlet.wsgi.server, acc1lis, acc1srv, nl)
-    acc2spa = eventlet.spawn(eventlet.wsgi.server, acc2lis, acc2srv, nl)
-    con1spa = eventlet.spawn(eventlet.wsgi.server, con1lis, con1srv, nl)
-    con2spa = eventlet.spawn(eventlet.wsgi.server, con2lis, con2srv, nl)
+    prospa = eventlet.spawn(eventlet.wsgi.server, prolis, app, nl,
+                            protocol=SwiftHttpProtocol)
+    acc1spa = eventlet.spawn(eventlet.wsgi.server, acc1lis, acc1srv, nl,
+                             protocol=SwiftHttpProtocol)
+    acc2spa = eventlet.spawn(eventlet.wsgi.server, acc2lis, acc2srv, nl,
+                             protocol=SwiftHttpProtocol)
+    con1spa = eventlet.spawn(eventlet.wsgi.server, con1lis, con1srv, nl,
+                             protocol=SwiftHttpProtocol)
+    con2spa = eventlet.spawn(eventlet.wsgi.server, con2lis, con2srv, nl,
+                             protocol=SwiftHttpProtocol)
 
-    objspa = [eventlet.spawn(eventlet.wsgi.server, objsrv[0], objsrv[1], nl)
+    objspa = [eventlet.spawn(eventlet.wsgi.server, objsrv[0], objsrv[1], nl,
+                             protocol=SwiftHttpProtocol)
               for objsrv in objsrvs]
 
     global _test_coros

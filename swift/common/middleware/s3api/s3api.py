@@ -65,14 +65,6 @@ When using keystone, the config will be::
     both authtoken and s3token will issue the acceptable token to keystone
     (i.e. authenticate twice).
 
-Object-Server Setting
-^^^^^^^^^^^^^^^^^^^^^
-
-To get better compatibility, you may add S3 supported headers (
-Cache-Control, Content-Language, Expires, and X-Robots-Tag), that are
-not supporeted in Swift by default, into allowed_headers option in
-``object-server.conf`` Please see ``object-server.conf`` for more detail.
-
 -----------
 Constraints
 -----------
@@ -173,7 +165,6 @@ class S3ApiMiddleware(object):
 
     def handle_request(self, req):
         self.logger.debug('Calling S3Api Middleware')
-        self.logger.debug(req.__dict__)
         try:
             controller = req.controller(self.app, self.conf, self.logger)
         except S3NotImplemented:
@@ -272,6 +263,7 @@ def filter_factory(global_conf, **local_conf):
         max_multi_delete_objects=conf.get('max_multi_delete_objects', 1000),
         allow_multipart_uploads=conf.get('allow_multipart_uploads', True),
         min_segment_size=conf.get('min_segment_size', 5242880),
+        s3_acl=conf.get('s3_acl', False)
     )
 
     def s3api_filter(app):

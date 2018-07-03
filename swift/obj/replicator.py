@@ -34,7 +34,7 @@ from swift.common.ring.utils import is_local_device
 from swift.common.utils import whataremyips, unlink_older_than, \
     compute_eta, get_logger, dump_recon_cache, \
     rsync_module_interpolation, mkdirs, config_true_value, \
-    tpool_reraise, config_auto_int_value, storage_directory, \
+    config_auto_int_value, storage_directory, \
     load_recon_cache, PrefixLoggerAdapter, parse_override_options, \
     distribute_evenly
 from swift.common.bufferedhttp import http_connect
@@ -146,6 +146,12 @@ class ObjectReplicator(Daemon):
         self.partition_times = []
         self.interval = int(conf.get('interval') or
                             conf.get('run_pause') or 30)
+        if 'run_pause' in conf and 'interval' not in conf:
+            self.logger.warning('Option object-replicator/run_pause '
+                                'is deprecated and will be removed in a '
+                                'future version. Update your configuration'
+                                ' to use option object-replicator/'
+                                'interval.')
         self.rsync_timeout = int(conf.get('rsync_timeout',
                                           DEFAULT_RSYNC_TIMEOUT))
         self.rsync_io_timeout = conf.get('rsync_io_timeout', '30')
@@ -336,6 +342,20 @@ class ObjectReplicator(Daemon):
         policy.load_ring(self.swift_dir)
         return policy.object_ring
 
+    def _limit_rsync_log(self, line):
+        """
+        If rsync_error_log_line_length is defined then
+        limit the error to that length
+
+        :param line: rsync log line
+        :return: If enabled the line limited to rsync_error_log_line_length
+                 otherwise the initial line.
+        """
+        if self.rsync_error_log_line_length:
+            return line[:self.rsync_error_log_line_length]
+
+        return line
+
     def _rsync(self, args):
         """
         Execute the rsync binary to replicate a partition.
@@ -353,7 +373,9 @@ class ObjectReplicator(Daemon):
                 results = proc.stdout.read()
                 ret_val = proc.wait()
         except Timeout:
-            self.logger.error(_("Killing long-running rsync: %s"), str(args))
+            self.logger.error(
+                self._limit_rsync_log(
+                    _("Killing long-running rsync: %s") % str(args)))
             if proc:
                 proc.kill()
                 try:
@@ -385,11 +407,10 @@ class ObjectReplicator(Daemon):
             else:
                 self.logger.error(result)
         if ret_val:
-            error_line = _('Bad rsync return code: %(ret)d <- %(args)s') % \
-                {'args': str(args), 'ret': ret_val}
-            if self.rsync_error_log_line_length:
-                error_line = error_line[:self.rsync_error_log_line_length]
-            self.logger.error(error_line)
+            self.logger.error(
+                self._limit_rsync_log(
+                    _('Bad rsync return code: %(ret)d <- %(args)s') %
+                    {'args': str(args), 'ret': ret_val}))
         else:
             log_method = self.logger.info if results else self.logger.debug
             log_method(
@@ -595,7 +616,7 @@ class ObjectReplicator(Daemon):
         begin = time.time()
         df_mgr = self._df_router[job['policy']]
         try:
-            hashed, local_hash = tpool_reraise(
+            hashed, local_hash = tpool.execute(
                 df_mgr._get_hashes, job['device'],
                 job['partition'], job['policy'],
                 do_listdir=_do_listdir(
@@ -649,7 +670,7 @@ class ObjectReplicator(Daemon):
                     if not suffixes:
                         stats.hashmatch += 1
                         continue
-                    hashed, recalc_hash = tpool_reraise(
+                    hashed, recalc_hash = tpool.execute(
                         df_mgr._get_hashes,
                         job['device'], job['partition'], job['policy'],
                         recalculate=suffixes)
@@ -771,17 +792,17 @@ class ObjectReplicator(Daemon):
                               and (override_devices is None
                                    or dev['device'] in override_devices))]:
             found_local = True
-            dev_path = check_drive(self.devices_dir, local_dev['device'],
-                                   self.mount_check)
             local_dev_stats = self.stats_for_dev[local_dev['device']]
-            if not dev_path:
+            try:
+                dev_path = check_drive(self.devices_dir, local_dev['device'],
+                                       self.mount_check)
+            except ValueError as err:
                 local_dev_stats.add_failure_stats(
                     [(failure_dev['replication_ip'],
                       failure_dev['device'])
                      for failure_dev in policy.object_ring.devs
                      if failure_dev])
-                self.logger.warning(
-                    _('%s is not mounted'), local_dev['device'])
+                self.logger.warning("%s", err)
                 continue
             obj_path = join(dev_path, data_dir)
             tmp_path = join(dev_path, get_tmp_dir(policy))
@@ -912,13 +933,14 @@ class ObjectReplicator(Daemon):
                 dev_stats = self.stats_for_dev[job['device']]
                 num_jobs += 1
                 current_nodes = job['nodes']
-                dev_path = check_drive(self.devices_dir, job['device'],
-                                       self.mount_check)
-                if not dev_path:
+                try:
+                    check_drive(self.devices_dir, job['device'],
+                                self.mount_check)
+                except ValueError as err:
                     dev_stats.add_failure_stats([
                         (failure_dev['replication_ip'], failure_dev['device'])
                         for failure_dev in job['nodes']])
-                    self.logger.warning(_('%s is not mounted'), job['device'])
+                    self.logger.warning("%s", err)
                     continue
                 if self.handoffs_first and not job['delete']:
                     # in handoffs first mode, we won't process primary

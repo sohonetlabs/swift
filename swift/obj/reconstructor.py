@@ -32,8 +32,9 @@ from swift import gettext_ as _
 from swift.common.utils import (
     whataremyips, unlink_older_than, compute_eta, get_logger,
     dump_recon_cache, mkdirs, config_true_value,
-    tpool_reraise, GreenAsyncPile, Timestamp, remove_file,
-    load_recon_cache, parse_override_options, distribute_evenly)
+    GreenAsyncPile, Timestamp, remove_file,
+    load_recon_cache, parse_override_options, distribute_evenly,
+    PrefixLoggerAdapter)
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.bufferedhttp import http_connect
 from swift.common.daemon import Daemon
@@ -142,8 +143,8 @@ class ObjectReconstructor(Daemon):
         :param logger: logging object
         """
         self.conf = conf
-        self.logger = logger or get_logger(
-            conf, log_route='object-reconstructor')
+        self.logger = PrefixLoggerAdapter(
+            logger or get_logger(conf, log_route='object-reconstructor'), {})
         self.devices_dir = conf.get('devices', '/srv/node')
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
         self.swift_dir = conf.get('swift_dir', '/etc/swift')
@@ -164,6 +165,12 @@ class ObjectReconstructor(Daemon):
         self.partition_times = []
         self.interval = int(conf.get('interval') or
                             conf.get('run_pause') or 30)
+        if 'run_pause' in conf and 'interval' not in conf:
+            self.logger.warning('Option object-reconstructor/run_pause '
+                                'is deprecated and will be removed in a '
+                                'future version. Update your configuration'
+                                ' to use option object-reconstructor/'
+                                'interval.')
         self.http_timeout = int(conf.get('http_timeout', 60))
         self.lockup_timeout = int(conf.get('lockup_timeout', 1800))
         self.recon_cache_path = conf.get('recon_cache_path',
@@ -225,16 +232,21 @@ class ObjectReconstructor(Daemon):
         if not devices:
             # we only need a single worker to do nothing until a ring change
             yield dict(override_devices=override_opts.devices,
-                       override_partitions=override_opts.partitions)
+                       override_partitions=override_opts.partitions,
+                       multiprocess_worker_index=0)
             return
+
         # for somewhat uniform load per worker use same
         # max_devices_per_worker when handling all devices or just override
         # devices, but only use enough workers for the actual devices being
         # handled
-        n_workers = min(self.reconstructor_workers, len(devices))
-        for ods in distribute_evenly(devices, n_workers):
+        self.reconstructor_workers = min(self.reconstructor_workers,
+                                         len(devices))
+        for index, ods in enumerate(distribute_evenly(
+                devices, self.reconstructor_workers)):
             yield dict(override_partitions=override_opts.partitions,
-                       override_devices=ods)
+                       override_devices=ods,
+                       multiprocess_worker_index=index)
 
     def is_healthy(self):
         """
@@ -571,6 +583,12 @@ class ObjectReconstructor(Daemon):
                 _("Nothing reconstructed for %s seconds."),
                 (time.time() - self.start))
 
+    def _emplace_log_prefix(self, worker_index):
+        self.logger.set_prefix("[worker %d/%d pid=%s] " % (
+            worker_index + 1,  # use 1-based indexing for more readable logs
+            self.reconstructor_workers,
+            os.getpid()))
+
     def kill_coros(self):
         """Utility function that kills all coroutines currently running."""
         for coro in list(self.run_pool.coroutines_running):
@@ -604,7 +622,7 @@ class ObjectReconstructor(Daemon):
     def _get_hashes(self, device, partition, policy, recalculate=None,
                     do_listdir=False):
         df_mgr = self._df_router[policy]
-        hashed, suffix_hashes = tpool_reraise(
+        hashed, suffix_hashes = tpool.execute(
             df_mgr._get_hashes, device, partition, policy,
             recalculate=recalculate, do_listdir=do_listdir)
         self.logger.update_stats('suffix.hashes', hashed)
@@ -1213,7 +1231,13 @@ class ObjectReconstructor(Daemon):
             recon_update['object_reconstruction_per_disk'] = {}
         dump_recon_cache(recon_update, self.rcache, self.logger)
 
-    def run_once(self, *args, **kwargs):
+    def post_multiprocess_run(self):
+        # This method is called after run_once when using multiple workers.
+        self.aggregate_recon_update()
+
+    def run_once(self, multiprocess_worker_index=None, *args, **kwargs):
+        if multiprocess_worker_index is not None:
+            self._emplace_log_prefix(multiprocess_worker_index)
         start = time.time()
         self.logger.info(_("Running object reconstructor in script mode."))
         override_opts = parse_override_options(once=True, **kwargs)
@@ -1231,7 +1255,9 @@ class ObjectReconstructor(Daemon):
                 total, override_devices=override_opts.devices,
                 override_partitions=override_opts.partitions)
 
-    def run_forever(self, *args, **kwargs):
+    def run_forever(self, multiprocess_worker_index=None, *args, **kwargs):
+        if multiprocess_worker_index is not None:
+            self._emplace_log_prefix(multiprocess_worker_index)
         self.logger.info(_("Starting object reconstructor in daemon mode."))
         # Run the reconstructor continually
         while True:

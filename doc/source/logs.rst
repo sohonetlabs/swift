@@ -102,9 +102,11 @@ DLO                     :ref:`dynamic-large-objects`
 LE                      :ref:`list_endpoints`
 KS                      :ref:`keystoneauth`
 RL                      :ref:`ratelimit`
+RO                      :ref:`read_only`
 VW                      :ref:`versioned_writes`
 SSC                     :ref:`copy`
 SYM                     :ref:`symlink`
+SH                      :ref:`sharding_doc`
 ======================= =============================
 
 

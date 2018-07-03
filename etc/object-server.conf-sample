@@ -120,9 +120,7 @@ use = egg:swift#object
 # Comma separated list of headers that can be set in metadata on an object.
 # This list is in addition to X-Object-Meta-* headers and cannot include
 # Content-Type, etag, Content-Length, or deleted
-# Note that you may add some extra headers for better S3 compatibility, they are:
-# Cache-Control, Content-Language, Expires, and X-Robots-Tag
-# allowed_headers = Content-Disposition, Content-Encoding, X-Delete-At, X-Object-Manifest, X-Static-Large-Object
+# allowed_headers = Content-Disposition, Content-Encoding, X-Delete-At, X-Object-Manifest, X-Static-Large-Object, Cache-Control, Content-Language, Expires, X-Robots-Tag
 #
 # auto_create_account_prefix = .
 #
@@ -373,8 +371,15 @@ use = egg:swift#recon
 # log_address = /dev/log
 #
 # interval = 300
-# concurrency = 1
 # node_timeout = <whatever's in the DEFAULT section or 10>
+#
+# updater_workers controls how many processes the object updater will
+# spawn, while concurrency controls how many async_pending records
+# each updater process will operate on at any one time. With
+# concurrency=C and updater_workers=W, there will be up to W*C
+# async_pending records being processed at once.
+# concurrency = 8
+# updater_workers = 1
 #
 # Send at most this many object updates per second
 # objects_per_second = 50

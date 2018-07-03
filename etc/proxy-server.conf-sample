@@ -109,6 +109,15 @@ use = egg:swift#proxy
 # set log_level = INFO
 # set log_address = /dev/log
 #
+# When deployed behind a proxy, load balancer, or SSL terminator that is
+# configured to speak the human-readable (v1) PROXY protocol (see
+# http://www.haproxy.org/download/1.7/doc/proxy-protocol.txt), you should set
+# this option to true.  The proxy-server will populate the client connection
+# information using the PROXY protocol and reject any connection missing a
+# valid PROXY line with a 400.  Only v1 (human-readable) of the PROXY protocol
+# is supported.
+# require_proxy_protocol = false
+#
 # log_handoffs = true
 # recheck_account_existence = 60
 # recheck_container_existence = 60
@@ -669,6 +678,14 @@ use = egg:swift#ratelimit
 # container_listing_ratelimit_0 = 100
 # container_listing_ratelimit_10 = 50
 # container_listing_ratelimit_50 = 20
+
+[filter:read_only]
+use = egg:swift#read_only
+# read_only set to true means turn global read only on
+# read_only = false
+# allow_deletes set to true means to allow deletes
+# allow_deletes = false
+# Note: Put after ratelimit in the pipeline.
 
 [filter:domain_remap]
 use = egg:swift#domain_remap

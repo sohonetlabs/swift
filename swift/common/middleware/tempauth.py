@@ -174,6 +174,7 @@ To generate a curl command line from the above::
 
 from __future__ import print_function
 
+import json
 from time import time
 from traceback import format_exc
 from uuid import uuid4
@@ -190,7 +191,7 @@ from swift.common.middleware.acl import (
     clean_acl, parse_acl, referrer_allowed, acls_from_account_info)
 from swift.common.utils import cache_from_env, get_logger, \
     split_path, config_true_value, register_swift_info
-from swift.common.utils import config_read_reseller_options
+from swift.common.utils import config_read_reseller_options, quote
 from swift.proxy.controllers.base import get_account_info
 
 
@@ -229,7 +230,7 @@ class TempAuth(object):
         self.storage_url_scheme = conf.get('storage_url_scheme', 'default')
         self.users = {}
         for conf_key in conf:
-            if conf_key.startswith('user_') or conf_key.startswith('user64_'):
+            if conf_key.startswith(('user_', 'user64_')):
                 account, username = conf_key.split('_', 1)[1].split('_')
                 if conf_key.startswith('user64_'):
                     # Because trailing equal signs would screw up config file
@@ -245,7 +246,8 @@ class TempAuth(object):
                 if values and ('://' in values[-1] or '$HOST' in values[-1]):
                     url = values.pop()
                 else:
-                    url = '$HOST/v1/%s%s' % (self.reseller_prefix, account)
+                    url = '$HOST/v1/%s%s' % (
+                        self.reseller_prefix, quote(account))
                 self.users[account + ':' + username] = {
                     'key': key, 'url': url, 'groups': values}
 
@@ -284,7 +286,11 @@ class TempAuth(object):
                 if groups and service_groups:
                     groups += ',' + service_groups
             if groups:
-                user = groups and groups.split(',', 1)[0] or ''
+                group_list = groups.split(',', 2)
+                if len(group_list) > 1:
+                    user = group_list[1]
+                else:
+                    user = group_list[0]
                 trans_id = env.get('swift.trans_id')
                 self.logger.debug('User: %s uses token %s (trans_id %s)' %
                                   (user, 's3' if s3 else token, trans_id))
@@ -502,16 +508,19 @@ class TempAuth(object):
             # on ACLs, TempAuth is not such an auth system.  At this point,
             # it thinks it is authoritative.
             if key not in tempauth_acl_keys:
-                return "Key '%s' not recognized" % key
+                return "Key %s not recognized" % json.dumps(
+                    key).encode('ascii')
 
         for key in tempauth_acl_keys:
             if key not in result:
                 continue
             if not isinstance(result[key], list):
-                return "Value for key '%s' must be a list" % key
+                return "Value for key %s must be a list" % json.dumps(
+                    key).encode('ascii')
             for grantee in result[key]:
                 if not isinstance(grantee, six.string_types):
-                    return "Elements of '%s' list must be strings" % key
+                    return "Elements of %s list must be strings" % json.dumps(
+                        key).encode('ascii')
 
         # Everything looks fine, no errors found
         internal_hdr = get_sys_meta_prefix('account') + 'core-access-control'

@@ -62,6 +62,7 @@ Overview and Concepts
     overview_erasure_code
     overview_encryption
     overview_backing_store
+    overview_container_sharding
     ring_background
     ring_partpower
     associated_projects
@@ -116,6 +117,14 @@ The following provides supporting information for the REST API:
     api/form_post_middleware.rst
     api/use_content-encoding_metadata.rst
     api/use_the_content-disposition_metadata.rst
+
+S3 Compatibility Info
+=====================
+
+.. toctree::
+    :maxdepth: 1
+
+    s3_compat
 
 OpenStack End User Guide
 ========================

@@ -25,7 +25,7 @@ from test.unit import debug_logger, mock_check_drive
 
 from eventlet import spawn, Timeout
 
-from swift.common import utils
+from swift.common import exceptions, utils
 from swift.container import updater as container_updater
 from swift.container.backend import ContainerBroker, DATADIR
 from swift.common.ring import RingData
@@ -148,10 +148,53 @@ class TestContainerUpdater(unittest.TestCase):
             cu.run_once()
         log_lines = self.logger.get_lines_for_level('warning')
         self.assertGreater(len(log_lines), 0)
-        msg = 'sda1 is not mounted'
+        msg = '%s is not mounted' % self.sda1
         self.assertEqual(log_lines[0], msg)
         # Ensure that the container_sweep did not run
         self.assertFalse(mock_sweep.called)
+
+    @mock.patch('swift.container.updater.dump_recon_cache')
+    def test_run_once_with_get_info_timeout(self, mock_dump_recon):
+        cu = self._get_container_updater()
+        containers_dir = os.path.join(self.sda1, DATADIR)
+        os.mkdir(containers_dir)
+        subdir = os.path.join(containers_dir, 'subdir')
+        os.mkdir(subdir)
+        db_file = os.path.join(subdir, 'hash.db')
+        cb = ContainerBroker(db_file, account='a', container='c')
+        cb.initialize(normalize_timestamp(1), 0)
+
+        timeout = exceptions.LockTimeout(10, db_file)
+        timeout.cancel()
+        with mock.patch('swift.container.updater.ContainerBroker.get_info',
+                        side_effect=timeout):
+            cu.run_once()
+        log_lines = self.logger.get_lines_for_level('info')
+        self.assertIn('Failed to get container info (Lock timeout: '
+                      '10 seconds: %s); skipping.' % db_file, log_lines)
+
+    @mock.patch('swift.container.updater.dump_recon_cache')
+    @mock.patch('swift.container.updater.ContainerUpdater.process_container',
+                side_effect=Exception('Boom!'))
+    def test_error_in_process(self, mock_process, mock_dump_recon):
+        cu = self._get_container_updater()
+        containers_dir = os.path.join(self.sda1, DATADIR)
+        os.mkdir(containers_dir)
+        subdir = os.path.join(containers_dir, 'subdir')
+        os.mkdir(subdir)
+        cb = ContainerBroker(os.path.join(subdir, 'hash.db'), account='a',
+                             container='c', pending_timeout=1)
+        cb.initialize(normalize_timestamp(1), 0)
+
+        cu.run_once()
+
+        log_lines = self.logger.get_lines_for_level('error')
+        self.assertTrue(log_lines)
+        self.assertIn('Error processing container ', log_lines[0])
+        self.assertIn('devices/sda1/containers/subdir/hash.db', log_lines[0])
+        self.assertIn('Boom!', log_lines[0])
+        self.assertFalse(log_lines[1:])
+        self.assertEqual(1, len(mock_dump_recon.mock_calls))
 
     def test_run_once(self):
         cu = self._get_container_updater()
@@ -165,6 +208,7 @@ class TestContainerUpdater(unittest.TestCase):
         cb = ContainerBroker(os.path.join(subdir, 'hash.db'), account='a',
                              container='c')
         cb.initialize(normalize_timestamp(1), 0)
+        self.assertTrue(cb.is_root_container())
         cu.run_once()
         info = cb.get_info()
         self.assertEqual(info['object_count'], 0)
@@ -300,6 +344,95 @@ class TestContainerUpdater(unittest.TestCase):
         self.assertEqual(info['bytes_used'], 3)
         self.assertEqual(info['reported_object_count'], 1)
         self.assertEqual(info['reported_bytes_used'], 3)
+
+    def test_shard_container(self):
+        cu = self._get_container_updater()
+        cu.run_once()
+        containers_dir = os.path.join(self.sda1, DATADIR)
+        os.mkdir(containers_dir)
+        cu.run_once()
+        self.assertTrue(os.path.exists(containers_dir))
+        subdir = os.path.join(containers_dir, 'subdir')
+        os.mkdir(subdir)
+        cb = ContainerBroker(os.path.join(subdir, 'hash.db'),
+                             account='.shards_a', container='c')
+        cb.initialize(normalize_timestamp(1), 0)
+        cb.set_sharding_sysmeta('Root', 'a/c')
+        self.assertFalse(cb.is_root_container())
+        cu.run_once()
+        info = cb.get_info()
+        self.assertEqual(info['object_count'], 0)
+        self.assertEqual(info['bytes_used'], 0)
+        self.assertEqual(info['reported_put_timestamp'], '0')
+        self.assertEqual(info['reported_delete_timestamp'], '0')
+        self.assertEqual(info['reported_object_count'], 0)
+        self.assertEqual(info['reported_bytes_used'], 0)
+
+        cb.put_object('o', normalize_timestamp(2), 3, 'text/plain',
+                      '68b329da9893e34099c7d8ad5cb9c940')
+        # Fake us having already reported *bad* stats under swift 2.18.0
+        cb.reported('0', '0', 1, 3)
+
+        # Should fail with a bunch of connection-refused
+        cu.run_once()
+        info = cb.get_info()
+        self.assertEqual(info['object_count'], 1)
+        self.assertEqual(info['bytes_used'], 3)
+        self.assertEqual(info['reported_put_timestamp'], '0')
+        self.assertEqual(info['reported_delete_timestamp'], '0')
+        self.assertEqual(info['reported_object_count'], 1)
+        self.assertEqual(info['reported_bytes_used'], 3)
+
+        def accept(sock, addr, return_code):
+            try:
+                with Timeout(3):
+                    inc = sock.makefile('rb')
+                    out = sock.makefile('wb')
+                    out.write('HTTP/1.1 %d OK\r\nContent-Length: 0\r\n\r\n' %
+                              return_code)
+                    out.flush()
+                    self.assertEqual(inc.readline(),
+                                     'PUT /sda1/2/.shards_a/c HTTP/1.1\r\n')
+                    headers = {}
+                    line = inc.readline()
+                    while line and line != '\r\n':
+                        headers[line.split(':')[0].lower()] = \
+                            line.split(':')[1].strip()
+                        line = inc.readline()
+                    self.assertTrue('x-put-timestamp' in headers)
+                    self.assertTrue('x-delete-timestamp' in headers)
+                    self.assertTrue('x-object-count' in headers)
+                    self.assertTrue('x-bytes-used' in headers)
+            except BaseException as err:
+                import traceback
+                traceback.print_exc()
+                return err
+            return None
+        bindsock = listen_zero()
+
+        def spawn_accepts():
+            events = []
+            for _junk in range(2):
+                sock, addr = bindsock.accept()
+                events.append(spawn(accept, sock, addr, 201))
+            return events
+
+        spawned = spawn(spawn_accepts)
+        for dev in cu.get_account_ring().devs:
+            if dev is not None:
+                dev['port'] = bindsock.getsockname()[1]
+        cu.run_once()
+        for event in spawned.wait():
+            err = event.wait()
+            if err:
+                raise err
+        info = cb.get_info()
+        self.assertEqual(info['object_count'], 1)
+        self.assertEqual(info['bytes_used'], 3)
+        self.assertEqual(info['reported_put_timestamp'], '0000000001.00000')
+        self.assertEqual(info['reported_delete_timestamp'], '0')
+        self.assertEqual(info['reported_object_count'], 0)
+        self.assertEqual(info['reported_bytes_used'], 0)
 
 if __name__ == '__main__':
     unittest.main()
