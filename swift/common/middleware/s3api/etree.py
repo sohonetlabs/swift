@@ -14,10 +14,9 @@
 # limitations under the License.
 
 import lxml.etree
-from urllib import quote
 from copy import deepcopy
 from pkg_resources import resource_stream  # pylint: disable-msg=E0611
-import sys
+import six
 
 from swift.common.utils import get_logger
 from swift.common.middleware.s3api.exception import S3Exception
@@ -42,7 +41,7 @@ def cleanup_namespaces(elem):
             tag = tag[len('{%s}' % ns):]
         return tag
 
-    if not isinstance(elem.tag, basestring):
+    if not isinstance(elem.tag, six.string_types):
         # elem is a comment element.
         return
 
@@ -75,10 +74,9 @@ def fromstring(text, root_tag=None, logger=None):
                 lxml.etree.RelaxNG(file=rng).assertValid(elem)
         except IOError as e:
             # Probably, the schema file doesn't exist.
-            exc_type, exc_value, exc_traceback = sys.exc_info()
             logger = logger or get_logger({}, log_route='s3api')
             logger.error(e)
-            raise exc_type, exc_value, exc_traceback
+            raise
         except lxml.etree.DocumentInvalid as e:
             if logger:
                 logger.debug(e)
@@ -87,27 +85,18 @@ def fromstring(text, root_tag=None, logger=None):
     return elem
 
 
-def tostring(tree, encoding_type=None, use_s3ns=True):
+def tostring(tree, use_s3ns=True, xml_declaration=True):
     if use_s3ns:
         nsmap = tree.nsmap.copy()
         nsmap[None] = XMLNS_S3
 
         root = Element(tree.tag, attrib=tree.attrib, nsmap=nsmap)
         root.text = tree.text
-        root.extend(deepcopy(tree.getchildren()))
+        root.extend(deepcopy(list(tree)))
         tree = root
 
-    if encoding_type == 'url':
-        tree = deepcopy(tree)
-        for e in tree.iter():
-            # Some elements are not url-encoded even when we specify
-            # encoding_type=url.
-            blacklist = ['LastModified', 'ID', 'DisplayName', 'Initiated']
-            if e.tag not in blacklist:
-                if isinstance(e.text, basestring):
-                    e.text = quote(e.text)
-
-    return lxml.etree.tostring(tree, xml_declaration=True, encoding='UTF-8')
+    return lxml.etree.tostring(tree, xml_declaration=xml_declaration,
+                               encoding='UTF-8')
 
 
 class _Element(lxml.etree.ElementBase):
@@ -131,7 +120,9 @@ class _Element(lxml.etree.ElementBase):
         """
         utf-8 wrapper property of lxml.etree.Element.text
         """
-        return utf8encode(lxml.etree.ElementBase.text.__get__(self))
+        if six.PY2:
+            return utf8encode(lxml.etree.ElementBase.text.__get__(self))
+        return lxml.etree.ElementBase.text.__get__(self)
 
     @text.setter
     def text(self, value):

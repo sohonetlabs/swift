@@ -21,10 +21,10 @@ to plug in your own logging format/method.
 
 The logging format implemented below is as follows:
 
-client_ip remote_addr datetime request_method request_path protocol
+client_ip remote_addr end_time.datetime method path protocol
     status_int referer user_agent auth_token bytes_recvd bytes_sent
     client_etag transaction_id headers request_time source log_info
-    request_start_time request_end_time
+    start_time end_time policy_index
 
 These values are space-separated, and each is url-encoded, so that they can
 be separated with a simple .split()
@@ -71,19 +71,21 @@ if this is a middleware subrequest or not. A log processor calculating
 bandwidth usage will want to only sum up logs with no swift.source.
 """
 
-import sys
+import os
 import time
 
-import six
-from six.moves.urllib.parse import quote
+from swift.common.middleware.catch_errors import enforce_byte_count
 from swift.common.swob import Request
 from swift.common.utils import (get_logger, get_remote_client,
-                                config_true_value,
-                                InputProxy, list_from_csv, get_policy_index)
+                                config_true_value, reiterate,
+                                close_if_possible,
+                                InputProxy, list_from_csv, get_policy_index,
+                                split_path, StrAnonymizer, StrFormatTime,
+                                LogStringFormatter)
 
 from swift.common.storage_policy import POLICIES
-
-QUOTE_SAFE = '/:'
+from swift.common.registry import get_sensitive_headers, \
+    get_sensitive_params, register_sensitive_header
 
 
 class ProxyLoggingMiddleware(object):
@@ -93,6 +95,19 @@ class ProxyLoggingMiddleware(object):
 
     def __init__(self, app, conf, logger=None):
         self.app = app
+        self.pid = os.getpid()
+        self.log_formatter = LogStringFormatter(default='-', quote=True)
+        self.log_msg_template = conf.get(
+            'log_msg_template', (
+                '{client_ip} {remote_addr} {end_time.datetime} {method} '
+                '{path} {protocol} {status_int} {referer} {user_agent} '
+                '{auth_token} {bytes_recvd} {bytes_sent} {client_etag} '
+                '{transaction_id} {headers} {request_time} {source} '
+                '{log_info} {start_time} {end_time} {policy_index}'))
+        # The salt is only used in StrAnonymizer. This class requires bytes,
+        # convert it now to prevent useless convertion later.
+        self.anonymization_method = conf.get('log_anonymization_method', 'md5')
+        self.anonymization_salt = conf.get('log_anonymization_salt', '')
         self.log_hdrs = config_true_value(conf.get(
             'access_log_headers',
             conf.get('log_headers', 'no')))
@@ -118,11 +133,62 @@ class ProxyLoggingMiddleware(object):
             value = conf.get('access_' + key, conf.get(key, None))
             if value:
                 access_log_conf[key] = value
-        self.access_logger = logger or get_logger(access_log_conf,
-                                                  log_route='proxy-access')
-        self.access_logger.set_statsd_prefix('proxy-server')
+        self.access_logger = logger or get_logger(
+            access_log_conf,
+            log_route=conf.get('access_log_route', 'proxy-access'),
+            statsd_tail_prefix='proxy-server')
         self.reveal_sensitive_prefix = int(
             conf.get('reveal_sensitive_prefix', 16))
+        self.check_log_msg_template_validity()
+
+    def check_log_msg_template_validity(self):
+        replacements = {
+            # Time information
+            'end_time': StrFormatTime(1000001),
+            'start_time': StrFormatTime(1000000),
+            # Information worth to anonymize
+            'client_ip': StrAnonymizer('1.2.3.4', self.anonymization_method,
+                                       self.anonymization_salt),
+            'remote_addr': StrAnonymizer('4.3.2.1', self.anonymization_method,
+                                         self.anonymization_salt),
+            'domain': StrAnonymizer('', self.anonymization_method,
+                                    self.anonymization_salt),
+            'path': StrAnonymizer('/', self.anonymization_method,
+                                  self.anonymization_salt),
+            'referer': StrAnonymizer('ref', self.anonymization_method,
+                                     self.anonymization_salt),
+            'user_agent': StrAnonymizer('swift', self.anonymization_method,
+                                        self.anonymization_salt),
+            'headers': StrAnonymizer('header', self.anonymization_method,
+                                     self.anonymization_salt),
+            'client_etag': StrAnonymizer('etag', self.anonymization_method,
+                                         self.anonymization_salt),
+            'account': StrAnonymizer('a', self.anonymization_method,
+                                     self.anonymization_salt),
+            'container': StrAnonymizer('c', self.anonymization_method,
+                                       self.anonymization_salt),
+            'object': StrAnonymizer('', self.anonymization_method,
+                                    self.anonymization_salt),
+            # Others information
+            'method': 'GET',
+            'protocol': '',
+            'status_int': '0',
+            'auth_token': '1234...',
+            'bytes_recvd': '1',
+            'bytes_sent': '0',
+            'transaction_id': 'tx1234',
+            'request_time': '0.05',
+            'source': '',
+            'log_info': '',
+            'policy_index': '',
+            'ttfb': '0.05',
+            'pid': '42',
+            'wire_status_int': '200',
+        }
+        try:
+            self.log_formatter.format(self.log_msg_template, **replacements)
+        except Exception as e:
+            raise ValueError('Cannot interpolate log_msg_template: %s' % e)
 
     def method_from_req(self, req):
         return req.environ.get('swift.orig_req_method', req.method)
@@ -138,8 +204,27 @@ class ProxyLoggingMiddleware(object):
             return value[:self.reveal_sensitive_prefix] + '...'
         return value
 
+    def obscure_req(self, req):
+        for header in get_sensitive_headers():
+            if header in req.headers:
+                req.headers[header] = \
+                    self.obscure_sensitive(req.headers[header])
+
+        obscure_params = get_sensitive_params()
+        new_params = []
+        any_obscured = False
+        for k, v in req.params.items():
+            if k in obscure_params:
+                new_params.append((k, self.obscure_sensitive(v)))
+                any_obscured = True
+            else:
+                new_params.append((k, v))
+        if any_obscured:
+            req.params = new_params
+
     def log_request(self, req, status_int, bytes_received, bytes_sent,
-                    start_time, end_time, resp_headers=None):
+                    start_time, end_time, resp_headers=None, ttfb=0,
+                    wire_status_int=None):
         """
         Log a request.
 
@@ -150,7 +235,13 @@ class ProxyLoggingMiddleware(object):
         :param start_time: timestamp request started
         :param end_time: timestamp request completed
         :param resp_headers: dict of the response headers
+        :param wire_status_int: the on the wire status int
         """
+        self.obscure_req(req)
+        domain = req.environ.get('HTTP_HOST',
+                                 req.environ.get('SERVER_NAME', None))
+        if ':' in domain:
+            domain, port = domain.rsplit(':', 1)
         resp_headers = resp_headers or {}
         logged_headers = None
         if self.log_hdrs:
@@ -163,37 +254,67 @@ class ProxyLoggingMiddleware(object):
                                            for k, v in req.headers.items())
 
         method = self.method_from_req(req)
-        end_gmtime_str = time.strftime('%d/%b/%Y/%H/%M/%S',
-                                       time.gmtime(end_time))
         duration_time_str = "%.4f" % (end_time - start_time)
-        start_time_str = "%.9f" % start_time
-        end_time_str = "%.9f" % end_time
         policy_index = get_policy_index(req.headers, resp_headers)
-        self.access_logger.info(' '.join(
-            quote(str(x) if x else '-', QUOTE_SAFE)
-            for x in (
-                get_remote_client(req),
-                req.remote_addr,
-                end_gmtime_str,
-                method,
-                req.path_qs,
+
+        acc, cont, obj = None, None, None
+        swift_path = req.environ.get('swift.backend_path', req.path)
+        if swift_path.startswith('/v1/'):
+            _, acc, cont, obj = split_path(swift_path, 1, 4, True)
+
+        replacements = {
+            # Time information
+            'end_time': StrFormatTime(end_time),
+            'start_time': StrFormatTime(start_time),
+            # Information worth to anonymize
+            'client_ip': StrAnonymizer(get_remote_client(req),
+                                       self.anonymization_method,
+                                       self.anonymization_salt),
+            'remote_addr': StrAnonymizer(req.remote_addr,
+                                         self.anonymization_method,
+                                         self.anonymization_salt),
+            'domain': StrAnonymizer(domain, self.anonymization_method,
+                                    self.anonymization_salt),
+            'path': StrAnonymizer(req.path_qs, self.anonymization_method,
+                                  self.anonymization_salt),
+            'referer': StrAnonymizer(req.referer, self.anonymization_method,
+                                     self.anonymization_salt),
+            'user_agent': StrAnonymizer(req.user_agent,
+                                        self.anonymization_method,
+                                        self.anonymization_salt),
+            'headers': StrAnonymizer(logged_headers, self.anonymization_method,
+                                     self.anonymization_salt),
+            'client_etag': StrAnonymizer(req.headers.get('etag'),
+                                         self.anonymization_method,
+                                         self.anonymization_salt),
+            'account': StrAnonymizer(acc, self.anonymization_method,
+                                     self.anonymization_salt),
+            'container': StrAnonymizer(cont, self.anonymization_method,
+                                       self.anonymization_salt),
+            'object': StrAnonymizer(obj, self.anonymization_method,
+                                    self.anonymization_salt),
+            # Others information
+            'method': method,
+            'protocol':
                 req.environ.get('SERVER_PROTOCOL'),
-                status_int,
-                req.referer,
-                req.user_agent,
-                self.obscure_sensitive(req.headers.get('x-auth-token')),
-                bytes_received,
-                bytes_sent,
-                req.headers.get('etag', None),
-                req.environ.get('swift.trans_id'),
-                logged_headers,
-                duration_time_str,
-                req.environ.get('swift.source'),
-                ','.join(req.environ.get('swift.log_info') or ''),
-                start_time_str,
-                end_time_str,
-                policy_index
-            )))
+            'status_int': status_int,
+            'auth_token':
+                req.headers.get('x-auth-token'),
+            'bytes_recvd': bytes_received,
+            'bytes_sent': bytes_sent,
+            'transaction_id': req.environ.get('swift.trans_id'),
+            'request_time': duration_time_str,
+            'source': req.environ.get('swift.source'),
+            'log_info':
+                ','.join(req.environ.get('swift.log_info', '')),
+            'policy_index': policy_index,
+            'ttfb': ttfb,
+            'pid': self.pid,
+            'wire_status_int': wire_status_int or status_int,
+        }
+        self.access_logger.info(
+            self.log_formatter.format(self.log_msg_template,
+                                      **replacements))
 
         # Log timing and bytes-transferred data to StatsD
         metric_name = self.statsd_metric_name(req, status_int, method)
@@ -215,10 +336,11 @@ class ProxyLoggingMiddleware(object):
                                             bytes_received + bytes_sent)
 
     def get_metric_name_type(self, req):
-        if req.path.startswith('/v1/'):
+        swift_path = req.environ.get('swift.backend_path', req.path)
+        if swift_path.startswith('/v1/'):
             try:
                 stat_type = [None, 'account', 'container',
-                             'object'][req.path.strip('/').count('/')]
+                             'object'][swift_path.strip('/').count('/')]
             except IndexError:
                 stat_type = 'object'
         else:
@@ -264,82 +386,85 @@ class ProxyLoggingMiddleware(object):
         def my_start_response(status, headers, exc_info=None):
             start_response_args[0] = (status, list(headers), exc_info)
 
-        def status_int_for_logging(client_disconnect=False, start_status=None):
+        def status_int_for_logging(start_status, client_disconnect=False):
             # log disconnected clients as '499' status code
             if client_disconnect or input_proxy.client_disconnect:
-                ret_status_int = 499
-            elif start_status is None:
-                ret_status_int = int(
-                    start_response_args[0][0].split(' ', 1)[0])
-            else:
-                ret_status_int = start_status
-            return ret_status_int
+                return 499
+            return start_status
 
         def iter_response(iterable):
-            iterator = iter(iterable)
-            try:
-                chunk = next(iterator)
-                while not chunk:
-                    chunk = next(iterator)
-            except StopIteration:
-                chunk = ''
+            iterator = reiterate(iterable)
+            content_length = None
             for h, v in start_response_args[0][1]:
-                if h.lower() in ('content-length', 'transfer-encoding'):
+                if h.lower() == 'content-length':
+                    content_length = int(v)
+                    break
+                elif h.lower() == 'transfer-encoding':
                     break
             else:
-                if not chunk:
-                    start_response_args[0][1].append(('Content-Length', '0'))
-                elif isinstance(iterable, list):
+                if isinstance(iterator, list):
+                    content_length = sum(len(i) for i in iterator)
                     start_response_args[0][1].append(
-                        ('Content-Length', str(sum(len(i) for i in iterable))))
+                        ('Content-Length', str(content_length)))
+
+            req = Request(env)
+            method = self.method_from_req(req)
+            if method == 'HEAD':
+                content_length = 0
+            if content_length is not None:
+                iterator = enforce_byte_count(iterator, content_length)
+
+            wire_status_int = int(start_response_args[0][0].split(' ', 1)[0])
             resp_headers = dict(start_response_args[0][1])
             start_response(*start_response_args[0])
-            req = Request(env)
 
             # Log timing information for time-to-first-byte (GET requests only)
-            method = self.method_from_req(req)
+            ttfb = 0.0
             if method == 'GET':
-                status_int = status_int_for_logging()
                 policy_index = get_policy_index(req.headers, resp_headers)
-                metric_name = self.statsd_metric_name(req, status_int, method)
+                metric_name = self.statsd_metric_name(
+                    req, wire_status_int, method)
                 metric_name_policy = self.statsd_metric_name_policy(
-                    req, status_int, method, policy_index)
+                    req, wire_status_int, method, policy_index)
+                ttfb = time.time() - start_time
                 if metric_name:
-                    self.access_logger.timing_since(
-                        metric_name + '.first-byte.timing', start_time)
+                    self.access_logger.timing(
+                        metric_name + '.first-byte.timing', ttfb * 1000)
                 if metric_name_policy:
-                    self.access_logger.timing_since(
-                        metric_name_policy + '.first-byte.timing', start_time)
+                    self.access_logger.timing(
+                        metric_name_policy + '.first-byte.timing', ttfb * 1000)
 
             bytes_sent = 0
             client_disconnect = False
+            start_status = wire_status_int
             try:
-                while chunk:
+                for chunk in iterator:
                     bytes_sent += len(chunk)
                     yield chunk
-                    chunk = next(iterator)
             except GeneratorExit:  # generator was closed before we finished
                 client_disconnect = True
                 raise
+            except Exception:
+                start_status = 500
+                raise
             finally:
-                status_int = status_int_for_logging(client_disconnect)
+                status_int = status_int_for_logging(
+                    start_status, client_disconnect)
                 self.log_request(
                     req, status_int, input_proxy.bytes_received, bytes_sent,
-                    start_time, time.time(), resp_headers=resp_headers)
-                close_method = getattr(iterable, 'close', None)
-                if callable(close_method):
-                    close_method()
+                    start_time, time.time(), resp_headers=resp_headers,
+                    ttfb=ttfb, wire_status_int=wire_status_int)
+                close_if_possible(iterator)
 
         try:
             iterable = self.app(env, my_start_response)
         except Exception:
-            exc_type, exc_value, exc_traceback = sys.exc_info()
             req = Request(env)
-            status_int = status_int_for_logging(start_status=500)
+            status_int = status_int_for_logging(500)
             self.log_request(
                 req, status_int, input_proxy.bytes_received, 0, start_time,
                 time.time())
-            six.reraise(exc_type, exc_value, exc_traceback)
+            raise
         else:
             return iter_response(iterable)
 
@@ -347,6 +472,12 @@ class ProxyLoggingMiddleware(object):
 def filter_factory(global_conf, **local_conf):
     conf = global_conf.copy()
     conf.update(local_conf)
+
+    # Normally it would be the middleware that uses the header that
+    # would register it, but because there could be 3rd party auth middlewares
+    # that use 'x-auth-token' or 'x-storage-token' we special case it here.
+    register_sensitive_header('x-auth-token')
+    register_sensitive_header('x-storage-token')
 
     def proxy_logger(app):
         return ProxyLoggingMiddleware(app, conf)

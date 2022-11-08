@@ -13,16 +13,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import sys
+import json
 
+from swift.common import constraints
 from swift.common.http import HTTP_OK, HTTP_PARTIAL_CONTENT, HTTP_NO_CONTENT
-from swift.common.swob import Range, content_range_header_value
-from swift.common.utils import public
+from swift.common.request_helpers import update_etag_is_at_header
+from swift.common.swob import Range, content_range_header_value, \
+    normalize_etag
+from swift.common.utils import public, list_from_csv
+from swift.common.registry import get_swift_info
 
-from swift.common.middleware.s3api.utils import S3Timestamp
+from swift.common.middleware.versioned_writes.object_versioning import \
+    DELETE_MARKER_CONTENT_TYPE
+from swift.common.middleware.s3api.utils import S3Timestamp, sysmeta_header
 from swift.common.middleware.s3api.controllers.base import Controller
 from swift.common.middleware.s3api.s3response import S3NotImplemented, \
-    InvalidRange, NoSuchKey, InvalidArgument
+    InvalidRange, NoSuchKey, NoSuchVersion, InvalidArgument, HTTPNoContent, \
+    PreconditionFailed, KeyTooLongError
 
 
 class ObjectController(Controller):
@@ -37,7 +44,7 @@ class ObjectController(Controller):
         conditions which are described in the following document.
         - http://www.w3.org/Protocols/rfc2616/rfc2616-sec14.html#sec14.35
         """
-        length = long(resp.headers.get('Content-Length'))
+        length = int(resp.headers.get('Content-Length'))
 
         try:
             content_range = Range(req_range)
@@ -63,10 +70,42 @@ class ObjectController(Controller):
         return resp
 
     def GETorHEAD(self, req):
-        resp = req.get_response(self.app)
+        had_match = False
+        for match_header in ('if-match', 'if-none-match'):
+            if match_header not in req.headers:
+                continue
+            had_match = True
+            for value in list_from_csv(req.headers[match_header]):
+                value = normalize_etag(value)
+                if value.endswith('-N'):
+                    # Deal with fake S3-like etags for SLOs uploaded via Swift
+                    req.headers[match_header] += ', ' + value[:-2]
+
+        if had_match:
+            # Update where to look
+            update_etag_is_at_header(req, sysmeta_header('object', 'etag'))
+
+        object_name = req.object_name
+        version_id = req.params.get('versionId')
+        if version_id not in ('null', None) and \
+                'object_versioning' not in get_swift_info():
+            raise S3NotImplemented()
+
+        query = {} if version_id is None else {'version-id': version_id}
+        if version_id not in ('null', None):
+            container_info = req.get_container_info(self.app)
+            if not container_info.get(
+                    'sysmeta', {}).get('versions-container', ''):
+                # Versioning has never been enabled
+                raise NoSuchVersion(object_name, version_id)
+
+        resp = req.get_response(self.app, query=query)
 
         if req.method == 'HEAD':
             resp.app_iter = None
+
+        if 'x-amz-meta-deleted' in resp.headers:
+            raise NoSuchKey(object_name)
 
         for key in ('content-type', 'content-language', 'expires',
                     'cache-control', 'content-disposition',
@@ -101,6 +140,8 @@ class ObjectController(Controller):
         """
         Handle PUT Object and PUT Object (Copy) request
         """
+        if len(req.object_name) > constraints.MAX_OBJECT_NAME_LENGTH:
+            raise KeyTooLongError()
         # set X-Timestamp by s3api to use at copy resp body
         req_timestamp = S3Timestamp.now()
         req.headers['X-Timestamp'] = req_timestamp.internal
@@ -110,15 +151,17 @@ class ObjectController(Controller):
                                   req.headers['X-Amz-Copy-Source-Range'],
                                   'Illegal copy header')
         req.check_copy_source(self.app)
+        if not req.headers.get('Content-Type'):
+            # can't setdefault because it can be None for some reason
+            req.headers['Content-Type'] = 'binary/octet-stream'
         resp = req.get_response(self.app)
 
         if 'X-Amz-Copy-Source' in req.headers:
             resp.append_copy_resp_body(req.controller_name,
                                        req_timestamp.s3xmlformat)
-
             # delete object metadata from response
             for key in list(resp.headers.keys()):
-                if key.startswith('x-amz-meta-'):
+                if key.lower().startswith('x-amz-meta-'):
                     del resp.headers[key]
 
         resp.status = HTTP_OK
@@ -128,23 +171,74 @@ class ObjectController(Controller):
     def POST(self, req):
         raise S3NotImplemented()
 
+    def _restore_on_delete(self, req):
+        resp = req.get_response(self.app, 'GET', req.container_name, '',
+                                query={'prefix': req.object_name,
+                                       'versions': True})
+        if resp.status_int != HTTP_OK:
+            return resp
+        old_versions = json.loads(resp.body)
+        resp = None
+        for item in old_versions:
+            if item['content_type'] == DELETE_MARKER_CONTENT_TYPE:
+                resp = None
+                break
+            try:
+                resp = req.get_response(self.app, 'PUT', query={
+                    'version-id': item['version_id']})
+            except PreconditionFailed:
+                self.logger.debug('skipping failed PUT?version-id=%s' %
+                                  item['version_id'])
+                continue
+            # if that worked, we'll go ahead and fix up the status code
+            resp.status_int = HTTP_NO_CONTENT
+            break
+        return resp
+
     @public
     def DELETE(self, req):
         """
         Handle DELETE Object request
         """
+        if 'versionId' in req.params and \
+                req.params['versionId'] != 'null' and \
+                'object_versioning' not in get_swift_info():
+            raise S3NotImplemented()
+
+        version_id = req.params.get('versionId')
+        if version_id not in ('null', None):
+            container_info = req.get_container_info(self.app)
+            if not container_info.get(
+                    'sysmeta', {}).get('versions-container', ''):
+                # Versioning has never been enabled
+                return HTTPNoContent(headers={'x-amz-version-id': version_id})
+
         try:
-            query = req.gen_multipart_manifest_delete_query(self.app)
+            try:
+                query = req.gen_multipart_manifest_delete_query(
+                    self.app, version=version_id)
+            except NoSuchKey:
+                query = {}
+
             req.headers['Content-Type'] = None  # Ignore client content-type
+
+            if version_id is not None:
+                query['version-id'] = version_id
+                query['symlink'] = 'get'
+
             resp = req.get_response(self.app, query=query)
-            if query and resp.status_int == HTTP_OK:
+            if query.get('multipart-manifest') and resp.status_int == HTTP_OK:
                 for chunk in resp.app_iter:
                     pass  # drain the bulk-deleter response
                 resp.status = HTTP_NO_CONTENT
-                resp.body = ''
+                resp.body = b''
+            if resp.sw_headers.get('X-Object-Current-Version-Id') == 'null':
+                new_resp = self._restore_on_delete(req)
+                if new_resp:
+                    resp = new_resp
         except NoSuchKey:
             # expect to raise NoSuchBucket when the bucket doesn't exist
-            exc_type, exc_value, exc_traceback = sys.exc_info()
             req.get_container_info(self.app)
-            raise exc_type, exc_value, exc_traceback
+            # else -- it's gone! Success.
+            return HTTPNoContent()
         return resp

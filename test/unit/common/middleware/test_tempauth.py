@@ -16,53 +16,24 @@
 
 import json
 import unittest
-from contextlib import contextmanager
-from base64 import b64encode
+from base64 import b64encode as _b64encode
 from time import time
 
+import six
 from six.moves.urllib.parse import quote, urlparse
 from swift.common.middleware import tempauth as auth
 from swift.common.middleware.acl import format_acl
 from swift.common.swob import Request, Response
-from swift.common.utils import split_path
+from swift.common.utils import split_path, StatsdClient
+from test.unit import FakeMemcache
 
 NO_CONTENT_RESP = (('204 No Content', {}, ''),)   # mock server response
 
 
-class FakeMemcache(object):
-
-    def __init__(self):
-        self.store = {}
-
-    def get(self, key):
-        return self.store.get(key)
-
-    def set(self, key, value, time=0):
-        if isinstance(value, (tuple, list)):
-            decoded = []
-            for elem in value:
-                if type(elem) == str:
-                    decoded.append(elem.decode('utf8'))
-                else:
-                    decoded.append(elem)
-            value = tuple(decoded)
-        self.store[key] = value
-        return True
-
-    def incr(self, key, time=0):
-        self.store[key] = self.store.setdefault(key, 0) + 1
-        return self.store[key]
-
-    @contextmanager
-    def soft_lock(self, key, timeout=0, retries=5):
-        yield True
-
-    def delete(self, key):
-        try:
-            del self.store[key]
-        except Exception:
-            pass
-        return True
+def b64encode(str_or_bytes):
+    if not isinstance(str_or_bytes, bytes):
+        str_or_bytes = str_or_bytes.encode('utf8')
+    return _b64encode(str_or_bytes).decode('ascii')
 
 
 class FakeApp(object):
@@ -125,6 +96,34 @@ class TestAuth(unittest.TestCase):
         req = Request.blank(path, **kwargs)
         req.environ['swift.cache'] = FakeMemcache()
         return req
+
+    def test_statsd_prefix(self):
+        app = FakeApp()
+        ath = auth.filter_factory({'log_statsd_host': 'example.com'})(app)
+        self.assertIsNotNone(ath.logger.logger.statsd_client)
+        self.assertIsInstance(ath.logger.logger.statsd_client,
+                              StatsdClient)
+        self.assertEqual('tempauth.AUTH_.',
+                         ath.logger.logger.statsd_client._prefix)
+
+        ath = auth.filter_factory({'log_statsd_metric_prefix': 'foo',
+                                   'log_name': 'bar',
+                                   'log_statsd_host': 'example.com'})(app)
+        self.assertIsNotNone(ath.logger.logger.statsd_client)
+        self.assertIsInstance(ath.logger.logger.statsd_client,
+                              StatsdClient)
+        self.assertEqual('foo.tempauth.AUTH_.',
+                         ath.logger.logger.statsd_client._prefix)
+
+        ath = auth.filter_factory({'log_statsd_metric_prefix': 'foo',
+                                   'log_name': 'bar',
+                                   'log_statsd_host': 'example.com',
+                                   'reseller_prefix': 'TEST'})(app)
+        self.assertIsNotNone(ath.logger.logger.statsd_client)
+        self.assertIsInstance(ath.logger.logger.statsd_client,
+                              StatsdClient)
+        self.assertEqual('foo.tempauth.TEST_.',
+                         ath.logger.logger.statsd_client._prefix)
 
     def test_reseller_prefix_init(self):
         app = FakeApp()
@@ -273,7 +272,25 @@ class TestAuth(unittest.TestCase):
         self.assertEqual(req.environ['swift.authorize'],
                          local_auth.denied_response)
 
-    def test_auth_with_s3_authorization_good(self):
+    def test_auth_with_swift3_authorization_good(self):
+        local_app = FakeApp()
+        local_auth = auth.filter_factory(
+            {'user_s3_s3': 'secret .admin'})(local_app)
+        req = self._make_request('/v1/s3:s3', environ={
+            'swift3.auth_details': {
+                'access_key': 's3:s3',
+                'signature': b64encode('sig'),
+                'string_to_sign': 't',
+                'check_signature': lambda secret: True}})
+        resp = req.get_response(local_auth)
+
+        self.assertEqual(resp.status_int, 404)
+        self.assertEqual(local_app.calls, 1)
+        self.assertEqual(req.environ['PATH_INFO'], '/v1/AUTH_s3')
+        self.assertEqual(req.environ['swift.authorize'],
+                         local_auth.authorize)
+
+    def test_auth_with_s3api_authorization_good(self):
         local_app = FakeApp()
         local_auth = auth.filter_factory(
             {'user_s3_s3': 'secret .admin'})(local_app)
@@ -291,7 +308,25 @@ class TestAuth(unittest.TestCase):
         self.assertEqual(req.environ['swift.authorize'],
                          local_auth.authorize)
 
-    def test_auth_with_s3_authorization_invalid(self):
+    def test_auth_with_swift3_authorization_invalid(self):
+        local_app = FakeApp()
+        local_auth = auth.filter_factory(
+            {'user_s3_s3': 'secret .admin'})(local_app)
+        req = self._make_request('/v1/s3:s3', environ={
+            'swift3.auth_details': {
+                'access_key': 's3:s3',
+                'signature': b64encode('sig'),
+                'string_to_sign': 't',
+                'check_signature': lambda secret: False}})
+        resp = req.get_response(local_auth)
+
+        self.assertEqual(resp.status_int, 401)
+        self.assertEqual(local_app.calls, 1)
+        self.assertEqual(req.environ['PATH_INFO'], '/v1/s3:s3')
+        self.assertEqual(req.environ['swift.authorize'],
+                         local_auth.denied_response)
+
+    def test_auth_with_s3api_authorization_invalid(self):
         local_app = FakeApp()
         local_auth = auth.filter_factory(
             {'user_s3_s3': 'secret .admin'})(local_app)
@@ -309,7 +344,24 @@ class TestAuth(unittest.TestCase):
         self.assertEqual(req.environ['swift.authorize'],
                          local_auth.denied_response)
 
-    def test_auth_with_old_s3_details(self):
+    def test_auth_with_old_swift3_details(self):
+        local_app = FakeApp()
+        local_auth = auth.filter_factory(
+            {'user_s3_s3': 'secret .admin'})(local_app)
+        req = self._make_request('/v1/s3:s3', environ={
+            'swift3.auth_details': {
+                'access_key': 's3:s3',
+                'signature': b64encode('sig'),
+                'string_to_sign': 't'}})
+        resp = req.get_response(local_auth)
+
+        self.assertEqual(resp.status_int, 401)
+        self.assertEqual(local_app.calls, 1)
+        self.assertEqual(req.environ['PATH_INFO'], '/v1/s3:s3')
+        self.assertEqual(req.environ['swift.authorize'],
+                         local_auth.denied_response)
+
+    def test_auth_with_old_s3api_details(self):
         local_app = FakeApp()
         local_auth = auth.filter_factory(
             {'user_s3_s3': 'secret .admin'})(local_app)
@@ -477,7 +529,7 @@ class TestAuth(unittest.TestCase):
 
     def test_account_put_permissions(self):
         self.test_auth = auth.filter_factory({})(
-            FakeApp(iter(NO_CONTENT_RESP * 4)))
+            FakeApp(iter(NO_CONTENT_RESP * 5)))
         req = self._make_request('/v1/AUTH_new',
                                  environ={'REQUEST_METHOD': 'PUT'})
         req.remote_user = 'act:usr,act'
@@ -503,6 +555,12 @@ class TestAuth(unittest.TestCase):
         resp = self.test_auth.authorize(req)
         self.assertIsNone(resp)
 
+        req = self._make_request('/v1/AUTH_new',
+                                 environ={'REQUEST_METHOD': 'PUT'})
+        req.remote_user = 'act:usr,act,.reseller_reader'
+        resp = self.test_auth.authorize(req)
+        self.assertEqual(resp.status_int, 403)
+
         # .super_admin is not something the middleware should ever see or care
         # about
         req = self._make_request('/v1/AUTH_new',
@@ -513,7 +571,7 @@ class TestAuth(unittest.TestCase):
 
     def test_account_delete_permissions(self):
         self.test_auth = auth.filter_factory({})(
-            FakeApp(iter(NO_CONTENT_RESP * 4)))
+            FakeApp(iter(NO_CONTENT_RESP * 5)))
         req = self._make_request('/v1/AUTH_new',
                                  environ={'REQUEST_METHOD': 'DELETE'})
         req.remote_user = 'act:usr,act'
@@ -539,6 +597,12 @@ class TestAuth(unittest.TestCase):
         resp = self.test_auth.authorize(req)
         self.assertIsNone(resp)
 
+        req = self._make_request('/v1/AUTH_new',
+                                 environ={'REQUEST_METHOD': 'DELETE'})
+        req.remote_user = 'act:usr,act,.reseller_reader'
+        resp = self.test_auth.authorize(req)
+        self.assertEqual(resp.status_int, 403)
+
         # .super_admin is not something the middleware should ever see or care
         # about
         req = self._make_request('/v1/AUTH_new',
@@ -562,6 +626,15 @@ class TestAuth(unittest.TestCase):
         self.assertAlmostEqual(int(resp.headers['x-auth-token-expires']),
                                auth.DEFAULT_TOKEN_LIFE - 0.5, delta=0.5)
         self.assertGreater(len(resp.headers['x-auth-token']), 10)
+
+    def test_get_token_memcache_error(self):
+        test_auth = auth.filter_factory({'user_ac_user': 'testing'})(FakeApp())
+        req = self._make_request(
+            '/auth/v1.0',
+            headers={'X-Auth-User': 'ac:user', 'X-Auth-Key': 'testing'})
+        req.environ['swift.cache'] = FakeMemcache(error_on_set=[True])
+        resp = req.get_response(test_auth)
+        self.assertEqual(resp.status_int, 503)
 
     def test_get_token_success_other_auth_prefix(self):
         test_auth = auth.filter_factory({'user_ac_user': 'testing',
@@ -764,8 +837,17 @@ class TestAuth(unittest.TestCase):
         req = self._make_request('/v1/AUTH_cfa',
                                  headers={'X-Auth-Token': 'AUTH_t'})
         req.remote_user = '.reseller_admin'
-        self.test_auth.authorize(req)
+        resp = self.test_auth.authorize(req)
+        self.assertIsNone(resp)
         self.assertEqual(owner_values, [True])
+
+        owner_values = []
+        req = self._make_request('/v1/AUTH_cfa',
+                                 headers={'X-Auth-Token': 'AUTH_t'})
+        req.remote_user = '.reseller_reader'
+        resp = self.test_auth.authorize(req)
+        self.assertIsNone(resp)
+        self.assertEqual(owner_values, [False])
 
     def test_admin_is_owner(self):
         orig_authorize = self.test_auth.authorize
@@ -919,9 +1001,11 @@ class TestAuth(unittest.TestCase):
 
     def test_successful_token_unicode_user(self):
         app = FakeApp(iter(NO_CONTENT_RESP * 2))
-        ath = auth.filter_factory(
-            {u'user_t\u00e9st_t\u00e9ster'.encode('utf8'):
-             u'p\u00e1ss .admin'.encode('utf8')})(app)
+        conf = {u'user_t\u00e9st_t\u00e9ster': u'p\u00e1ss .admin'}
+        if six.PY2:
+            conf = {k.encode('utf8'): v.encode('utf8')
+                    for k, v in conf.items()}
+        ath = auth.filter_factory(conf)(app)
         quoted_acct = quote(u'/v1/AUTH_t\u00e9st'.encode('utf8'))
         memcache = FakeMemcache()
 
@@ -956,10 +1040,41 @@ class TestAuth(unittest.TestCase):
 
         # ...but it also works if you send the account raw
         req = self._make_request(
-            u'/v1/AUTH_t\u00e9st', headers={'X-Auth-Token': auth_token})
+            u'/v1/AUTH_t\u00e9st'.encode('utf8'),
+            headers={'X-Auth-Token': auth_token})
         req.environ['swift.cache'] = memcache
         resp = req.get_response(ath)
         self.assertEqual(204, resp.status_int)
+
+    def test_request_method_not_allowed(self):
+        test_auth = auth.filter_factory({'user_ac_user': 'testing'})(FakeApp())
+        req = self._make_request(
+            '/auth/v1.0',
+            headers={'X-Auth-User': 'ac:user', 'X-Auth-Key': 'testing'},
+            environ={'REQUEST_METHOD': 'PUT'})
+        resp = req.get_response(test_auth)
+        self.assertEqual(resp.status_int, 405)
+
+        req = self._make_request(
+            '/auth/v1.0',
+            headers={'X-Auth-User': 'ac:user', 'X-Auth-Key': 'testing'},
+            environ={'REQUEST_METHOD': 'HEAD'})
+        resp = req.get_response(test_auth)
+        self.assertEqual(resp.status_int, 405)
+
+        req = self._make_request(
+            '/auth/v1.0',
+            headers={'X-Auth-User': 'ac:user', 'X-Auth-Key': 'testing'},
+            environ={'REQUEST_METHOD': 'POST'})
+        resp = req.get_response(test_auth)
+        self.assertEqual(resp.status_int, 405)
+
+        req = self._make_request(
+            '/auth/v1.0',
+            headers={'X-Auth-User': 'ac:user', 'X-Auth-Key': 'testing'},
+            environ={'REQUEST_METHOD': 'DELETE'})
+        resp = req.get_response(test_auth)
+        self.assertEqual(resp.status_int, 405)
 
 
 class TestAuthWithMultiplePrefixes(TestAuth):
@@ -1079,12 +1194,17 @@ class TestParseUserCreation(unittest.TestCase):
             'user_test_tester3': 'testing',
             'user_has_url': 'urlly .admin http://a.b/v1/DEF_has',
             'user_admin_admin': 'admin .admin .reseller_admin',
+            'user_admin_auditor': 'admin_ro .reseller_reader',
         })(FakeApp())
         self.assertEqual(auth_filter.users, {
             'admin:admin': {
                 'url': '$HOST/v1/ABC_admin',
                 'groups': ['.admin', '.reseller_admin'],
                 'key': 'admin'
+            }, 'admin:auditor': {
+                'url': '$HOST/v1/ABC_admin',
+                'groups': ['.reseller_reader'],
+                'key': 'admin_ro'
             }, 'test:tester3': {
                 'url': '$HOST/v1/ABC_test',
                 'groups': [],
@@ -1126,6 +1246,14 @@ class TestParseUserCreation(unittest.TestCase):
             'user_bob_bobby': '',
             'user_admin_admin': 'admin .admin .reseller_admin',
         }), FakeApp())
+
+    def test_account_with_no_user(self):
+        expected_msg = 'key user_testtester was provided in an invalid format'
+        with self.assertRaises(ValueError) as ctx:
+            auth.filter_factory({
+                'user_testtester': 'testing',
+            })(FakeApp())
+        self.assertEqual(str(ctx.exception), expected_msg)
 
 
 class TestAccountAcls(unittest.TestCase):
@@ -1342,13 +1470,13 @@ class TestAccountAcls(unittest.TestCase):
             resp = req.get_response(test_auth)
             self.assertEqual(resp.status_int, 204)
 
-        errmsg = 'X-Account-Access-Control invalid: %s'
+        errmsg = b'X-Account-Access-Control invalid: %s'
         # syntactically invalid acls get a 400
         update = {'x-account-access-control': bad_acl}
         req = self._make_request(target, headers=dict(good_headers, **update))
         resp = req.get_response(test_auth)
         self.assertEqual(resp.status_int, 400)
-        self.assertEqual(errmsg % "Syntax error", resp.body[:46])
+        self.assertEqual(errmsg % b"Syntax error", resp.body[:46])
 
         # syntactically valid acls with bad keys also get a 400
         update = {'x-account-access-control': wrong_acl}
@@ -1356,7 +1484,7 @@ class TestAccountAcls(unittest.TestCase):
         resp = req.get_response(test_auth)
         self.assertEqual(resp.status_int, 400)
         self.assertTrue(resp.body.startswith(
-            errmsg % 'Key "other-auth-system" not recognized'), resp.body)
+            errmsg % b'Key "other-auth-system" not recognized'), resp.body)
 
         # and do something sane with crazy data
         update = {'x-account-access-control': u'{"\u1234": []}'.encode('utf8')}
@@ -1364,7 +1492,7 @@ class TestAccountAcls(unittest.TestCase):
         resp = req.get_response(test_auth)
         self.assertEqual(resp.status_int, 400)
         self.assertTrue(resp.body.startswith(
-            errmsg % 'Key "\\u1234" not recognized'), resp.body)
+            errmsg % b'Key "\\u1234" not recognized'), resp.body)
 
         # acls with good keys but bad values also get a 400
         update = {'x-account-access-control': bad_value_acl}
@@ -1372,7 +1500,7 @@ class TestAccountAcls(unittest.TestCase):
         resp = req.get_response(test_auth)
         self.assertEqual(resp.status_int, 400)
         self.assertTrue(resp.body.startswith(
-            errmsg % 'Value for key "admin" must be a list'), resp.body)
+            errmsg % b'Value for key "admin" must be a list'), resp.body)
 
         # acls with non-string-types in list also get a 400
         update = {'x-account-access-control': bad_list_types}
@@ -1380,7 +1508,7 @@ class TestAccountAcls(unittest.TestCase):
         resp = req.get_response(test_auth)
         self.assertEqual(resp.status_int, 400)
         self.assertTrue(resp.body.startswith(
-            errmsg % 'Elements of "read-only" list must be strings'),
+            errmsg % b'Elements of "read-only" list must be strings'),
             resp.body)
 
         # acls with wrong json structure also get a 400
@@ -1388,14 +1516,14 @@ class TestAccountAcls(unittest.TestCase):
         req = self._make_request(target, headers=dict(good_headers, **update))
         resp = req.get_response(test_auth)
         self.assertEqual(resp.status_int, 400)
-        self.assertEqual(errmsg % "Syntax error", resp.body[:46])
+        self.assertEqual(errmsg % b"Syntax error", resp.body[:46])
 
         # acls with wrong json structure also get a 400
         update = {'x-account-access-control': not_dict_acl2}
         req = self._make_request(target, headers=dict(good_headers, **update))
         resp = req.get_response(test_auth)
         self.assertEqual(resp.status_int, 400)
-        self.assertEqual(errmsg % "Syntax error", resp.body[:46])
+        self.assertEqual(errmsg % b"Syntax error", resp.body[:46])
 
     def test_acls_propagate_to_sysmeta(self):
         test_auth = auth.filter_factory({'user_admin_user': 'testing'})(
@@ -1521,6 +1649,16 @@ class ServiceTokenFunctionality(unittest.TestCase):
         self.assertEqual(resp.status_int, 200)
         resp = self._make_authed_request(
             {'reseller_prefix': 'AUTH'},
+            'admin:mary,admin,AUTH_admin,.reseller_reader',
+            '/v1/AUTH_acct', method='GET')
+        self.assertEqual(resp.status_int, 200)
+        resp = self._make_authed_request(
+            {'reseller_prefix': 'AUTH'},
+            'admin:mary,admin,AUTH_admin,.reseller_reader',
+            '/v1/AUTH_acct/c', method='GET')
+        self.assertEqual(resp.status_int, 200)
+        resp = self._make_authed_request(
+            {'reseller_prefix': 'AUTH'},
             'admin:mary,admin,AUTH_admin,.reseller_admin',
             '/v1/AUTH_acct', method='GET')
         self.assertEqual(resp.status_int, 200)
@@ -1547,6 +1685,26 @@ class ServiceTokenFunctionality(unittest.TestCase):
             'acct:joe,acct,AUTH_acct',
             '/v1/AUTH_acct',
             method='DELETE')
+        self.assertEqual(resp.status_int, 403)
+        resp = self._make_authed_request(
+            {'reseller_prefix': 'AUTH'},
+            'admin:mary,admin,.admin,.reseller_reader',
+            '/v1/AUTH_acct', method='PUT')
+        self.assertEqual(resp.status_int, 403)
+        resp = self._make_authed_request(
+            {'reseller_prefix': 'AUTH'},
+            'admin:mary,admin,.admin,.reseller_reader',
+            '/v1/AUTH_acct', method='DELETE')
+        self.assertEqual(resp.status_int, 403)
+        resp = self._make_authed_request(
+            {'reseller_prefix': 'AUTH'},
+            'admin:mary,admin,.admin,.reseller_reader',
+            '/v1/AUTH_acct/c', method='PUT')
+        self.assertEqual(resp.status_int, 403)
+        resp = self._make_authed_request(
+            {'reseller_prefix': 'AUTH'},
+            'admin:mary,admin,.admin,.reseller_reader',
+            '/v1/AUTH_acct/c', method='DELETE')
         self.assertEqual(resp.status_int, 403)
 
     def test_authed_for_primary_path_multiple(self):
@@ -1734,6 +1892,7 @@ class TestUtilityMethods(unittest.TestCase):
         auth_inst = auth.filter_factory({})(FakeApp())
         req = Request({'PATH_INFO': '/'})
         self.assertRaises(ValueError, auth_inst.account_acls, req)
+
 
 if __name__ == '__main__':
     unittest.main()

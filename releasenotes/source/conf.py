@@ -65,8 +65,8 @@ source_suffix = '.rst'
 master_doc = 'index'
 
 # General information about the project.
-project = u'Swift Release Notes'
-copyright = u'%d, OpenStack Foundation' % datetime.datetime.now().year
+project = 'Swift Release Notes'
+copyright = '%d, OpenStack Foundation' % datetime.datetime.now().year
 
 # Release notes do not need a version number in the title, they
 # cover multiple releases.
@@ -80,7 +80,7 @@ release = ''
 #
 # This is also used if you do content translation via gettext catalogs.
 # Usually you set "language" from the command line for these cases.
-language = None
+# language = None
 
 # There are two options for replacing |today|: either, you set today to some
 # non-false value, then it is used:
@@ -116,7 +116,7 @@ exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store']
 # show_authors = False
 
 # The name of the Pygments (syntax highlighting) style to use.
-pygments_style = 'sphinx'
+pygments_style = 'native'
 
 # A list of ignored prefixes for module index sorting.
 # modindex_common_prefix = []
@@ -158,8 +158,8 @@ html_theme = 'openstackdocs'
 # html_logo = None
 
 # The name of an image file (relative to this directory) to use as a favicon of
-# the docs.  This file should be a Windows icon file (.ico) being 16x16 or 32x32
-# pixels large.
+# the docs.  This file should be a Windows icon file (.ico) being 16x16 or
+# 32x32 pixels large.
 #
 # html_favicon = None
 
@@ -173,11 +173,6 @@ html_theme = 'openstackdocs'
 # directly to the root of the documentation.
 #
 # html_extra_path = []
-
-# If not '', a 'Last updated on:' timestamp is inserted at every page bottom,
-# using the given strftime format.
-# html_last_updated_fmt = '%b %d, %Y'
-html_last_updated_fmt = '%Y-%m-%d %H:%M'
 
 # If true, SmartyPants will be used to convert quotes and dashes to
 # typographically correct entities.
@@ -352,6 +347,7 @@ htmlhelp_basename = 'SwiftReleaseNotesdoc'
 locale_dirs = ['locale/']
 
 # -- Options for openstackdocstheme -------------------------------------------
-repository_name = 'openstack/swift'
-bug_project = 'swift'
-bug_tag = ''
+openstackdocs_repo_name = 'openstack/swift'
+openstackdocs_auto_name = False
+openstackdocs_bug_project = 'swift'
+openstackdocs_bug_tag = ''

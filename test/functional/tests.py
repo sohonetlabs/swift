@@ -15,19 +15,25 @@
 # limitations under the License.
 
 from datetime import datetime
-import email.parser
-import hashlib
+import io
 import locale
 import random
 import six
 from six.moves import urllib
 import time
-import unittest2
+import unittest
 import uuid
 from copy import deepcopy
 import eventlet
 from swift.common.http import is_success, is_client_error
+from swift.common.swob import normalize_etag
+from swift.common.utils import md5
 from email.utils import parsedate
+
+if six.PY2:
+    from email.parser import FeedParser
+else:
+    from email.parser import BytesFeedParser as FeedParser
 
 import mock
 
@@ -63,8 +69,11 @@ class Utils(object):
                      u'\u1802\u0901\uF111\uD20F\uB30D\u940B\u850A\u5607'\
                      u'\u3705\u1803\u0902\uF112\uD210\uB30E\u940C\u850B'\
                      u'\u5608\u3706\u1804\u0903\u03A9\u2603'
-        return ''.join([random.choice(utf8_chars)
-                        for x in range(length)]).encode('utf-8')
+        ustr = u''.join([random.choice(utf8_chars)
+                         for x in range(length)])
+        if six.PY2:
+            return ustr.encode('utf-8')
+        return ustr
 
     create_name = create_ascii_name
 
@@ -85,7 +94,7 @@ class BaseEnv(object):
         pass
 
 
-class Base(unittest2.TestCase):
+class Base(unittest.TestCase):
     env = BaseEnv
 
     @classmethod
@@ -101,6 +110,8 @@ class Base(unittest2.TestCase):
             tf.skip_if_no_xattrs()
 
     def assert_body(self, body):
+        if not isinstance(body, bytes):
+            body = body.encode('utf-8')
         response_body = self.env.conn.response.read()
         self.assertEqual(response_body, body,
                          'Body returned: %s' % (response_body))
@@ -121,13 +132,22 @@ class Base(unittest2.TestCase):
                 'Expected header name %r not found in response.' % header_name)
         self.assertEqual(expected_value, actual_value)
 
+    def assert_etag(self, unquoted_value):
+        if tf.cluster_info.get('etag_quoter', {}).get('enable_by_default'):
+            expected = '"%s"' % unquoted_value
+        else:
+            expected = unquoted_value
+        self.assert_header('etag', expected)
+
 
 class Base2(object):
-    def setUp(self):
+    @classmethod
+    def setUpClass(cls):
         Utils.create_name = Utils.create_utf8_name
-        super(Base2, self).setUp()
+        super(Base2, cls).setUpClass()
 
-    def tearDown(self):
+    @classmethod
+    def tearDownClass(cls):
         Utils.create_name = Utils.create_ascii_name
 
 
@@ -165,7 +185,12 @@ class TestAccount(Base):
         self.assert_status([401, 412])
 
     def testInvalidUTF8Path(self):
-        invalid_utf8 = Utils.create_utf8_name()[::-1]
+        valid_utf8 = Utils.create_utf8_name()
+        if six.PY2:
+            invalid_utf8 = valid_utf8[::-1]
+        else:
+            invalid_utf8 = (valid_utf8.encode('utf8')[::-1]).decode(
+                'utf-8', 'surrogateescape')
         container = self.env.account.container(invalid_utf8)
         self.assertFalse(container.create(cfg={'no_path_quote': True}))
         self.assert_status(412)
@@ -232,7 +257,8 @@ class TestAccount(Base):
                 self.assertGreaterEqual(a['count'], 0)
                 self.assertGreaterEqual(a['bytes'], 0)
 
-            headers = dict(self.env.conn.response.getheaders())
+            headers = dict((k.lower(), v)
+                           for k, v in self.env.conn.response.getheaders())
             if format_type == 'json':
                 self.assertEqual(headers['content-type'],
                                  'application/json; charset=utf-8')
@@ -242,12 +268,12 @@ class TestAccount(Base):
 
     def testListingLimit(self):
         limit = load_constraint('account_listing_limit')
-        for l in (1, 100, limit / 2, limit - 1, limit, limit + 1, limit * 2):
-            p = {'limit': l}
+        for lim in (1, 100, limit / 2, limit - 1, limit, limit + 1, limit * 2):
+            p = {'limit': lim}
 
-            if l <= limit:
+            if lim <= limit:
                 self.assertLessEqual(len(self.env.account.containers(parms=p)),
-                                     l)
+                                     lim)
                 self.assert_status(200)
             else:
                 self.assertRaises(ResponseError,
@@ -275,6 +301,25 @@ class TestAccount(Base):
 
         results = self.env.account.containers(parms={'delimiter': delimiter})
         expected = ['test', 'test-']
+        results = [r for r in results if r in expected]
+        self.assertEqual(expected, results)
+
+        results = self.env.account.containers(parms={'delimiter': delimiter,
+                                                     'reverse': 'yes'})
+        expected.reverse()
+        results = [r for r in results if r in expected]
+        self.assertEqual(expected, results)
+
+    def testListMultiCharDelimiter(self):
+        delimiter = '-&'
+        containers = ['test', delimiter.join(['test', 'bar']),
+                      delimiter.join(['test', 'foo'])]
+        for c in containers:
+            cont = self.env.account.container(c)
+            self.assertTrue(cont.create())
+
+        results = self.env.account.containers(parms={'delimiter': delimiter})
+        expected = ['test', 'test-&']
         results = [r for r in results if r in expected]
         self.assertEqual(expected, results)
 
@@ -338,12 +383,15 @@ class TestAccount(Base):
 
     def testLastContainerMarker(self):
         for format_type in [None, 'json', 'xml']:
-            containers = self.env.account.containers({'format': format_type})
+            containers = self.env.account.containers(parms={
+                'format': format_type})
             self.assertEqual(len(containers), len(self.env.containers))
             self.assert_status(200)
 
+            marker = (containers[-1] if format_type is None
+                      else containers[-1]['name'])
             containers = self.env.account.containers(
-                parms={'format': format_type, 'marker': containers[-1]})
+                parms={'format': format_type, 'marker': marker})
             self.assertEqual(len(containers), 0)
             if format_type is None:
                 self.assert_status(204)
@@ -373,7 +421,7 @@ class TestAccount(Base):
                 parms={'format': format_type})
             if isinstance(containers[0], dict):
                 containers = [x['name'] for x in containers]
-            self.assertEqual(sorted(containers, cmp=locale.strcoll),
+            self.assertEqual(sorted(containers, key=locale.strxfrm),
                              containers)
 
     def testQuotedWWWAuthenticateHeader(self):
@@ -387,7 +435,17 @@ class TestAccount(Base):
         quoted_hax = urllib.parse.quote(hax)
         conn.connection.request('GET', '/v1/' + quoted_hax, None, {})
         resp = conn.connection.getresponse()
-        resp_headers = dict(resp.getheaders())
+
+        resp_headers = {}
+        for h, v in resp.getheaders():
+            h = h.lower()
+            if h in resp_headers:
+                # py2 would do this for us, but py3 apparently keeps them
+                # separate? Not sure which I like more...
+                resp_headers[h] += ',' + v
+            else:
+                resp_headers[h] = v
+
         self.assertIn('www-authenticate', resp_headers)
         actual = resp_headers['www-authenticate']
         expected = 'Swift realm="%s"' % quoted_hax
@@ -528,10 +586,10 @@ class TestContainer(Base):
     def testContainerNameLimit(self):
         limit = load_constraint('max_container_name_length')
 
-        for l in (limit - 100, limit - 10, limit - 1, limit,
-                  limit + 1, limit + 10, limit + 100):
-            cont = self.env.account.container('a' * l)
-            if l <= limit:
+        for lim in (limit - 100, limit - 10, limit - 1, limit,
+                    limit + 1, limit + 10, limit + 100):
+            cont = self.env.account.container('a' * lim)
+            if lim <= limit:
                 self.assertTrue(cont.create())
                 self.assert_status((201, 202))
             else:
@@ -638,6 +696,37 @@ class TestContainer(Base):
                 results = [x.get('name', x.get('subdir')) for x in results]
             self.assertEqual(results, ['test-', 'test'])
 
+    def testListMultiCharDelimiter(self):
+        cont = self.env.account.container(Utils.create_name())
+        self.assertTrue(cont.create())
+
+        delimiter = '-&'
+        files = ['test', delimiter.join(['test', 'bar']),
+                 delimiter.join(['test', 'foo']), "test-'baz"]
+        for f in files:
+            file_item = cont.file(f)
+            self.assertTrue(file_item.write_random())
+
+        for format_type in [None, 'json', 'xml']:
+            results = cont.files(parms={'format': format_type})
+            if isinstance(results[0], dict):
+                results = [x.get('name', x.get('subdir')) for x in results]
+            self.assertEqual(results, ['test', 'test-&bar', 'test-&foo',
+                                       "test-'baz"])
+
+            results = cont.files(parms={'delimiter': delimiter,
+                                        'format': format_type})
+            if isinstance(results[0], dict):
+                results = [x.get('name', x.get('subdir')) for x in results]
+            self.assertEqual(results, ['test', 'test-&', "test-'baz"])
+
+            results = cont.files(parms={'delimiter': delimiter,
+                                        'format': format_type,
+                                        'reverse': 'yes'})
+            if isinstance(results[0], dict):
+                results = [x.get('name', x.get('subdir')) for x in results]
+            self.assertEqual(results, ["test-'baz", 'test-&', 'test'])
+
     def testListDelimiterAndPrefix(self):
         cont = self.env.account.container(Utils.create_name())
         self.assertTrue(cont.create())
@@ -685,7 +774,11 @@ class TestContainer(Base):
 
     def testUtf8Container(self):
         valid_utf8 = Utils.create_utf8_name()
-        invalid_utf8 = valid_utf8[::-1]
+        if six.PY2:
+            invalid_utf8 = valid_utf8[::-1]
+        else:
+            invalid_utf8 = (valid_utf8.encode('utf8')[::-1]).decode(
+                'utf-8', 'surrogateescape')
         container = self.env.account.container(valid_utf8)
         self.assertTrue(container.create(cfg={'no_path_quote': True}))
         self.assertIn(container.name, self.env.account.containers())
@@ -707,15 +800,13 @@ class TestContainer(Base):
         self.assert_status(202)
 
     def testSlashInName(self):
-        if Utils.create_name == Utils.create_utf8_name:
-            cont_name = list(six.text_type(Utils.create_name(), 'utf-8'))
+        if six.PY2:
+            cont_name = list(Utils.create_name().decode('utf-8'))
         else:
             cont_name = list(Utils.create_name())
-
         cont_name[random.randint(2, len(cont_name) - 2)] = '/'
         cont_name = ''.join(cont_name)
-
-        if Utils.create_name == Utils.create_utf8_name:
+        if six.PY2:
             cont_name = cont_name.encode('utf-8')
 
         cont = self.env.account.container(cont_name)
@@ -754,12 +845,13 @@ class TestContainer(Base):
 
     def testLastFileMarker(self):
         for format_type in [None, 'json', 'xml']:
-            files = self.env.container.files({'format': format_type})
+            files = self.env.container.files(parms={'format': format_type})
             self.assertEqual(len(files), len(self.env.files))
             self.assert_status(200)
 
+            marker = files[-1] if format_type is None else files[-1]['name']
             files = self.env.container.files(
-                parms={'format': format_type, 'marker': files[-1]})
+                parms={'format': format_type, 'marker': marker})
             self.assertEqual(len(files), 0)
 
             if format_type is None:
@@ -790,7 +882,11 @@ class TestContainer(Base):
         for actual in file_list:
             name = actual['name']
             self.assertIn(name, expected)
-            self.assertEqual(expected[name]['etag'], actual['hash'])
+            if tf.cluster_info.get('etag_quoter', {}).get('enable_by_default'):
+                self.assertEqual(expected[name]['etag'],
+                                 '"%s"' % actual['hash'])
+            else:
+                self.assertEqual(expected[name]['etag'], actual['hash'])
             self.assertEqual(
                 expected[name]['content_type'], actual['content_type'])
             self.assertEqual(
@@ -830,7 +926,7 @@ class TestContainer(Base):
             files = self.env.container.files(parms={'format': format_type})
             if isinstance(files[0], dict):
                 files = [x['name'] for x in files]
-            self.assertEqual(sorted(files, cmp=locale.strcoll), files)
+            self.assertEqual(sorted(files, key=locale.strxfrm), files)
 
     def testContainerInfo(self):
         info = self.env.container.info()
@@ -854,11 +950,12 @@ class TestContainer(Base):
         cont = self.env.account.container(Utils.create_name())
         self.assertRaises(ResponseError, cont.files)
         self.assertTrue(cont.create())
-        cont.files()
+        self.assertEqual(cont.files(), [])
 
         cont = self.env.account.container(Utils.create_name())
         self.assertRaises(ResponseError, cont.files)
         self.assertTrue(cont.create())
+        # NB: no GET! Make sure the PUT cleared the cached 404
         file_item = cont.file(Utils.create_name())
         file_item.write_random()
 
@@ -889,7 +986,7 @@ class TestContainer(Base):
         # PUT object doesn't change container last modified timestamp
         obj = container.file(Utils.create_name())
         self.assertTrue(
-            obj.write("aaaaa", hdrs={'Content-Type': 'text/plain'}))
+            obj.write(b"aaaaa", hdrs={'Content-Type': 'text/plain'}))
         info = container.info()
         t3 = info['last_modified']
         self.assertEqual(t2, t3)
@@ -1149,7 +1246,7 @@ class TestContainerPaths(Base):
     def testStructure(self):
         def assert_listing(path, file_list):
             files = self.env.container.files(parms={'path': path})
-            self.assertEqual(sorted(file_list, cmp=locale.strcoll), files)
+            self.assertEqual(sorted(file_list, key=locale.strxfrm), files)
         if not normalized_urls:
             assert_listing('/', ['/dir1/', '/dir2/', '/file1', '/file A'])
             assert_listing('/dir1',
@@ -1189,17 +1286,18 @@ class TestFileEnv(BaseEnv):
     @classmethod
     def setUp(cls):
         super(TestFileEnv, cls).setUp()
-        # creating another account and connection
-        # for account to account copy tests
-        config2 = deepcopy(tf.config)
-        config2['account'] = tf.config['account2']
-        config2['username'] = tf.config['username2']
-        config2['password'] = tf.config['password2']
-        cls.conn2 = Connection(config2)
-        cls.conn2.authenticate()
+        if not tf.skip2:
+            # creating another account and connection
+            # for account to account copy tests
+            config2 = deepcopy(tf.config)
+            config2['account'] = tf.config['account2']
+            config2['username'] = tf.config['username2']
+            config2['password'] = tf.config['password2']
+            cls.conn2 = Connection(config2)
+            cls.conn2.authenticate()
 
-        cls.account2 = cls.conn2.get_account()
-        cls.account2.delete_containers()
+            cls.account2 = cls.conn2.get_account()
+            cls.account2.delete_containers()
 
         cls.container = cls.account.container(Utils.create_name())
         if not cls.container.create():
@@ -1214,7 +1312,8 @@ class TestFileEnv(BaseEnv):
         # not have been known. So we ensure that the project domain id is
         # in sysmeta by making a POST to the accounts using an admin role.
         cls.account.update_metadata()
-        cls.account2.update_metadata()
+        if not tf.skip2:
+            cls.account2.update_metadata()
 
 
 class TestFileDev(Base):
@@ -1229,7 +1328,7 @@ class TestFile(Base):
     env = TestFileEnv
 
     def testGetResponseHeaders(self):
-        obj_data = 'test_body'
+        obj_data = b'test_body'
 
         def do_test(put_hdrs, get_hdrs, expected_hdrs, unexpected_hdrs):
             filename = Utils.create_name()
@@ -1250,10 +1349,14 @@ class TestFile(Base):
                 if k.lower() in unexpected_hdrs:
                     errors.append('Found unexpected header %s: %s' % (k, v))
             for k, v in expected_hdrs.items():
-                matches = [hdr for hdr in resp_headers if hdr[0] == k]
+                matches = [hdr for hdr in resp_headers if hdr[0].lower() == k]
                 if not matches:
                     errors.append('Missing expected header %s' % k)
                 for (got_k, got_v) in matches:
+                    # The Connection: header is parsed by cluster's LB and may
+                    # be returned in either original lowercase or camel-cased.
+                    if k == 'connection':
+                        got_v = got_v.lower()
                     if got_v != v:
                         errors.append('Expected %s but got %s for %s' %
                                       (v, got_v, k))
@@ -1268,12 +1371,15 @@ class TestFile(Base):
                             'x-object-meta-fruit': 'Banana',
                             'accept-ranges': 'bytes',
                             'content-type': 'application/test',
-                            'etag': hashlib.md5(obj_data).hexdigest(),
+                            'etag': md5(
+                                obj_data, usedforsecurity=False).hexdigest(),
                             'last-modified': mock.ANY,
                             'date': mock.ANY,
                             'x-delete-at': mock.ANY,
                             'x-trans-id': mock.ANY,
                             'x-openstack-request-id': mock.ANY}
+        if tf.cluster_info.get('etag_quoter', {}).get('enable_by_default'):
+            expected_headers['etag'] = '"%s"' % expected_headers['etag']
         unexpected_headers = ['connection', 'x-delete-after']
         do_test(put_headers, {}, expected_headers, unexpected_headers)
 
@@ -1329,7 +1435,7 @@ class TestFile(Base):
                     self.fail('Failed to find %s in listing' % dest_filename)
 
                 self.assertEqual(file_item.size, obj['bytes'])
-                self.assertEqual(file_item.etag, obj['hash'])
+                self.assertEqual(normalize_etag(file_item.etag), obj['hash'])
                 self.assertEqual(file_item.content_type, obj['content_type'])
 
                 file_copy = cont.file(dest_filename)
@@ -1379,7 +1485,7 @@ class TestFile(Base):
                     self.fail('Failed to find %s in listing' % dest_filename)
 
                 self.assertEqual(file_item.size, obj['bytes'])
-                self.assertEqual(file_item.etag, obj['hash'])
+                self.assertEqual(normalize_etag(file_item.etag), obj['hash'])
                 self.assertEqual(
                     'application/test-changed', obj['content_type'])
 
@@ -1414,7 +1520,7 @@ class TestFile(Base):
                     self.fail('Failed to find %s in listing' % dest_filename)
 
                 self.assertEqual(file_item.size, obj['bytes'])
-                self.assertEqual(file_item.etag, obj['hash'])
+                self.assertEqual(normalize_etag(file_item.etag), obj['hash'])
                 self.assertEqual(
                     'application/test-updated', obj['content_type'])
 
@@ -1433,7 +1539,7 @@ class TestFile(Base):
         self.assertTrue(dest_cont.create())
 
         expected_body = data[100:201]
-        expected_etag = hashlib.md5(expected_body)
+        expected_etag = md5(expected_body, usedforsecurity=False)
         # copy both from within and across containers
         for cont in (self.env.container, dest_cont):
             # copy both with and without initial slash
@@ -1495,28 +1601,29 @@ class TestFile(Base):
                 self.assertTrue(file_item.initialize())
                 self.assertEqual(metadata, file_item.metadata)
 
-        dest_cont = self.env.account2.container(Utils.create_name())
-        self.assertTrue(dest_cont.create(hdrs={
-            'X-Container-Write': self.env.conn.user_acl
-        }))
+        if not tf.skip2:
+            dest_cont = self.env.account2.container(Utils.create_name())
+            self.assertTrue(dest_cont.create(hdrs={
+                'X-Container-Write': self.env.conn.user_acl
+            }))
 
-        acct = self.env.conn2.account_name
-        # copy both with and without initial slash
-        for prefix in ('', '/'):
-            dest_filename = Utils.create_name()
+            acct = self.env.conn2.account_name
+            # copy both with and without initial slash
+            for prefix in ('', '/'):
+                dest_filename = Utils.create_name()
 
-            file_item = self.env.container.file(source_filename)
-            file_item.copy_account(acct,
-                                   '%s%s' % (prefix, dest_cont),
-                                   dest_filename)
+                file_item = self.env.container.file(source_filename)
+                file_item.copy_account(acct,
+                                       '%s%s' % (prefix, dest_cont),
+                                       dest_filename)
 
-            self.assertIn(dest_filename, dest_cont.files())
+                self.assertIn(dest_filename, dest_cont.files())
 
-            file_item = dest_cont.file(dest_filename)
+                file_item = dest_cont.file(dest_filename)
 
-            self.assertEqual(data, file_item.read())
-            self.assertTrue(file_item.initialize())
-            self.assertEqual(metadata, file_item.metadata)
+                self.assertEqual(data, file_item.read())
+                self.assertTrue(file_item.initialize())
+                self.assertEqual(metadata, file_item.metadata)
 
     def testCopy404s(self):
         source_filename = Utils.create_name()
@@ -1559,6 +1666,8 @@ class TestFile(Base):
                               Utils.create_name())
 
     def testCopyAccount404s(self):
+        if tf.skip2:
+            raise SkipTest('Account2 not set')
         acct = self.env.conn.account_name
         acct2 = self.env.conn2.account_name
         source_filename = Utils.create_name()
@@ -1686,6 +1795,8 @@ class TestFile(Base):
                 self.assertEqual(metadata, file_item.metadata)
 
     def testCopyFromAccountHeader(self):
+        if tf.skip2:
+            raise SkipTest('Account2 not set')
         acct = self.env.conn.account_name
         src_cont = self.env.account.container(Utils.create_name())
         self.assertTrue(src_cont.create(hdrs={
@@ -1761,6 +1872,8 @@ class TestFile(Base):
             self.assert_status(404)
 
     def testCopyFromAccountHeader404s(self):
+        if tf.skip2:
+            raise SkipTest('Account2 not set')
         acct = self.env.conn2.account_name
         src_cont = self.env.account2.container(Utils.create_name())
         self.assertTrue(src_cont.create(hdrs={
@@ -1781,9 +1894,7 @@ class TestFile(Base):
                                                    (prefix,
                                                     Utils.create_name(),
                                                     source_filename)})
-            # looks like cached responses leak "not found"
-            # to un-authorized users, not going to fix it now, but...
-            self.assert_status([403, 404])
+            self.assert_status(403)
 
             # invalid source object
             file_item = self.env.container.file(Utils.create_name())
@@ -1806,13 +1917,57 @@ class TestFile(Base):
                                                     source_filename)})
             self.assert_status(404)
 
+    def testCopyFromAccountHeader403s(self):
+        if tf.skip2:
+            raise SkipTest('Account2 not set')
+        acct = self.env.conn2.account_name
+        src_cont = self.env.account2.container(Utils.create_name())
+        self.assertTrue(src_cont.create())  # Primary user has no access
+        source_filename = Utils.create_name()
+        file_item = src_cont.file(source_filename)
+        file_item.write_random()
+        dest_cont = self.env.account.container(Utils.create_name())
+        self.assertTrue(dest_cont.create())
+
+        for prefix in ('', '/'):
+            # invalid source container
+            file_item = dest_cont.file(Utils.create_name())
+            self.assertRaises(ResponseError, file_item.write,
+                              hdrs={'X-Copy-From-Account': acct,
+                                    'X-Copy-From': '%s%s/%s' %
+                                                   (prefix,
+                                                    Utils.create_name(),
+                                                    source_filename)})
+            self.assert_status(403)
+
+            # invalid source object
+            file_item = self.env.container.file(Utils.create_name())
+            self.assertRaises(ResponseError, file_item.write,
+                              hdrs={'X-Copy-From-Account': acct,
+                                    'X-Copy-From': '%s%s/%s' %
+                                                   (prefix,
+                                                    src_cont,
+                                                    Utils.create_name())})
+            self.assert_status(403)
+
+            # invalid destination container
+            dest_cont = self.env.account.container(Utils.create_name())
+            file_item = dest_cont.file(Utils.create_name())
+            self.assertRaises(ResponseError, file_item.write,
+                              hdrs={'X-Copy-From-Account': acct,
+                                    'X-Copy-From': '%s%s/%s' %
+                                                   (prefix,
+                                                    src_cont,
+                                                    source_filename)})
+            self.assert_status(403)
+
     def testNameLimit(self):
         limit = load_constraint('max_object_name_length')
 
-        for l in (1, 10, limit / 2, limit - 1, limit, limit + 1, limit * 2):
-            file_item = self.env.container.file('a' * l)
+        for lim in (1, 10, limit // 2, limit - 1, limit, limit + 1, limit * 2):
+            file_item = self.env.container.file('a' * lim)
 
-            if l <= limit:
+            if lim <= limit:
                 self.assertTrue(file_item.write())
                 self.assert_status(201)
             else:
@@ -1862,7 +2017,7 @@ class TestFile(Base):
         for i in (number_limit - 10, number_limit - 1, number_limit,
                   number_limit + 1, number_limit + 10, number_limit + 100):
 
-            j = size_limit / (i * 2)
+            j = size_limit // (i * 2)
 
             metadata = {}
             while len(metadata.keys()) < i:
@@ -1871,7 +2026,12 @@ class TestFile(Base):
 
                 if len(key) > j:
                     key = key[:j]
-                    val = val[:j]
+                    # NB: we'll likely write object metadata that's *not* UTF-8
+                    if six.PY2:
+                        val = val[:j]
+                    else:
+                        val = val.encode('utf8')[:j].decode(
+                            'utf8', 'surrogateescape')
 
                 metadata[key] = val
 
@@ -1882,7 +2042,7 @@ class TestFile(Base):
                 self.assertTrue(file_item.write())
                 self.assert_status(201)
                 self.assertTrue(file_item.sync_metadata())
-                self.assert_status((201, 202))
+                self.assert_status(202)
             else:
                 self.assertRaises(ResponseError, file_item.write)
                 self.assert_status(400)
@@ -1902,7 +2062,7 @@ class TestFile(Base):
 
         for i in file_types.keys():
             file_item = container.file(Utils.create_name() + '.' + i)
-            file_item.write('', cfg={'no_content_type': True})
+            file_item.write(b'', cfg={'no_content_type': True})
 
         file_types_read = {}
         for i in container.files(parms={'format': 'json'}):
@@ -1917,7 +2077,7 @@ class TestFile(Base):
         # that's a common EC segment size. The 1.33 multiple is to ensure we
         # aren't aligned on segment boundaries
         file_length = int(1048576 * 1.33)
-        range_size = file_length / 10
+        range_size = file_length // 10
         file_item = self.env.container.file(Utils.create_name())
         data = file_item.write_random(file_length)
 
@@ -1943,7 +2103,7 @@ class TestFile(Base):
                 self.assertEqual(file_item.read(hdrs=hdrs), data[-i:])
                 self.assert_header('content-range', 'bytes %d-%d/%d' % (
                     file_length - i, file_length - 1, file_length))
-            self.assert_header('etag', file_item.md5)
+            self.assert_etag(file_item.md5)
             self.assert_header('accept-ranges', 'bytes')
 
             range_string = 'bytes=%d-' % (i)
@@ -1957,7 +2117,7 @@ class TestFile(Base):
         self.assertRaises(ResponseError, file_item.read, hdrs=hdrs)
         self.assert_status(416)
         self.assert_header('content-range', 'bytes */%d' % file_length)
-        self.assert_header('etag', file_item.md5)
+        self.assert_etag(file_item.md5)
         self.assert_header('accept-ranges', 'bytes')
 
         range_string = 'bytes=%d-%d' % (file_length - 1000, file_length + 2000)
@@ -1976,8 +2136,8 @@ class TestFile(Base):
 
     def testMultiRangeGets(self):
         file_length = 10000
-        range_size = file_length / 10
-        subrange_size = range_size / 10
+        range_size = file_length // 10
+        subrange_size = range_size // 10
         file_item = self.env.container.file(Utils.create_name())
         data = file_item.write_random(
             file_length, hdrs={"Content-Type":
@@ -2001,8 +2161,8 @@ class TestFile(Base):
             # HTTP response bodies don't). We fake it out by constructing a
             # one-header preamble containing just the Content-Type, then
             # feeding in the response body.
-            parser = email.parser.FeedParser()
-            parser.feed("Content-Type: %s\r\n\r\n" % content_type)
+            parser = FeedParser()
+            parser.feed(b"Content-Type: %s\r\n\r\n" % content_type.encode())
             parser.feed(fetched)
             root_message = parser.close()
             self.assertTrue(root_message.is_multipart())
@@ -2016,7 +2176,7 @@ class TestFile(Base):
                 byteranges[0]['Content-Range'],
                 "bytes %d-%d/%d" % (i, i + subrange_size - 1, file_length))
             self.assertEqual(
-                byteranges[0].get_payload(),
+                byteranges[0].get_payload(decode=True),
                 data[i:(i + subrange_size)])
 
             self.assertEqual(byteranges[1]['Content-Type'],
@@ -2026,7 +2186,7 @@ class TestFile(Base):
                 "bytes %d-%d/%d" % (i + 2 * subrange_size,
                                     i + 3 * subrange_size - 1, file_length))
             self.assertEqual(
-                byteranges[1].get_payload(),
+                byteranges[1].get_payload(decode=True),
                 data[(i + 2 * subrange_size):(i + 3 * subrange_size)])
 
             self.assertEqual(byteranges[2]['Content-Type'],
@@ -2036,7 +2196,7 @@ class TestFile(Base):
                 "bytes %d-%d/%d" % (i + 4 * subrange_size,
                                     i + 5 * subrange_size - 1, file_length))
             self.assertEqual(
-                byteranges[2].get_payload(),
+                byteranges[2].get_payload(decode=True),
                 data[(i + 4 * subrange_size):(i + 5 * subrange_size)])
 
         # The first two ranges are satisfiable but the third is not; the
@@ -2053,8 +2213,8 @@ class TestFile(Base):
         self.assertTrue(content_type.startswith("multipart/byteranges"))
         self.assertIsNone(file_item.content_range)
 
-        parser = email.parser.FeedParser()
-        parser.feed("Content-Type: %s\r\n\r\n" % content_type)
+        parser = FeedParser()
+        parser.feed(b"Content-Type: %s\r\n\r\n" % content_type.encode())
         parser.feed(fetched)
         root_message = parser.close()
 
@@ -2067,7 +2227,8 @@ class TestFile(Base):
         self.assertEqual(
             byteranges[0]['Content-Range'],
             "bytes %d-%d/%d" % (0, subrange_size - 1, file_length))
-        self.assertEqual(byteranges[0].get_payload(), data[:subrange_size])
+        self.assertEqual(byteranges[0].get_payload(decode=True),
+                         data[:subrange_size])
 
         self.assertEqual(byteranges[1]['Content-Type'],
                          "lovecraft/rugose; squamous=true")
@@ -2076,7 +2237,7 @@ class TestFile(Base):
             "bytes %d-%d/%d" % (2 * subrange_size, 3 * subrange_size - 1,
                                 file_length))
         self.assertEqual(
-            byteranges[1].get_payload(),
+            byteranges[1].get_payload(decode=True),
             data[(2 * subrange_size):(3 * subrange_size)])
 
         # The first range is satisfiable but the second is not; the
@@ -2091,8 +2252,8 @@ class TestFile(Base):
         content_type = file_item.content_type
         if content_type.startswith("multipart/byteranges"):
             self.assertIsNone(file_item.content_range)
-            parser = email.parser.FeedParser()
-            parser.feed("Content-Type: %s\r\n\r\n" % content_type)
+            parser = FeedParser()
+            parser.feed(b"Content-Type: %s\r\n\r\n" % content_type.encode())
             parser.feed(fetched)
             root_message = parser.close()
 
@@ -2105,7 +2266,8 @@ class TestFile(Base):
             self.assertEqual(
                 byteranges[0]['Content-Range'],
                 "bytes %d-%d/%d" % (0, subrange_size - 1, file_length))
-            self.assertEqual(byteranges[0].get_payload(), data[:subrange_size])
+            self.assertEqual(byteranges[0].get_payload(decode=True),
+                             data[:subrange_size])
         else:
             self.assertEqual(
                 file_item.content_range,
@@ -2171,7 +2333,7 @@ class TestFile(Base):
 
     def testNoContentLengthForPut(self):
         file_item = self.env.container.file(Utils.create_name())
-        self.assertRaises(ResponseError, file_item.write, 'testing',
+        self.assertRaises(ResponseError, file_item.write, b'testing',
                           cfg={'no_content_length': True})
         self.assert_status(411)
 
@@ -2269,14 +2431,16 @@ class TestFile(Base):
         file_item.content_type = content_type
         file_item.write_random(self.env.file_size)
 
-        md5 = file_item.md5
+        expected_etag = file_item.md5
+        if tf.cluster_info.get('etag_quoter', {}).get('enable_by_default'):
+            expected_etag = '"%s"' % expected_etag
 
         file_item = self.env.container.file(file_name)
         info = file_item.info()
 
         self.assert_status(200)
         self.assertEqual(info['content_length'], self.env.file_size)
-        self.assertEqual(info['etag'], md5)
+        self.assertEqual(info['etag'], expected_etag)
         self.assertEqual(info['content_type'], content_type)
         self.assertIn('last_modified', info)
 
@@ -2315,7 +2479,7 @@ class TestFile(Base):
 
             file_item.metadata = metadata
             self.assertTrue(file_item.sync_metadata())
-            self.assert_status((201, 202))
+            self.assert_status(202)
 
             file_item = self.env.container.file(file_item.name)
             self.assertTrue(file_item.initialize())
@@ -2424,7 +2588,8 @@ class TestFile(Base):
                     found, 'Unexpected file %s found in '
                     '%s listing' % (file_item['name'], format_type))
 
-            headers = dict(self.env.conn.response.getheaders())
+            headers = dict((h.lower(), v)
+                           for h, v in self.env.conn.response.getheaders())
             if format_type == 'json':
                 self.assertEqual(headers['content-type'],
                                  'application/json; charset=utf-8')
@@ -2456,26 +2621,20 @@ class TestFile(Base):
     def testZeroByteFile(self):
         file_item = self.env.container.file(Utils.create_name())
 
-        self.assertTrue(file_item.write(''))
+        self.assertTrue(file_item.write(b''))
         self.assertIn(file_item.name, self.env.container.files())
-        self.assertEqual(file_item.read(), '')
+        self.assertEqual(file_item.read(), b'')
 
     def testEtagResponse(self):
         file_item = self.env.container.file(Utils.create_name())
 
-        data = six.StringIO(file_item.write_random(512))
-        etag = File.compute_md5sum(data)
-
-        headers = dict(self.env.conn.response.getheaders())
-        self.assertIn('etag', headers.keys())
-
-        header_etag = headers['etag'].strip('"')
-        self.assertEqual(etag, header_etag)
+        data = io.BytesIO(file_item.write_random(512))
+        self.assert_etag(File.compute_md5sum(data))
 
     def testChunkedPut(self):
         if (tf.web_front_end == 'apache2'):
-            raise SkipTest("Chunked PUT can only be tested with apache2 web"
-                           " front end")
+            raise SkipTest("Chunked PUT cannot be tested with apache2 web "
+                           "front end")
 
         def chunks(s, length=3):
             i, j = 0, length
@@ -2496,7 +2655,7 @@ class TestFile(Base):
             self.assertEqual(data, file_item.read())
 
             info = file_item.info()
-            self.assertEqual(etag, info['etag'])
+            self.assertEqual(normalize_etag(info['etag']), etag)
 
     def test_POST(self):
         # verify consistency between object and container listing metadata
@@ -2521,7 +2680,10 @@ class TestFile(Base):
             self.fail('Failed to find file %r in listing' % file_name)
         self.assertEqual(1024, f_dict['bytes'])
         self.assertEqual('text/foobar', f_dict['content_type'])
-        self.assertEqual(etag, f_dict['hash'])
+        if tf.cluster_info.get('etag_quoter', {}).get('enable_by_default'):
+            self.assertEqual(etag, '"%s"' % f_dict['hash'])
+        else:
+            self.assertEqual(etag, f_dict['hash'])
         put_last_modified = f_dict['last_modified']
 
         # now POST updated content-type to each file
@@ -2548,7 +2710,10 @@ class TestFile(Base):
         self.assertEqual(1024, f_dict['bytes'])
         self.assertEqual('image/foobarbaz', f_dict['content_type'])
         self.assertLess(put_last_modified, f_dict['last_modified'])
-        self.assertEqual(etag, f_dict['hash'])
+        if tf.cluster_info.get('etag_quoter', {}).get('enable_by_default'):
+            self.assertEqual(etag, '"%s"' % f_dict['hash'])
+        else:
+            self.assertEqual(etag, f_dict['hash'])
 
 
 class TestFileUTF8(Base2, TestFile):
@@ -2593,7 +2758,7 @@ class TestFileComparison(Base):
             hdrs = {'If-Match': 'bogus'}
             self.assertRaises(ResponseError, file_item.read, hdrs=hdrs)
             self.assert_status(412)
-            self.assert_header('etag', file_item.md5)
+            self.assert_etag(file_item.md5)
 
     def testIfMatchMultipleEtags(self):
         for file_item in self.env.files:
@@ -2603,7 +2768,7 @@ class TestFileComparison(Base):
             hdrs = {'If-Match': '"bogus1", "bogus2", "bogus3"'}
             self.assertRaises(ResponseError, file_item.read, hdrs=hdrs)
             self.assert_status(412)
-            self.assert_header('etag', file_item.md5)
+            self.assert_etag(file_item.md5)
 
     def testIfNoneMatch(self):
         for file_item in self.env.files:
@@ -2613,7 +2778,7 @@ class TestFileComparison(Base):
             hdrs = {'If-None-Match': file_item.md5}
             self.assertRaises(ResponseError, file_item.read, hdrs=hdrs)
             self.assert_status(304)
-            self.assert_header('etag', file_item.md5)
+            self.assert_etag(file_item.md5)
             self.assert_header('accept-ranges', 'bytes')
 
     def testIfNoneMatchMultipleEtags(self):
@@ -2625,7 +2790,7 @@ class TestFileComparison(Base):
                     '"bogus1", "bogus2", "%s"' % file_item.md5}
             self.assertRaises(ResponseError, file_item.read, hdrs=hdrs)
             self.assert_status(304)
-            self.assert_header('etag', file_item.md5)
+            self.assert_etag(file_item.md5)
             self.assert_header('accept-ranges', 'bytes')
 
     def testIfModifiedSince(self):
@@ -2637,11 +2802,11 @@ class TestFileComparison(Base):
             hdrs = {'If-Modified-Since': self.env.time_new}
             self.assertRaises(ResponseError, file_item.read, hdrs=hdrs)
             self.assert_status(304)
-            self.assert_header('etag', file_item.md5)
+            self.assert_etag(file_item.md5)
             self.assert_header('accept-ranges', 'bytes')
             self.assertRaises(ResponseError, file_item.info, hdrs=hdrs)
             self.assert_status(304)
-            self.assert_header('etag', file_item.md5)
+            self.assert_etag(file_item.md5)
             self.assert_header('accept-ranges', 'bytes')
 
     def testIfUnmodifiedSince(self):
@@ -2653,10 +2818,10 @@ class TestFileComparison(Base):
             hdrs = {'If-Unmodified-Since': self.env.time_old_f2}
             self.assertRaises(ResponseError, file_item.read, hdrs=hdrs)
             self.assert_status(412)
-            self.assert_header('etag', file_item.md5)
+            self.assert_etag(file_item.md5)
             self.assertRaises(ResponseError, file_item.info, hdrs=hdrs)
             self.assert_status(412)
-            self.assert_header('etag', file_item.md5)
+            self.assert_etag(file_item.md5)
 
     def testIfMatchAndUnmodified(self):
         for file_item in self.env.files:
@@ -2668,13 +2833,13 @@ class TestFileComparison(Base):
                     'If-Unmodified-Since': self.env.time_new}
             self.assertRaises(ResponseError, file_item.read, hdrs=hdrs)
             self.assert_status(412)
-            self.assert_header('etag', file_item.md5)
+            self.assert_etag(file_item.md5)
 
             hdrs = {'If-Match': file_item.md5,
                     'If-Unmodified-Since': self.env.time_old_f3}
             self.assertRaises(ResponseError, file_item.read, hdrs=hdrs)
             self.assert_status(412)
-            self.assert_header('etag', file_item.md5)
+            self.assert_etag(file_item.md5)
 
     def testLastModified(self):
         file_name = Utils.create_name()
@@ -2695,7 +2860,7 @@ class TestFileComparison(Base):
         hdrs = {'If-Modified-Since': last_modified}
         self.assertRaises(ResponseError, file_item.read, hdrs=hdrs)
         self.assert_status(304)
-        self.assert_header('etag', etag)
+        self.assert_etag(etag)
         self.assert_header('accept-ranges', 'bytes')
 
         hdrs = {'If-Unmodified-Since': last_modified}
@@ -2706,7 +2871,7 @@ class TestFileComparisonUTF8(Base2, TestFileComparison):
     pass
 
 
-class TestServiceToken(unittest2.TestCase):
+class TestServiceToken(unittest.TestCase):
 
     def setUp(self):
         if tf.skip_service_tokens:
@@ -2797,31 +2962,31 @@ class TestServiceToken(unittest2.TestCase):
         self.dbg = dbg
 
     def do_request(self, url, token, parsed, conn, service_token=''):
-            if self.use_service_account:
-                path = self._service_account(parsed.path)
-            else:
-                path = parsed.path
-            if self.container:
-                path += '/%s' % self.container
-            if self.obj:
-                path += '/%s' % self.obj
-            headers = {}
-            if self.body:
-                headers.update({'Content-Length': len(self.body)})
-            if self.x_auth_token == self.SET_TO_USERS_TOKEN:
-                headers.update({'X-Auth-Token': token})
-            elif self.x_auth_token == self.SET_TO_SERVICE_TOKEN:
-                headers.update({'X-Auth-Token': service_token})
-            if self.x_service_token == self.SET_TO_USERS_TOKEN:
-                headers.update({'X-Service-Token': token})
-            elif self.x_service_token == self.SET_TO_SERVICE_TOKEN:
-                headers.update({'X-Service-Token': service_token})
-            if self.dbg:
-                print('DEBUG: conn.request: method:%s path:%s'
-                      ' body:%s headers:%s' % (self.method, path, self.body,
-                                               headers))
-            conn.request(self.method, path, self.body, headers=headers)
-            return check_response(conn)
+        if self.use_service_account:
+            path = self._service_account(parsed.path)
+        else:
+            path = parsed.path
+        if self.container:
+            path += '/%s' % self.container
+        if self.obj:
+            path += '/%s' % self.obj
+        headers = {}
+        if self.body:
+            headers.update({'Content-Length': len(self.body)})
+        if self.x_auth_token == self.SET_TO_USERS_TOKEN:
+            headers.update({'X-Auth-Token': token})
+        elif self.x_auth_token == self.SET_TO_SERVICE_TOKEN:
+            headers.update({'X-Auth-Token': service_token})
+        if self.x_service_token == self.SET_TO_USERS_TOKEN:
+            headers.update({'X-Service-Token': token})
+        elif self.x_service_token == self.SET_TO_SERVICE_TOKEN:
+            headers.update({'X-Service-Token': service_token})
+        if self.dbg:
+            print('DEBUG: conn.request: method:%s path:%s'
+                  ' body:%s headers:%s' % (self.method, path, self.body,
+                                           headers))
+        conn.request(self.method, path, self.body, headers=headers)
+        return check_response(conn)
 
     def _service_account(self, path):
         parts = path.split('/', 3)
@@ -2877,4 +3042,4 @@ class TestServiceToken(unittest2.TestCase):
 
 
 if __name__ == '__main__':
-    unittest2.main()
+    unittest.main()

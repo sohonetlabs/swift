@@ -13,17 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import unittest
 import mock
 
-from cStringIO import StringIO
-from hashlib import md5
+from io import BytesIO
 
 from swift.common.swob import Request, HTTPAccepted
 from swift.common.middleware.s3api.etree import fromstring, tostring, \
     Element, SubElement, XMLNS_XSI
 from swift.common.middleware.s3api.s3response import InvalidArgument
 from swift.common.middleware.s3api.acl_utils import handle_acl_header
+from swift.common.utils import md5
 
 from test.unit.common.middleware.s3api import S3ApiTestCase
 from test.unit.common.middleware.s3api.helpers import UnreadableInput
@@ -45,13 +46,17 @@ class TestS3ApiAcl(S3ApiTestCase):
         name = elem.find('./AccessControlList/Grant/Grantee/ID').text
         self.assertEqual(name, owner)
 
+    @s3acl
     def test_bucket_acl_GET(self):
         req = Request.blank('/bucket?acl',
                             environ={'REQUEST_METHOD': 'GET'},
                             headers={'Authorization': 'AWS test:tester:hmac',
                                      'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
-        self._check_acl('test:tester', body)
+        if not self.s3api.conf.s3_acl:
+            self._check_acl('test:tester', body)
+        self.assertSetEqual(set((('HEAD', '/v1/AUTH_test/bucket'),)),
+                            set(self.swift.calls))
 
     def test_bucket_acl_PUT(self):
         elem = Element('AccessControlPolicy')
@@ -76,7 +81,7 @@ class TestS3ApiAcl(S3ApiTestCase):
 
         req = Request.blank('/bucket?acl',
                             environ={'REQUEST_METHOD': 'PUT',
-                                     'wsgi.input': StringIO(xml)},
+                                     'wsgi.input': BytesIO(xml)},
                             headers={'Authorization': 'AWS test:tester:hmac',
                                      'Date': self.get_date_header(),
                                      'Transfer-Encoding': 'chunked'})
@@ -131,8 +136,9 @@ class TestS3ApiAcl(S3ApiTestCase):
                          'UnexpectedContent')
 
     def _test_put_no_body(self, use_content_length=False,
-                          use_transfer_encoding=False, string_to_md5=''):
-        content_md5 = md5(string_to_md5).digest().encode('base64').strip()
+                          use_transfer_encoding=False, string_to_md5=b''):
+        content_md5 = base64.b64encode(
+            md5(string_to_md5, usedforsecurity=False).digest()).strip()
         with UnreadableInput(self) as fake_input:
             req = Request.blank(
                 '/bucket?acl',
@@ -153,24 +159,29 @@ class TestS3ApiAcl(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'MissingSecurityHeader')
         self.assertEqual(self._get_error_message(body),
                          'Your request was missing a required header.')
-        self.assertIn('<MissingHeaderName>x-amz-acl</MissingHeaderName>', body)
+        self.assertIn(b'<MissingHeaderName>x-amz-acl</MissingHeaderName>',
+                      body)
 
     @s3acl
     def test_bucket_fails_with_neither_acl_header_nor_xml_PUT(self):
         self._test_put_no_body()
-        self._test_put_no_body(string_to_md5='test')
+        self._test_put_no_body(string_to_md5=b'test')
         self._test_put_no_body(use_content_length=True)
-        self._test_put_no_body(use_content_length=True, string_to_md5='test')
+        self._test_put_no_body(use_content_length=True, string_to_md5=b'test')
         self._test_put_no_body(use_transfer_encoding=True)
-        self._test_put_no_body(use_transfer_encoding=True, string_to_md5='zz')
+        self._test_put_no_body(use_transfer_encoding=True, string_to_md5=b'zz')
 
+    @s3acl
     def test_object_acl_GET(self):
         req = Request.blank('/bucket/object?acl',
                             environ={'REQUEST_METHOD': 'GET'},
                             headers={'Authorization': 'AWS test:tester:hmac',
                                      'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
-        self._check_acl('test:tester', body)
+        if not self.s3api.conf.s3_acl:
+            self._check_acl('test:tester', body)
+        self.assertSetEqual(set((('HEAD', '/v1/AUTH_test/bucket/object'),)),
+                            set(self.swift.calls))
 
     def test_invalid_xml(self):
         req = Request.blank('/bucket?acl',

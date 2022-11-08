@@ -15,8 +15,11 @@
 
 import json
 
+import six
+
+from swift.common import constraints
 from swift.common.middleware import listing_formats
-from swift.common.swob import HTTPOk, HTTPNoContent
+from swift.common.swob import HTTPOk, HTTPNoContent, str_to_wsgi
 from swift.common.utils import Timestamp
 from swift.common.storage_policy import POLICIES
 
@@ -62,37 +65,39 @@ def get_response_headers(broker):
         for key, value in stats.items():
             header_name = header_prefix % key.replace('_', '-')
             resp_headers[header_name] = value
-    resp_headers.update((key, value)
-                        for key, (value, timestamp) in
+    resp_headers.update((str_to_wsgi(key), str_to_wsgi(value))
+                        for key, (value, _timestamp) in
                         broker.metadata.items() if value != '')
     return resp_headers
 
 
 def account_listing_response(account, req, response_content_type, broker=None,
-                             limit='', marker='', end_marker='', prefix='',
-                             delimiter='', reverse=False):
+                             limit=constraints.ACCOUNT_LISTING_LIMIT,
+                             marker='', end_marker='', prefix='', delimiter='',
+                             reverse=False):
     if broker is None:
         broker = FakeAccountBroker()
 
     resp_headers = get_response_headers(broker)
 
     account_list = broker.list_containers_iter(limit, marker, end_marker,
-                                               prefix, delimiter, reverse)
+                                               prefix, delimiter, reverse,
+                                               req.allow_reserved_names)
     data = []
     for (name, object_count, bytes_used, put_timestamp, is_subdir) \
             in account_list:
+        name_ = name.decode('utf8') if six.PY2 else name
         if is_subdir:
-            data.append({'subdir': name.decode('utf8')})
+            data.append({'subdir': name_})
         else:
             data.append(
-                {'name': name.decode('utf8'), 'count': object_count,
-                 'bytes': bytes_used,
+                {'name': name_, 'count': object_count, 'bytes': bytes_used,
                  'last_modified': Timestamp(put_timestamp).isoformat})
     if response_content_type.endswith('/xml'):
         account_list = listing_formats.account_to_xml(data, account)
         ret = HTTPOk(body=account_list, request=req, headers=resp_headers)
     elif response_content_type.endswith('/json'):
-        account_list = json.dumps(data)
+        account_list = json.dumps(data).encode('ascii')
         ret = HTTPOk(body=account_list, request=req, headers=resp_headers)
     elif data:
         account_list = listing_formats.listing_to_text(data)

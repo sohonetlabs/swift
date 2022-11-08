@@ -14,7 +14,7 @@
 # limitations under the License.
 
 """Tests for swift.common.db"""
-
+import contextlib
 import os
 import sys
 import unittest
@@ -23,6 +23,7 @@ from shutil import rmtree, copy
 from uuid import uuid4
 import six.moves.cPickle as pickle
 
+import base64
 import json
 import sqlite3
 import itertools
@@ -33,17 +34,19 @@ from mock import patch, MagicMock
 from eventlet.timeout import Timeout
 from six.moves import range
 
+import six
+
 import swift.common.db
 from swift.common.constraints import \
     MAX_META_VALUE_LENGTH, MAX_META_COUNT, MAX_META_OVERALL_SIZE
 from swift.common.db import chexor, dict_factory, get_db_connection, \
     DatabaseBroker, DatabaseConnectionError, DatabaseAlreadyExists, \
-    GreenDBConnection, PICKLE_PROTOCOL, zero_like
+    GreenDBConnection, PICKLE_PROTOCOL, zero_like, TombstoneReclaimer
 from swift.common.utils import normalize_timestamp, mkdirs, Timestamp
 from swift.common.exceptions import LockTimeout
 from swift.common.swob import HTTPException
 
-from test.unit import with_tempdir
+from test.unit import with_tempdir, make_timestamp_iter
 
 
 class TestHelperFunctions(unittest.TestCase):
@@ -228,6 +231,7 @@ class ExampleBroker(DatabaseBroker):
                 delete_timestamp TEXT DEFAULT '0',
                 hash TEXT default '00000000000000000000000000000000',
                 id TEXT,
+                status TEXT DEFAULT '',
                 status_changed_at TEXT DEFAULT '0',
                 metadata TEXT DEFAULT ''
             );
@@ -250,10 +254,10 @@ class ExampleBroker(DatabaseBroker):
         ''')
         conn.execute("""
         INSERT INTO test_stat (
-            account, created_at, id, put_timestamp, status_changed_at)
-        VALUES (?, ?, ?, ?, ?);
+            account, created_at, id, put_timestamp, status_changed_at, status)
+        VALUES (?, ?, ?, ?, ?, ?);
         """, (self.account, Timestamp.now().internal, str(uuid4()),
-              put_timestamp, put_timestamp))
+              put_timestamp, put_timestamp, ''))
 
     def merge_items(self, item_list):
         with self.get() as conn:
@@ -271,7 +275,7 @@ class ExampleBroker(DatabaseBroker):
             conn.commit()
 
     def _commit_puts_load(self, item_list, entry):
-        (name, timestamp, deleted) = pickle.loads(entry.decode('base64'))
+        (name, timestamp, deleted) = entry
         item_list.append({
             'name': name,
             'created_at': timestamp,
@@ -288,10 +292,10 @@ class ExampleBroker(DatabaseBroker):
             self.merge_items([record])
             return
         with open(self.pending_file, 'a+b') as fp:
-            fp.write(':')
-            fp.write(pickle.dumps(
+            fp.write(b':')
+            fp.write(base64.b64encode(pickle.dumps(
                 (name, timestamp, deleted),
-                protocol=PICKLE_PROTOCOL).encode('base64'))
+                protocol=PICKLE_PROTOCOL)))
             fp.flush()
 
     def put_test(self, name, timestamp):
@@ -304,6 +308,7 @@ class ExampleBroker(DatabaseBroker):
         conn.execute("""
             UPDATE test_stat
             SET delete_timestamp = ?,
+                status = 'DELETED',
                 status_changed_at = ?
             WHERE delete_timestamp < ? """, (timestamp, timestamp, timestamp))
 
@@ -324,17 +329,16 @@ class TestExampleBroker(unittest.TestCase):
     policy = 0
 
     def setUp(self):
-        self.ts = (Timestamp(t).internal for t in
-                   itertools.count(int(time.time())))
+        self.ts = make_timestamp_iter()
 
     def test_delete_db(self):
         broker = self.broker_class(':memory:', account='a', container='c')
-        broker.initialize(next(self.ts))
-        broker.delete_db(next(self.ts))
+        broker.initialize(next(self.ts).internal)
+        broker.delete_db(next(self.ts).internal)
         self.assertTrue(broker.is_deleted())
 
     def test_merge_timestamps_simple_delete(self):
-        put_timestamp = next(self.ts)
+        put_timestamp = next(self.ts).internal
         broker = self.broker_class(':memory:', account='a', container='c')
         broker.initialize(put_timestamp)
         created_at = broker.get_info()['created_at']
@@ -345,7 +349,7 @@ class TestExampleBroker(unittest.TestCase):
         self.assertEqual(info['delete_timestamp'], '0')
         self.assertEqual(info['status_changed_at'], put_timestamp)
         # delete
-        delete_timestamp = next(self.ts)
+        delete_timestamp = next(self.ts).internal
         broker.merge_timestamps(created_at, put_timestamp, delete_timestamp)
         self.assertTrue(broker.is_deleted())
         info = broker.get_info()
@@ -361,7 +365,7 @@ class TestExampleBroker(unittest.TestCase):
         broker.delete_test('test', timestamp)
 
     def test_merge_timestamps_delete_with_objects(self):
-        put_timestamp = next(self.ts)
+        put_timestamp = next(self.ts).internal
         broker = self.broker_class(':memory:', account='a', container='c')
         broker.initialize(put_timestamp, storage_policy_index=int(self.policy))
         created_at = broker.get_info()['created_at']
@@ -372,11 +376,11 @@ class TestExampleBroker(unittest.TestCase):
         self.assertEqual(info['delete_timestamp'], '0')
         self.assertEqual(info['status_changed_at'], put_timestamp)
         # add object
-        self.put_item(broker, next(self.ts))
+        self.put_item(broker, next(self.ts).internal)
         self.assertEqual(broker.get_info()[
             '%s_count' % broker.db_contains_type], 1)
         # delete
-        delete_timestamp = next(self.ts)
+        delete_timestamp = next(self.ts).internal
         broker.merge_timestamps(created_at, put_timestamp, delete_timestamp)
         self.assertFalse(broker.is_deleted())
         info = broker.get_info()
@@ -386,18 +390,18 @@ class TestExampleBroker(unittest.TestCase):
         # status is unchanged
         self.assertEqual(info['status_changed_at'], put_timestamp)
         # count is causing status to hold on
-        self.delete_item(broker, next(self.ts))
+        self.delete_item(broker, next(self.ts).internal)
         self.assertEqual(broker.get_info()[
             '%s_count' % broker.db_contains_type], 0)
         self.assertTrue(broker.is_deleted())
 
     def test_merge_timestamps_simple_recreate(self):
-        put_timestamp = next(self.ts)
+        put_timestamp = next(self.ts).internal
         broker = self.broker_class(':memory:', account='a', container='c')
         broker.initialize(put_timestamp, storage_policy_index=int(self.policy))
         virgin_status_changed_at = broker.get_info()['status_changed_at']
         created_at = broker.get_info()['created_at']
-        delete_timestamp = next(self.ts)
+        delete_timestamp = next(self.ts).internal
         broker.merge_timestamps(created_at, put_timestamp, delete_timestamp)
         self.assertTrue(broker.is_deleted())
         info = broker.get_info()
@@ -408,7 +412,7 @@ class TestExampleBroker(unittest.TestCase):
         self.assertTrue(orig_status_changed_at >
                         Timestamp(virgin_status_changed_at))
         # recreate
-        recreate_timestamp = next(self.ts)
+        recreate_timestamp = next(self.ts).internal
         status_changed_at = time.time()
         with patch('swift.common.db.time.time', new=lambda: status_changed_at):
             broker.merge_timestamps(created_at, recreate_timestamp, '0')
@@ -417,15 +421,16 @@ class TestExampleBroker(unittest.TestCase):
         self.assertEqual(info['created_at'], created_at)
         self.assertEqual(info['put_timestamp'], recreate_timestamp)
         self.assertEqual(info['delete_timestamp'], delete_timestamp)
-        self.assertTrue(info['status_changed_at'], status_changed_at)
+        self.assertEqual(Timestamp(status_changed_at).normal,
+                         info['status_changed_at'])
 
     def test_merge_timestamps_recreate_with_objects(self):
-        put_timestamp = next(self.ts)
+        put_timestamp = next(self.ts).internal
         broker = self.broker_class(':memory:', account='a', container='c')
         broker.initialize(put_timestamp, storage_policy_index=int(self.policy))
         created_at = broker.get_info()['created_at']
         # delete
-        delete_timestamp = next(self.ts)
+        delete_timestamp = next(self.ts).internal
         broker.merge_timestamps(created_at, put_timestamp, delete_timestamp)
         self.assertTrue(broker.is_deleted())
         info = broker.get_info()
@@ -436,12 +441,12 @@ class TestExampleBroker(unittest.TestCase):
         self.assertTrue(Timestamp(orig_status_changed_at) >=
                         Timestamp(put_timestamp))
         # add object
-        self.put_item(broker, next(self.ts))
+        self.put_item(broker, next(self.ts).internal)
         count_key = '%s_count' % broker.db_contains_type
         self.assertEqual(broker.get_info()[count_key], 1)
         self.assertFalse(broker.is_deleted())
         # recreate
-        recreate_timestamp = next(self.ts)
+        recreate_timestamp = next(self.ts).internal
         broker.merge_timestamps(created_at, recreate_timestamp, '0')
         self.assertFalse(broker.is_deleted())
         info = broker.get_info()
@@ -450,30 +455,31 @@ class TestExampleBroker(unittest.TestCase):
         self.assertEqual(info['delete_timestamp'], delete_timestamp)
         self.assertEqual(info['status_changed_at'], orig_status_changed_at)
         # count is not causing status to hold on
-        self.delete_item(broker, next(self.ts))
+        self.delete_item(broker, next(self.ts).internal)
         self.assertFalse(broker.is_deleted())
 
     def test_merge_timestamps_update_put_no_status_change(self):
-        put_timestamp = next(self.ts)
+        put_timestamp = next(self.ts).internal
         broker = self.broker_class(':memory:', account='a', container='c')
         broker.initialize(put_timestamp, storage_policy_index=int(self.policy))
         info = broker.get_info()
         orig_status_changed_at = info['status_changed_at']
         created_at = info['created_at']
-        new_put_timestamp = next(self.ts)
+        new_put_timestamp = next(self.ts).internal
         broker.merge_timestamps(created_at, new_put_timestamp, '0')
         info = broker.get_info()
         self.assertEqual(new_put_timestamp, info['put_timestamp'])
         self.assertEqual(orig_status_changed_at, info['status_changed_at'])
 
     def test_merge_timestamps_update_delete_no_status_change(self):
-        put_timestamp = next(self.ts)
+        put_timestamp = next(self.ts).internal
         broker = self.broker_class(':memory:', account='a', container='c')
         broker.initialize(put_timestamp, storage_policy_index=int(self.policy))
         created_at = broker.get_info()['created_at']
-        broker.merge_timestamps(created_at, put_timestamp, next(self.ts))
+        broker.merge_timestamps(created_at, put_timestamp,
+                                next(self.ts).internal)
         orig_status_changed_at = broker.get_info()['status_changed_at']
-        new_delete_timestamp = next(self.ts)
+        new_delete_timestamp = next(self.ts).internal
         broker.merge_timestamps(created_at, put_timestamp,
                                 new_delete_timestamp)
         info = broker.get_info()
@@ -482,13 +488,14 @@ class TestExampleBroker(unittest.TestCase):
 
     def test_get_max_row(self):
         broker = self.broker_class(':memory:', account='a', container='c')
-        broker.initialize(next(self.ts), storage_policy_index=int(self.policy))
+        broker.initialize(next(self.ts).internal,
+                          storage_policy_index=int(self.policy))
         self.assertEqual(-1, broker.get_max_row())
-        self.put_item(broker, next(self.ts))
+        self.put_item(broker, next(self.ts).internal)
         self.assertEqual(1, broker.get_max_row())
-        self.delete_item(broker, next(self.ts))
+        self.delete_item(broker, next(self.ts).internal)
         self.assertEqual(2, broker.get_max_row())
-        self.put_item(broker, next(self.ts))
+        self.put_item(broker, next(self.ts).internal)
         self.assertEqual(3, broker.get_max_row())
 
     def test_get_info(self):
@@ -517,8 +524,17 @@ class TestExampleBroker(unittest.TestCase):
                           storage_policy_index=int(self.policy))
         self.assertEqual(broker.metadata, {})
         self.assertEqual(broker.get_raw_metadata(), '')
-        key = u'test\u062a'.encode('utf-8')
-        value = u'value\u062a'
+        # This is not obvious. The actual JSON in the database is the same:
+        #  '{"test\\u062a": ["value\\u062a", "0000000001.00000"]}'
+        # The only difference is what reading it produces on py2 and py3.
+        # We use native strings for metadata (see native_str_keys_and_values),
+        # so types are different.
+        if six.PY2:
+            key = u'test\u062a'.encode('utf-8')
+            value = u'value\u062a'.encode('utf-8')
+        else:
+            key = u'test\u062a'
+            value = u'value\u062a'
         metadata = {
             key: [value, Timestamp(1).internal]
         }
@@ -529,7 +545,7 @@ class TestExampleBroker(unittest.TestCase):
 
     def test_put_timestamp(self):
         broker = self.broker_class(':memory:', account='a', container='c')
-        orig_put_timestamp = next(self.ts)
+        orig_put_timestamp = next(self.ts).internal
         broker.initialize(orig_put_timestamp,
                           storage_policy_index=int(self.policy))
         self.assertEqual(broker.get_info()['put_timestamp'],
@@ -539,7 +555,7 @@ class TestExampleBroker(unittest.TestCase):
         self.assertEqual(broker.get_info()['put_timestamp'],
                          orig_put_timestamp)
         # put_timestamp newer - gets newer
-        newer_put_timestamp = next(self.ts)
+        newer_put_timestamp = next(self.ts).internal
         broker.update_put_timestamp(newer_put_timestamp)
         self.assertEqual(broker.get_info()['put_timestamp'],
                          newer_put_timestamp)
@@ -550,7 +566,7 @@ class TestExampleBroker(unittest.TestCase):
 
     def test_status_changed_at(self):
         broker = self.broker_class(':memory:', account='test', container='c')
-        put_timestamp = next(self.ts)
+        put_timestamp = next(self.ts).internal
         created_at = time.time()
         with patch('swift.common.db.time.time', new=lambda: created_at):
             broker.initialize(put_timestamp,
@@ -559,13 +575,13 @@ class TestExampleBroker(unittest.TestCase):
                          put_timestamp)
         self.assertEqual(broker.get_info()['created_at'],
                          Timestamp(created_at).internal)
-        status_changed_at = next(self.ts)
+        status_changed_at = next(self.ts).internal
         broker.update_status_changed_at(status_changed_at)
         self.assertEqual(broker.get_info()['status_changed_at'],
                          status_changed_at)
         # save the old and get a new status_changed_at
         old_status_changed_at, status_changed_at = \
-            status_changed_at, next(self.ts)
+            status_changed_at, next(self.ts).internal
         broker.update_status_changed_at(status_changed_at)
         self.assertEqual(broker.get_info()['status_changed_at'],
                          status_changed_at)
@@ -592,9 +608,9 @@ class TestExampleBroker(unittest.TestCase):
     def test_commit_pending(self, tempdir):
         broker = self.broker_class(os.path.join(tempdir, 'test.db'),
                                    account='a', container='c')
-        broker.initialize(next(self.ts),
+        broker.initialize(next(self.ts).internal,
                           storage_policy_index=int(self.policy))
-        self.put_item(broker, next(self.ts))
+        self.put_item(broker, next(self.ts).internal)
         qry = 'select * from %s_stat' % broker.db_type
         with broker.get() as conn:
             rows = [dict(x) for x in conn.execute(qry)]
@@ -608,7 +624,7 @@ class TestExampleBroker(unittest.TestCase):
     def test_maybe_get(self, tempdir):
         broker = self.broker_class(os.path.join(tempdir, 'test.db'),
                                    account='a', container='c')
-        broker.initialize(next(self.ts),
+        broker.initialize(next(self.ts).internal,
                           storage_policy_index=int(self.policy))
         qry = 'select account from %s_stat' % broker.db_type
         with broker.maybe_get(None) as conn:
@@ -676,11 +692,9 @@ class TestDatabaseBroker(unittest.TestCase):
         stub_dict = {}
 
         def stub(*args, **kwargs):
-            for key in stub_dict.keys():
-                del stub_dict[key]
+            stub_dict.clear()
             stub_dict['args'] = args
-            for key, value in kwargs.items():
-                stub_dict[key] = value
+            stub_dict.update(kwargs)
         broker = DatabaseBroker(':memory:')
         broker._initialize = stub
         broker.initialize(normalize_timestamp('1'))
@@ -703,40 +717,78 @@ class TestDatabaseBroker(unittest.TestCase):
                           broker.initialize, normalize_timestamp('1'))
 
     def test_delete_db(self):
+        meta = {'foo': ['bar', normalize_timestamp('0')]}
+
         def init_stub(conn, put_timestamp, **kwargs):
             conn.execute('CREATE TABLE test (one TEXT)')
-            conn.execute('CREATE TABLE test_stat (id TEXT)')
-            conn.execute('INSERT INTO test_stat (id) VALUES (?)',
-                         (str(uuid4),))
+            conn.execute('''CREATE TABLE test_stat (
+                id TEXT, put_timestamp TEXT, delete_timestamp TEXT,
+                status TEXT, status_changed_at TEXT, metadata TEXT)''')
+            conn.execute(
+                '''INSERT INTO test_stat (
+                    id, put_timestamp, delete_timestamp, status,
+                    status_changed_at, metadata) VALUES (?, ?, ?, ?, ?, ?)''',
+                (str(uuid4), put_timestamp, '0', '', '0', json.dumps(meta)))
             conn.execute('INSERT INTO test (one) VALUES ("1")')
             conn.commit()
-        stub_called = [False]
 
-        def delete_stub(*a, **kw):
-            stub_called[0] = True
-        broker = DatabaseBroker(':memory:')
-        broker.db_type = 'test'
-        broker._initialize = init_stub
-        # Initializes a good broker for us
-        broker.initialize(normalize_timestamp('1'))
-        self.assertIsNotNone(broker.conn)
-        broker._delete_db = delete_stub
-        stub_called[0] = False
-        broker.delete_db('2')
-        self.assertTrue(stub_called[0])
-        broker = DatabaseBroker(os.path.join(self.testdir, '1.db'))
-        broker.db_type = 'test'
-        broker._initialize = init_stub
-        broker.initialize(normalize_timestamp('1'))
-        broker._delete_db = delete_stub
-        stub_called[0] = False
-        broker.delete_db('2')
-        self.assertTrue(stub_called[0])
-        # ensure that metadata was cleared
-        m2 = broker.metadata
-        self.assertTrue(not any(v[0] for v in m2.values()))
-        self.assertTrue(all(v[1] == normalize_timestamp('2')
-                            for v in m2.values()))
+        def do_test(expected_metadata, delete_meta_whitelist=None):
+            if not delete_meta_whitelist:
+                delete_meta_whitelist = []
+            broker = DatabaseBroker(':memory:')
+            broker.delete_meta_whitelist = delete_meta_whitelist
+            broker.db_type = 'test'
+            broker._initialize = init_stub
+            # Initializes a good broker for us
+            broker.initialize(normalize_timestamp('1'))
+            info = broker.get_info()
+            self.assertEqual('0', info['delete_timestamp'])
+            self.assertEqual('', info['status'])
+            self.assertIsNotNone(broker.conn)
+            broker.delete_db(normalize_timestamp('2'))
+            info = broker.get_info()
+            self.assertEqual(normalize_timestamp('2'),
+                             info['delete_timestamp'])
+            self.assertEqual('DELETED', info['status'])
+
+            # check meta
+            m2 = broker.metadata
+            self.assertEqual(m2, expected_metadata)
+
+            broker = DatabaseBroker(os.path.join(self.testdir,
+                                                 '%s.db' % uuid4()))
+            broker.delete_meta_whitelist = delete_meta_whitelist
+            broker.db_type = 'test'
+            broker._initialize = init_stub
+            broker.initialize(normalize_timestamp('1'))
+            info = broker.get_info()
+            self.assertEqual('0', info['delete_timestamp'])
+            self.assertEqual('', info['status'])
+            broker.delete_db(normalize_timestamp('2'))
+            info = broker.get_info()
+            self.assertEqual(normalize_timestamp('2'),
+                             info['delete_timestamp'])
+            self.assertEqual('DELETED', info['status'])
+
+            # check meta
+            m2 = broker.metadata
+            self.assertEqual(m2, expected_metadata)
+
+        # ensure that metadata was cleared by default
+        do_test({'foo': ['', normalize_timestamp('2')]})
+
+        # If the meta is in the brokers delete_meta_whitelist it wont get
+        # cleared up
+        do_test(meta, ['foo'])
+
+        # delete_meta_whitelist things need to be in lower case, as the keys
+        # are lower()'ed before checked
+        meta["X-Container-Meta-Test"] = ['value', normalize_timestamp('0')]
+        meta["X-Something-else"] = ['other', normalize_timestamp('0')]
+        do_test({'foo': ['', normalize_timestamp('2')],
+                 'X-Container-Meta-Test': ['value', normalize_timestamp('0')],
+                 'X-Something-else': ['other', normalize_timestamp('0')]},
+                ['x-container-meta-test', 'x-something-else'])
 
     def test_get(self):
         broker = DatabaseBroker(':memory:')
@@ -1042,6 +1094,7 @@ class TestDatabaseBroker(unittest.TestCase):
         broker = DatabaseBroker(':memory:', account='a')
         broker.db_type = 'test'
         broker.db_contains_type = 'test'
+        broker.db_reclaim_timestamp = 'created_at'
         broker_creation = normalize_timestamp(1)
         broker_uuid = str(uuid4())
         broker_metadata = metadata and json.dumps(
@@ -1132,7 +1185,7 @@ class TestDatabaseBroker(unittest.TestCase):
         return broker
 
     # only testing _reclaim_metadata here
-    @patch.object(DatabaseBroker, '_reclaim')
+    @patch.object(TombstoneReclaimer, 'reclaim')
     def test_metadata(self, mock_reclaim):
         # Initializes a good broker for us
         broker = self.get_replication_info_tester(metadata=True)
@@ -1267,7 +1320,7 @@ class TestDatabaseBroker(unittest.TestCase):
         for c in range(MAX_META_COUNT):
             key = 'X-Account-Meta-F{0}'.format(c)
             metadata[key] = ('B', normalize_timestamp(1))
-        key = 'X-Account-Meta-Foo'.format(c)
+        key = 'X-Account-Meta-Foo'
         metadata[key] = ('', normalize_timestamp(1))
         self.assertIsNone(DatabaseBroker.validate_metadata(metadata))
 
@@ -1413,20 +1466,40 @@ class TestDatabaseBroker(unittest.TestCase):
 
         # load file and merge
         with open(broker.pending_file, 'wb') as fd:
-            fd.write(':1:2:99')
+            for v in (1, 2, 99):
+                fd.write(b':' + base64.b64encode(pickle.dumps(
+                    v, protocol=PICKLE_PROTOCOL)))
         with patch.object(broker, 'merge_items') as mock_merge_items:
             broker._commit_puts_load = lambda l, e: l.append(e)
             broker._commit_puts()
-        mock_merge_items.assert_called_once_with(['1', '2', '99'])
+        mock_merge_items.assert_called_once_with([1, 2, 99])
         self.assertEqual(0, os.path.getsize(broker.pending_file))
 
         # load file and merge with given list
         with open(broker.pending_file, 'wb') as fd:
-            fd.write(':bad')
+            fd.write(b':' + base64.b64encode(pickle.dumps(
+                b'bad', protocol=PICKLE_PROTOCOL)))
         with patch.object(broker, 'merge_items') as mock_merge_items:
             broker._commit_puts_load = lambda l, e: l.append(e)
-            broker._commit_puts(['not'])
-        mock_merge_items.assert_called_once_with(['not', 'bad'])
+            broker._commit_puts([b'not'])
+        mock_merge_items.assert_called_once_with([b'not', b'bad'])
+        self.assertEqual(0, os.path.getsize(broker.pending_file))
+
+        # load a pending entry that's caused trouble in py2/py3 upgrade tests
+        # can't quite figure out how it got generated, though, so hard-code it
+        with open(broker.pending_file, 'wb') as fd:
+            fd.write(b':gAIoVS3olIngpILrjIvrjIvpkIngpIHlmIjlmIbjnIbgp'
+                     b'IPjnITimIPvhI/rjI3tiI5xAVUQMTU1OTI0MTg0Ni40NjY'
+                     b'wMXECVQEwVQEwVQEwSwBVATB0Lg==')
+        with patch.object(broker, 'merge_items') as mock_merge_items:
+            broker._commit_puts_load = lambda l, e: l.append(e)
+            broker._commit_puts([])
+        expected_name = (u'\u8509\u0902\ub30b\ub30b\u9409\u0901\u5608\u5606'
+                         u'\u3706\u0903\u3704\u2603\uf10f\ub30d\ud20e')
+        if six.PY2:
+            expected_name = expected_name.encode('utf8')
+        mock_merge_items.assert_called_once_with([
+            (expected_name, '1559241846.46601', '0', '0', '0', 0, '0')])
         self.assertEqual(0, os.path.getsize(broker.pending_file))
 
         # skip_commits True - no merge
@@ -1435,14 +1508,14 @@ class TestDatabaseBroker(unittest.TestCase):
         broker._initialize = MagicMock()
         broker.initialize(Timestamp.now())
         with open(broker.pending_file, 'wb') as fd:
-            fd.write(':ignored')
+            fd.write(b':ignored')
         with patch.object(broker, 'merge_items') as mock_merge_items:
             with self.assertRaises(DatabaseConnectionError) as cm:
-                broker._commit_puts(['hmmm'])
+                broker._commit_puts([b'hmmm'])
         mock_merge_items.assert_not_called()
         self.assertIn('commits not accepted', str(cm.exception))
         with open(broker.pending_file, 'rb') as fd:
-            self.assertEqual(':ignored', fd.read())
+            self.assertEqual(b':ignored', fd.read())
 
     def test_put_record(self):
         db_file = os.path.join(self.testdir, '1.db')
@@ -1457,9 +1530,10 @@ class TestDatabaseBroker(unittest.TestCase):
         mock_commit_puts.assert_not_called()
         with open(broker.pending_file, 'rb') as fd:
             pending = fd.read()
-        items = pending.split(':')
+        items = pending.split(b':')
         self.assertEqual(['PINKY'],
-                         [pickle.loads(i.decode('base64')) for i in items[1:]])
+                         [pickle.loads(base64.b64decode(i))
+                             for i in items[1:]])
 
         # record appended
         with patch.object(broker, '_commit_puts') as mock_commit_puts:
@@ -1467,15 +1541,16 @@ class TestDatabaseBroker(unittest.TestCase):
         mock_commit_puts.assert_not_called()
         with open(broker.pending_file, 'rb') as fd:
             pending = fd.read()
-        items = pending.split(':')
+        items = pending.split(b':')
         self.assertEqual(['PINKY', 'PERKY'],
-                         [pickle.loads(i.decode('base64')) for i in items[1:]])
+                         [pickle.loads(base64.b64decode(i))
+                             for i in items[1:]])
 
         # pending file above cap
         cap = swift.common.db.PENDING_CAP
         while os.path.getsize(broker.pending_file) < cap:
             with open(broker.pending_file, 'ab') as fd:
-                fd.write('x' * 100000)
+                fd.write(b'x' * 100000)
         with patch.object(broker, '_commit_puts') as mock_commit_puts:
             broker.put_record('direct')
         mock_commit_puts.called_once_with(['direct'])
@@ -1494,6 +1569,159 @@ class TestDatabaseBroker(unittest.TestCase):
         with open(broker.pending_file, 'rb') as fd:
             pending = fd.read()
         self.assertFalse(pending)
+
+
+class TestTombstoneReclaimer(unittest.TestCase):
+    def _make_object(self, broker, obj_name, ts, deleted):
+        if deleted:
+            broker.delete_test(obj_name, ts.internal)
+        else:
+            broker.put_test(obj_name, ts.internal)
+
+    def _count_reclaimable(self, conn, reclaim_age):
+        return conn.execute(
+            "SELECT count(*) FROM test "
+            "WHERE deleted = 1 AND created_at < ?", (reclaim_age,)
+        ).fetchone()[0]
+
+    def _get_reclaimable(self, broker, reclaim_age):
+        with broker.get() as conn:
+            return self._count_reclaimable(conn, reclaim_age)
+
+    def _setup_tombstones(self, reverse_names=True):
+        broker = ExampleBroker(':memory:', account='test_account',
+                               container='test_container')
+        broker.initialize(Timestamp('1').internal, 0)
+        now = time.time()
+        top_of_the_minute = now - (now % 60)
+
+        # namespace if reverse:
+        #  a-* has 70 'active' tombstones followed by 70 reclaimable
+        #  b-* has 70 'active' tombstones followed by 70 reclaimable
+        # else:
+        #  a-* has 70 reclaimable followed by 70 'active' tombstones
+        #  b-* has 70 reclaimable followed by 70 'active' tombstones
+        for i in range(0, 560, 4):
+            self._make_object(
+                broker, 'a_%3d' % (560 - i if reverse_names else i),
+                Timestamp(top_of_the_minute - (i * 60)), True)
+            self._make_object(
+                broker, 'a_%3d' % (559 - i if reverse_names else i + 1),
+                Timestamp(top_of_the_minute - ((i + 1) * 60)), False)
+            self._make_object(
+                broker, 'b_%3d' % (560 - i if reverse_names else i),
+                Timestamp(top_of_the_minute - ((i + 2) * 60)), True)
+            self._make_object(
+                broker, 'b_%3d' % (559 - i if reverse_names else i + 1),
+                Timestamp(top_of_the_minute - ((i + 3) * 60)), False)
+        broker._commit_puts()
+
+        # divide the set of timestamps exactly in half for reclaim
+        reclaim_age = top_of_the_minute + 1 - (560 / 2 * 60)
+        self.assertEqual(140, self._get_reclaimable(broker, reclaim_age))
+
+        tombstones = self._get_reclaimable(broker, top_of_the_minute + 1)
+        self.assertEqual(280, tombstones)
+        return broker, top_of_the_minute, reclaim_age
+
+    @contextlib.contextmanager
+    def _mock_broker_get(self, broker, reclaim_age):
+        # intercept broker.get() calls and capture the current reclaimable
+        # count before returning a conn
+        orig_get = broker.get
+        reclaimable = []
+
+        @contextlib.contextmanager
+        def mock_get():
+            with orig_get() as conn:
+                reclaimable.append(self._count_reclaimable(conn, reclaim_age))
+                yield conn
+        with patch.object(broker, 'get', mock_get):
+            yield reclaimable
+
+    def test_batched_reclaim_several_small_batches(self):
+        broker, totm, reclaim_age = self._setup_tombstones()
+
+        with self._mock_broker_get(broker, reclaim_age) as reclaimable:
+            with patch('swift.common.db.RECLAIM_PAGE_SIZE', 50):
+                reclaimer = TombstoneReclaimer(broker, reclaim_age)
+                reclaimer.reclaim()
+
+        expected_reclaimable = [140,  # 0 rows fetched
+                                90,  # 50 rows fetched, 50 reclaimed
+                                70,  # 100 rows fetched, 20 reclaimed
+                                60,  # 150 rows fetched, 10 reclaimed
+                                10,  # 200 rows fetched, 50 reclaimed
+                                0,  # 250 rows fetched, 10 reclaimed
+                                ]
+        self.assertEqual(expected_reclaimable, reclaimable)
+        self.assertEqual(0, self._get_reclaimable(broker, reclaim_age))
+
+    def test_batched_reclaim_exactly_two_batches(self):
+        broker, totm, reclaim_age = self._setup_tombstones()
+
+        with self._mock_broker_get(broker, reclaim_age) as reclaimable:
+            with patch('swift.common.db.RECLAIM_PAGE_SIZE', 140):
+                reclaimer = TombstoneReclaimer(broker, reclaim_age)
+                reclaimer.reclaim()
+
+        expected_reclaimable = [140,  # 0 rows fetched
+                                70,  # 140 rows fetched, 70 reclaimed
+                                ]
+        self.assertEqual(expected_reclaimable, reclaimable)
+        self.assertEqual(0, self._get_reclaimable(broker, reclaim_age))
+
+    def test_batched_reclaim_one_large_batch(self):
+        broker, totm, reclaim_age = self._setup_tombstones()
+
+        with self._mock_broker_get(broker, reclaim_age) as reclaimable:
+            with patch('swift.common.db.RECLAIM_PAGE_SIZE', 1000):
+                reclaimer = TombstoneReclaimer(broker, reclaim_age)
+                reclaimer.reclaim()
+
+        expected_reclaimable = [140]  # 0 rows fetched
+        self.assertEqual(expected_reclaimable, reclaimable)
+        self.assertEqual(0, self._get_reclaimable(broker, reclaim_age))
+
+    def test_reclaim_get_tombstone_count(self):
+        broker, totm, reclaim_age = self._setup_tombstones(reverse_names=False)
+        with patch('swift.common.db.RECLAIM_PAGE_SIZE', 122):
+            reclaimer = TombstoneReclaimer(broker, reclaim_age)
+            reclaimer.reclaim()
+        self.assertEqual(0, self._get_reclaimable(broker, reclaim_age))
+        tombstones = self._get_reclaimable(broker, totm + 1)
+        self.assertEqual(140, tombstones)
+        # in this scenario the reclaim phase finds the remaining tombstone
+        # count (140)
+        self.assertEqual(140, reclaimer.remaining_tombstones)
+        self.assertEqual(140, reclaimer.get_tombstone_count())
+
+    def test_reclaim_get_tombstone_count_with_leftover(self):
+        broker, totm, reclaim_age = self._setup_tombstones()
+        with patch('swift.common.db.RECLAIM_PAGE_SIZE', 122):
+            reclaimer = TombstoneReclaimer(broker, reclaim_age)
+            reclaimer.reclaim()
+
+        self.assertEqual(0, self._get_reclaimable(broker, reclaim_age))
+        tombstones = self._get_reclaimable(broker, totm + 1)
+        self.assertEqual(140, tombstones)
+        # in this scenario the reclaim phase finds a subset (104) of all
+        # tombstones (140)
+        self.assertEqual(104, reclaimer.remaining_tombstones)
+        # get_tombstone_count finds the rest
+        actual = reclaimer.get_tombstone_count()
+        self.assertEqual(140, actual)
+
+    def test_get_tombstone_count_with_leftover(self):
+        # verify that a call to get_tombstone_count() will invoke a reclaim if
+        # reclaim not already invoked
+        broker, totm, reclaim_age = self._setup_tombstones()
+        with patch('swift.common.db.RECLAIM_PAGE_SIZE', 122):
+            reclaimer = TombstoneReclaimer(broker, reclaim_age)
+            actual = reclaimer.get_tombstone_count()
+
+        self.assertEqual(0, self._get_reclaimable(broker, reclaim_age))
+        self.assertEqual(140, actual)
 
 
 if __name__ == '__main__':

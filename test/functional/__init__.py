@@ -16,7 +16,8 @@
 from __future__ import print_function
 import mock
 import os
-from six.moves.urllib.parse import urlparse
+import six
+from six.moves.urllib.parse import urlparse, urlsplit, urlunsplit
 import sys
 import pickle
 import socket
@@ -25,6 +26,7 @@ import eventlet
 import eventlet.debug
 import functools
 import random
+import base64
 
 from time import time, sleep
 from contextlib import closing
@@ -41,10 +43,9 @@ from swift.common.storage_policy import parse_storage_policies, PolicyError
 from swift.common.utils import set_swift_dir
 
 from test import get_config, listen_zero
-from test.functional.swift_test_client import Account, Connection, Container, \
-    ResponseError
 
-from test.unit import debug_logger, FakeMemcache
+from test.debug_logger import debug_logger
+from test.unit import FakeMemcache
 # importing skip_if_no_xattrs so that functional tests can grab it from the
 # test.functional namespace. Importing SkipTest so this works under both
 # nose and testr test runners.
@@ -53,8 +54,7 @@ from test.unit import SkipTest
 
 from swift.common import constraints, utils, ring, storage_policy
 from swift.common.ring import Ring
-from swift.common.wsgi import (
-    monkey_patch_mimetools, loadapp, SwiftHttpProtocol)
+from swift.common.wsgi import loadapp, SwiftHttpProtocol
 from swift.common.utils import config_true_value, split_path
 from swift.account import server as account_server
 from swift.container import server as container_server
@@ -73,6 +73,10 @@ DEBUG = True
 eventlet.hubs.use_hub(utils.get_hub())
 eventlet.patcher.monkey_patch(all=False, socket=True)
 eventlet.debug.hub_exceptions(False)
+
+# swift_test_client import from swiftclient, so move after the monkey-patching
+from test.functional.swift_test_client import Account, Connection, Container, \
+    ResponseError
 
 from swiftclient import get_auth, http_connection
 
@@ -150,7 +154,7 @@ def _in_process_setup_swift_conf(swift_conf_src, testdir):
         conf.set(section, 'swift_hash_path_prefix', 'inprocfunctests')
         section = 'swift-constraints'
         max_file_size = (8 * 1024 * 1024) + 2  # 8 MB + 2
-        conf.set(section, 'max_file_size', max_file_size)
+        conf.set(section, 'max_file_size', str(max_file_size))
     except NoSectionError:
         msg = 'Conf file %s is missing section %s' % (swift_conf_src, section)
         raise InProcessException(msg)
@@ -232,8 +236,8 @@ def _in_process_setup_ring(swift_conf, conf_src_dir, testdir):
     sp_zero_section = sp_prefix + '0'
     conf.add_section(sp_zero_section)
     for (k, v) in policy_to_test.get_info(config=True).items():
-        conf.set(sp_zero_section, k, v)
-    conf.set(sp_zero_section, 'default', True)
+        conf.set(sp_zero_section, k, str(v))
+    conf.set(sp_zero_section, 'default', 'True')
 
     with open(swift_conf, 'w') as fp:
         conf.write(fp)
@@ -245,7 +249,7 @@ def _in_process_setup_ring(swift_conf, conf_src_dir, testdir):
     try:
         ring_file_src = _in_process_find_conf_file(conf_src_dir, ring_file_src,
                                                    use_sample=False)
-    except InProcessException as e:
+    except InProcessException:
         if policy_specified:
             raise InProcessException('Failed to find ring file %s'
                                      % ring_file_src)
@@ -319,9 +323,16 @@ def _load_encryption(proxy_conf_file, swift_conf_file, **kwargs):
         pipeline = pipeline.replace(
             "proxy-logging proxy-server",
             "keymaster encryption proxy-logging proxy-server")
+        pipeline = pipeline.replace(
+            "cache listing_formats",
+            "cache etag-quoter listing_formats")
         conf.set(section, 'pipeline', pipeline)
-        root_secret = os.urandom(32).encode("base64")
+        root_secret = base64.b64encode(os.urandom(32))
+        if not six.PY2:
+            root_secret = root_secret.decode('ascii')
         conf.set('filter:keymaster', 'encryption_root_secret', root_secret)
+        conf.set('filter:versioned_writes', 'allow_object_versioning', 'true')
+        conf.set('filter:etag-quoter', 'enable_by_default', 'true')
     except NoSectionError as err:
         msg = 'Error problem with proxy conf file %s: %s' % \
               (proxy_conf_file, err)
@@ -399,7 +410,10 @@ def _load_domain_remap_staticweb(proxy_conf_file, swift_conf_file, **kwargs):
         old_pipeline = conf.get(section, 'pipeline')
         pipeline = old_pipeline.replace(
             " tempauth ",
-            " domain_remap tempauth staticweb ")
+            " tempauth staticweb ")
+        pipeline = pipeline.replace(
+            " listing_formats ",
+            " domain_remap listing_formats ")
         if pipeline == old_pipeline:
             raise InProcessException(
                 "Failed to insert domain_remap and staticweb into pipeline: %s"
@@ -448,6 +462,8 @@ def _load_s3api(proxy_conf_file, swift_conf_file, **kwargs):
             "s3api tempauth")
         conf.set(section, 'pipeline', pipeline)
         conf.set('filter:s3api', 's3_acl', 'true')
+
+        conf.set('filter:versioned_writes', 'allow_object_versioning', 'true')
     except NoSectionError as err:
         msg = 'Error problem with proxy conf file %s: %s' % \
               (proxy_conf_file, err)
@@ -468,8 +484,6 @@ def _load_s3api(proxy_conf_file, swift_conf_file, **kwargs):
 conf_loaders = {
     'encryption': _load_encryption,
     'ec': _load_ec_as_default_policy,
-    'domain_remap_staticweb': _load_domain_remap_staticweb,
-    's3api': _load_s3api,
 }
 
 
@@ -493,8 +507,6 @@ def in_process_setup(the_object_server=object_server):
     swift_conf_src = _in_process_find_conf_file(conf_src_dir, 'swift.conf')
     _info('Using swift config from %s' % swift_conf_src)
 
-    monkey_patch_mimetools()
-
     global _testdir
     _testdir = os.path.join(mkdtemp(), 'tmp_functional')
     utils.mkdirs(_testdir)
@@ -508,6 +520,11 @@ def in_process_setup(the_object_server=object_server):
 
     swift_conf = _in_process_setup_swift_conf(swift_conf_src, _testdir)
     _info('prepared swift.conf: %s' % swift_conf)
+
+    # load s3api and staticweb configs
+    proxy_conf, swift_conf = _load_s3api(proxy_conf, swift_conf)
+    proxy_conf, swift_conf = _load_domain_remap_staticweb(proxy_conf,
+                                                          swift_conf)
 
     # Call the associated method for the value of
     # 'SWIFT_TEST_IN_PROCESS_CONF_LOADER', if one exists
@@ -538,7 +555,6 @@ def in_process_setup(the_object_server=object_server):
         storage_policy.reload_storage_policies()
 
     global config
-    config['__file__'] = 'in_process_setup()'
     if constraints.SWIFT_CONSTRAINTS_LOADED:
         # Use the swift constraints that are loaded for the test framework
         # configuration
@@ -566,22 +582,15 @@ def in_process_setup(the_object_server=object_server):
         'swift_dir': _testdir,
         'mount_check': 'false',
         'client_timeout': '4',
+        'container_update_timeout': '3',
         'allow_account_management': 'true',
         'account_autocreate': 'true',
         'allow_versions': 'True',
         'allow_versioned_writes': 'True',
-        # TODO: move this into s3api config loader because they are
-        #       required by only s3api
-        'allowed_headers':
-            "Content-Disposition, Content-Encoding, X-Delete-At, "
-            "X-Object-Manifest, X-Static-Large-Object, Cache-Control, "
-            "Content-Language, Expires, X-Robots-Tag",
         # Below are values used by the functional test framework, as well as
         # by the various in-process swift servers
-        'auth_host': '127.0.0.1',
-        'auth_port': str(prolis.getsockname()[1]),
-        'auth_ssl': 'no',
-        'auth_prefix': '/auth/',
+        'auth_uri': 'http://127.0.0.1:%d/auth/v1.0/' % prolis.getsockname()[1],
+        's3_storage_url': 'http://%s:%d/' % prolis.getsockname(),
         # Primary functional test account (needs admin access to the
         # account)
         'account': 'test',
@@ -589,6 +598,10 @@ def in_process_setup(the_object_server=object_server):
         'password': 'testing',
         's3_access_key': 'test:tester',
         's3_secret_key': 'testing',
+        # Secondary user of the primary test account (needs admin access
+        # to the account) for s3api
+        's3_access_key2': 'test:tester2',
+        's3_secret_key2': 'testing2',
         # User on a second account (needs admin access to the account)
         'account2': 'test2',
         'username2': 'tester2',
@@ -596,8 +609,8 @@ def in_process_setup(the_object_server=object_server):
         # User on same account as first, but without admin access
         'username3': 'tester3',
         'password3': 'testing3',
-        's3_access_key2': 'test:tester3',
-        's3_secret_key2': 'testing3',
+        's3_access_key3': 'test:tester3',
+        's3_secret_key3': 'testing3',
         # Service user and prefix (emulates glance, cinder, etc. user)
         'account5': 'test5',
         'username5': 'tester5',
@@ -634,9 +647,6 @@ def in_process_setup(the_object_server=object_server):
                      {'id': 1, 'zone': 1, 'device': 'sdb1', 'ip': '127.0.0.1',
                       'port': con2lis.getsockname()[1]}], 30),
                     f)
-
-    # Default to only 4 seconds for in-process functional test runs
-    eventlet.wsgi.WRITE_TIMEOUT = 4
 
     def get_logger_name(name):
         if show_debug_logs:
@@ -711,10 +721,11 @@ def in_process_setup(the_object_server=object_server):
                 '/' + act, {'X-Timestamp': ts, 'x-trans-id': act})
             resp = conn.getresponse()
             assert resp.status == 201, 'Unable to create account: %s\n%s' % (
-                resp.status, resp.body)
+                resp.status, resp.read())
 
     create_account('AUTH_test')
     create_account('AUTH_test2')
+
 
 cluster_info = {}
 
@@ -732,7 +743,7 @@ def get_cluster_info():
         conn = Connection(config)
         conn.authenticate()
         cluster_info.update(conn.cluster_info())
-    except (ResponseError, socket.error):
+    except (ResponseError, socket.error, SkipTest):
         # Failed to get cluster_information via /info API, so fall back on
         # test.conf data
         pass
@@ -844,23 +855,44 @@ def setup_package():
     if config:
         swift_test_auth_version = str(config.get('auth_version', '1'))
 
-        swift_test_auth = 'http'
-        if config_true_value(config.get('auth_ssl', 'no')):
-            swift_test_auth = 'https'
-        if 'auth_prefix' not in config:
-            config['auth_prefix'] = '/'
-        try:
-            suffix = '://%(auth_host)s:%(auth_port)s%(auth_prefix)s' % config
-            swift_test_auth += suffix
-        except KeyError:
-            pass  # skip
+        if 'auth_uri' in config:
+            swift_test_auth = config['auth_uri']
+            # Back-fill the individual parts -- really, we should just need
+            # host and port for s3_test_client, and that's only until we
+            # improve it to take a s3_storage_url option
+            parsed = urlsplit(config['auth_uri'])
+            config.update({
+                'auth_ssl': str(parsed.scheme == 'https'),
+                'auth_host': parsed.hostname,
+                'auth_port': str(
+                    parsed.port if parsed.port is not None else
+                    443 if parsed.scheme == 'https' else 80),
+                'auth_prefix': parsed.path,
+            })
+            config.setdefault('s3_storage_url',
+                              urlunsplit(parsed[:2] + ('', None, None)))
+        elif 'auth_host' in config:
+            scheme = 'http'
+            if config_true_value(config.get('auth_ssl', 'no')):
+                scheme = 'https'
+            netloc = config['auth_host']
+            if 'auth_port' in config:
+                netloc += ':' + config['auth_port']
+            auth_prefix = config.get('auth_prefix', '/')
+            if swift_test_auth_version == "1":
+                auth_prefix += 'v1.0'
+            config['auth_uri'] = swift_test_auth = urlunsplit(
+                (scheme, netloc, auth_prefix, None, None))
+            config.setdefault('s3_storage_url', urlunsplit(
+                (scheme, netloc, '', None, None)))
+        # else, neither auth_uri nor auth_host; swift_test_auth will be unset
+        # and we'll skip everything later
 
         if 'service_prefix' in config:
-                swift_test_service_prefix = utils.append_underscore(
-                    config['service_prefix'])
+            swift_test_service_prefix = utils.append_underscore(
+                config['service_prefix'])
 
         if swift_test_auth_version == "1":
-            swift_test_auth += 'v1.0'
 
             try:
                 if 'account' in config:
@@ -901,12 +933,18 @@ def setup_package():
             swift_test_user[0] = config['username']
             swift_test_tenant[0] = config['account']
             swift_test_key[0] = config['password']
+            if 'domain' in config:
+                swift_test_domain[0] = config['domain']
             swift_test_user[1] = config['username2']
             swift_test_tenant[1] = config['account2']
             swift_test_key[1] = config['password2']
+            if 'domain2' in config:
+                swift_test_domain[1] = config['domain2']
             swift_test_user[2] = config['username3']
             swift_test_tenant[2] = config['account']
             swift_test_key[2] = config['password3']
+            if 'domain3' in config:
+                swift_test_domain[2] = config['domain3']
             if 'username4' in config:
                 swift_test_user[3] = config['username4']
                 swift_test_tenant[3] = config['account4']
@@ -916,49 +954,60 @@ def setup_package():
                 swift_test_user[4] = config['username5']
                 swift_test_tenant[4] = config['account5']
                 swift_test_key[4] = config['password5']
+                if 'domain5' in config:
+                    swift_test_domain[4] = config['domain5']
             if 'username6' in config:
                 swift_test_user[5] = config['username6']
                 swift_test_tenant[5] = config['account6']
                 swift_test_key[5] = config['password6']
+                if 'domain6' in config:
+                    swift_test_domain[5] = config['domain6']
 
             for _ in range(5):
                 swift_test_perm[_] = swift_test_tenant[_] + ':' \
                     + swift_test_user[_]
 
     global skip
-    skip = not all([swift_test_auth, swift_test_user[0], swift_test_key[0]])
-    if skip:
-        print('SKIPPING FUNCTIONAL TESTS DUE TO NO CONFIG', file=sys.stderr)
+    if not skip:
+        skip = not all([swift_test_auth, swift_test_user[0],
+                        swift_test_key[0]])
+        if skip:
+            print('SKIPPING FUNCTIONAL TESTS DUE TO NO CONFIG',
+                  file=sys.stderr)
 
     global skip2
-    skip2 = not all([not skip, swift_test_user[1], swift_test_key[1]])
-    if not skip and skip2:
-        print('SKIPPING SECOND ACCOUNT FUNCTIONAL TESTS '
-              'DUE TO NO CONFIG FOR THEM', file=sys.stderr)
+    if not skip2:
+        skip2 = not all([not skip, swift_test_user[1], swift_test_key[1]])
+        if not skip and skip2:
+            print('SKIPPING SECOND ACCOUNT FUNCTIONAL TESTS '
+                  'DUE TO NO CONFIG FOR THEM', file=sys.stderr)
 
     global skip3
-    skip3 = not all([not skip, swift_test_user[2], swift_test_key[2]])
-    if not skip and skip3:
-        print('SKIPPING THIRD ACCOUNT FUNCTIONAL TESTS'
-              'DUE TO NO CONFIG FOR THEM', file=sys.stderr)
+    if not skip3:
+        skip3 = not all([not skip, swift_test_user[2], swift_test_key[2]])
+        if not skip and skip3:
+            print('SKIPPING THIRD ACCOUNT FUNCTIONAL TESTS '
+                  'DUE TO NO CONFIG FOR THEM', file=sys.stderr)
 
     global skip_if_not_v3
-    skip_if_not_v3 = (swift_test_auth_version != '3'
-                      or not all([not skip,
-                                  swift_test_user[3],
-                                  swift_test_key[3]]))
-    if not skip and skip_if_not_v3:
-        print('SKIPPING FUNCTIONAL TESTS SPECIFIC TO AUTH VERSION 3',
-              file=sys.stderr)
+    if not skip_if_not_v3:
+        skip_if_not_v3 = (swift_test_auth_version != '3'
+                          or not all([not skip,
+                                      swift_test_user[3],
+                                      swift_test_key[3]]))
+        if not skip and skip_if_not_v3:
+            print('SKIPPING FUNCTIONAL TESTS SPECIFIC TO AUTH VERSION 3',
+                  file=sys.stderr)
 
     global skip_service_tokens
-    skip_service_tokens = not all([not skip, swift_test_user[4],
-                                   swift_test_key[4], swift_test_tenant[4],
-                                   swift_test_service_prefix])
-    if not skip and skip_service_tokens:
-        print(
-            'SKIPPING FUNCTIONAL TESTS SPECIFIC TO SERVICE TOKENS',
-            file=sys.stderr)
+    if not skip_service_tokens:
+        skip_service_tokens = not all([not skip, swift_test_user[4],
+                                       swift_test_key[4], swift_test_tenant[4],
+                                       swift_test_service_prefix])
+        if not skip and skip_service_tokens:
+            print(
+                'SKIPPING FUNCTIONAL TESTS SPECIFIC TO SERVICE TOKENS',
+                file=sys.stderr)
 
     if policy_specified:
         policies = FunctionalStoragePolicyCollection.from_info()
@@ -977,13 +1026,13 @@ def setup_package():
                             % policy_specified)
 
     global skip_if_no_reseller_admin
-    skip_if_no_reseller_admin = not all([not skip, swift_test_user[5],
-                                         swift_test_key[5],
-                                         swift_test_tenant[5]])
-    if not skip and skip_if_no_reseller_admin:
-        print(
-            'SKIPPING FUNCTIONAL TESTS DUE TO NO CONFIG FOR RESELLER ADMIN',
-            file=sys.stderr)
+    if not skip_if_no_reseller_admin:
+        skip_if_no_reseller_admin = not all([not skip, swift_test_user[5],
+                                             swift_test_key[5],
+                                             swift_test_tenant[5]])
+        if not skip and skip_if_no_reseller_admin:
+            print('SKIPPING FUNCTIONAL TESTS DUE TO NO CONFIG FOR '
+                  'RESELLER ADMIN', file=sys.stderr)
 
     get_cluster_info()
 
@@ -996,10 +1045,13 @@ def teardown_package():
     global config
 
     if config:
-        conn = Connection(config)
-        conn.authenticate()
-        account = Account(conn, config.get('account', config['username']))
-        account.delete_containers()
+        try:
+            conn = Connection(config)
+            conn.authenticate()
+            account = Account(conn, config.get('account', config['username']))
+            account.delete_containers()
+        except (SkipTest):
+            pass
 
     global in_process
     global _test_socks
@@ -1074,10 +1126,15 @@ def get_url_token(user_index, os_options):
                     auth_version=swift_test_auth_version,
                     os_options=os_options,
                     insecure=insecure)
-    return get_auth(swift_test_auth,
-                    swift_test_user[user_index],
-                    swift_test_key[user_index],
-                    **authargs)
+    url, token = get_auth(swift_test_auth,
+                          swift_test_user[user_index],
+                          swift_test_key[user_index],
+                          **authargs)
+    if six.PY2 and not isinstance(url, bytes):
+        url = url.encode('utf-8')
+    if six.PY2 and not isinstance(token, bytes):
+        token = token.encode('utf-8')
+    return url, token
 
 
 def retry(func, *args, **kwargs):
@@ -1281,4 +1338,16 @@ def requires_policies(f):
             raise SkipTest("Multiple policies not enabled")
         return f(self, *args, **kwargs)
 
+    return wrapper
+
+
+def requires_bulk(f):
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+        if skip or not cluster_info:
+            raise SkipTest('Requires bulk middleware')
+        # Determine whether this cluster has bulk middleware; if not, skip test
+        if not cluster_info.get('bulk_upload', {}):
+            raise SkipTest('Requires bulk middleware')
+        return f(*args, **kwargs)
     return wrapper

@@ -19,6 +19,7 @@ import mock
 from shutil import rmtree
 from tempfile import mkdtemp
 
+import six
 from six.moves import cStringIO as StringIO
 from test.unit import patch_policies, write_fake_ring, skip_if_no_xattrs
 
@@ -106,6 +107,7 @@ class TestCliInfo(TestCliInfoBase):
 
         info = {
             'account': 'acct',
+            'is_deleted': False,
             'created_at': 100.1,
             'put_timestamp': 106.3,
             'delete_timestamp': 107.9,
@@ -123,6 +125,7 @@ class TestCliInfo(TestCliInfoBase):
             print_db_info_metadata('account', info, md)
         exp_out = '''Path: /acct
   Account: acct
+  Deleted: False
   Account Hash: dc5be2aa4347a22a0fee6bc7de505b47
 Metadata:
   Created at: 1970-01-01T00:01:40.100000 (100.1)
@@ -138,8 +141,8 @@ Metadata:
 No system metadata found in db file
   User Metadata: {'x-account-meta-mydata': 'swift'}'''
 
-        self.assertEqual(sorted(out.getvalue().strip().split('\n')),
-                         sorted(exp_out.split('\n')))
+        self.assertEqual(out.getvalue().strip().split('\n'),
+                         exp_out.split('\n'))
 
         info = dict(
             account='acct',
@@ -158,9 +161,10 @@ No system metadata found in db file
             x_container_foo='bar',
             x_container_bar='goo',
             db_state=UNSHARDED,
-            is_root=True)
-        info['hash'] = 'abaddeadbeefcafe'
-        info['id'] = 'abadf100d0ddba11'
+            is_root=True,
+            is_deleted=False,
+            hash='abaddeadbeefcafe',
+            id='abadf100d0ddba11')
         md = {'x-container-sysmeta-mydata': ('swift', '0000000000.00000')}
         out = StringIO()
         with mock.patch('sys.stdout', out):
@@ -168,6 +172,7 @@ No system metadata found in db file
         exp_out = '''Path: /acct/cont
   Account: acct
   Container: cont
+  Deleted: False
   Container Hash: d49d0ecbb53be1fcc49624f2f7c7ccae
 Metadata:
   Created at: 1970-01-01T00:01:40.100000 (0000000100.10000)
@@ -190,6 +195,45 @@ No user metadata found in db file
 Sharding Metadata:
   Type: root
   State: unsharded''' % POLICIES[0].name
+        self.assertEqual(sorted(out.getvalue().strip().split('\n')),
+                         sorted(exp_out.split('\n')))
+
+        info = {
+            'account': 'acct',
+            'is_deleted': True,
+            'created_at': 100.1,
+            'put_timestamp': 106.3,
+            'delete_timestamp': 107.9,
+            'status_changed_at': 108.3,
+            'container_count': '3',
+            'object_count': '20',
+            'bytes_used': '42',
+            'hash': 'abaddeadbeefcafe',
+            'id': 'abadf100d0ddba11',
+        }
+        md = {'x-account-meta-mydata': ('swift', '0000000000.00000'),
+              'x-other-something': ('boo', '0000000000.00000')}
+        out = StringIO()
+        with mock.patch('sys.stdout', out):
+            print_db_info_metadata('account', info, md)
+        exp_out = '''Path: /acct
+  Account: acct
+  Deleted: True
+  Account Hash: dc5be2aa4347a22a0fee6bc7de505b47
+Metadata:
+  Created at: 1970-01-01T00:01:40.100000 (100.1)
+  Put Timestamp: 1970-01-01T00:01:46.300000 (106.3)
+  Delete Timestamp: 1970-01-01T00:01:47.900000 (107.9)
+  Status Timestamp: 1970-01-01T00:01:48.300000 (108.3)
+  Container Count: 3
+  Object Count: 20
+  Bytes Used: 42
+  Chexor: abaddeadbeefcafe
+  UUID: abadf100d0ddba11
+  X-Other-Something: boo
+No system metadata found in db file
+  User Metadata: {'x-account-meta-mydata': 'swift'}'''
+
         self.assertEqual(sorted(out.getvalue().strip().split('\n')),
                          sorted(exp_out.split('\n')))
 
@@ -219,15 +263,17 @@ Sharding Metadata:
             reported_bytes_used='42',
             db_state=SHARDED,
             is_root=True,
-            shard_ranges=shard_ranges)
-        info['hash'] = 'abaddeadbeefcafe'
-        info['id'] = 'abadf100d0ddba11'
+            shard_ranges=shard_ranges,
+            is_deleted=False,
+            hash='abaddeadbeefcafe',
+            id='abadf100d0ddba11')
         out = StringIO()
         with mock.patch('sys.stdout', out):
-            print_db_info_metadata('container', info, {})
+            print_db_info_metadata('container', info, {}, verbose=True)
         exp_out = '''Path: /acct/cont
   Account: acct
   Container: cont
+  Deleted: False
   Container Hash: d49d0ecbb53be1fcc49624f2f7c7ccae
 Metadata:
   Created at: 1970-01-01T00:01:40.100000 (0000000100.10000)
@@ -249,6 +295,10 @@ Sharding Metadata:
   Type: root
   State: sharded
 Shard Ranges (3):
+  States:
+        found: 1
+      created: 1
+      cleaved: 1
   Name: .sharded_a/shard_range_1
     lower: '1a', upper: '1z'
     Object Count: 1, Bytes Used: 1, State: cleaved (30)
@@ -265,8 +315,164 @@ Shard Ranges (3):
     Created at: 1970-01-01T00:00:03.000000 (0000000003.00000)
     Meta Timestamp: 1970-01-01T00:00:03.000000 (0000000003.00000)''' %\
                   POLICIES[0].name
-        self.assertEqual(sorted(out.getvalue().strip().split('\n')),
-                         sorted(exp_out.strip().split('\n')))
+        self.assertEqual(out.getvalue().strip().split('\n'),
+                         exp_out.strip().split('\n'))
+
+    def test_print_db_info_metadata_with_many_shard_ranges(self):
+
+        shard_ranges = [utils.ShardRange(
+            name='.sharded_a/shard_range_%s' % i,
+            timestamp=utils.Timestamp(i), lower='%02da' % i,
+            upper='%02dz' % i, object_count=i, bytes_used=i,
+            meta_timestamp=utils.Timestamp(i)) for i in range(1, 20)]
+        shard_ranges[0].state = utils.ShardRange.CLEAVED
+        shard_ranges[1].state = utils.ShardRange.CREATED
+
+        info = dict(
+            account='acct',
+            container='cont',
+            storage_policy_index=0,
+            created_at='0000000100.10000',
+            put_timestamp='0000000106.30000',
+            delete_timestamp='0000000107.90000',
+            status_changed_at='0000000108.30000',
+            object_count='20',
+            bytes_used='42',
+            reported_put_timestamp='0000010106.30000',
+            reported_delete_timestamp='0000010107.90000',
+            reported_object_count='20',
+            reported_bytes_used='42',
+            db_state=SHARDED,
+            is_root=True,
+            shard_ranges=shard_ranges,
+            is_deleted=False,
+            hash='abaddeadbeefcafe',
+            id='abadf100d0ddba11')
+        out = StringIO()
+        with mock.patch('sys.stdout', out):
+            print_db_info_metadata('container', info, {})
+        exp_out = '''
+Path: /acct/cont
+  Account: acct
+  Container: cont
+  Deleted: False
+  Container Hash: d49d0ecbb53be1fcc49624f2f7c7ccae
+Metadata:
+  Created at: 1970-01-01T00:01:40.100000 (0000000100.10000)
+  Put Timestamp: 1970-01-01T00:01:46.300000 (0000000106.30000)
+  Delete Timestamp: 1970-01-01T00:01:47.900000 (0000000107.90000)
+  Status Timestamp: 1970-01-01T00:01:48.300000 (0000000108.30000)
+  Object Count: 20
+  Bytes Used: 42
+  Storage Policy: %s (0)
+  Reported Put Timestamp: 1970-01-01T02:48:26.300000 (0000010106.30000)
+  Reported Delete Timestamp: 1970-01-01T02:48:27.900000 (0000010107.90000)
+  Reported Object Count: 20
+  Reported Bytes Used: 42
+  Chexor: abaddeadbeefcafe
+  UUID: abadf100d0ddba11
+No system metadata found in db file
+No user metadata found in db file
+Sharding Metadata:
+  Type: root
+  State: sharded
+Shard Ranges (19):
+  States:
+        found: 17
+      created: 1
+      cleaved: 1
+(Use -v/--verbose to show more Shard Ranges details)
+''' %\
+                  POLICIES[0].name
+        self.assertEqual(out.getvalue().strip().split('\n'),
+                         exp_out.strip().split('\n'))
+
+    def test_print_db_info_metadata_with_shard_ranges_bis(self):
+
+        shard_ranges = [utils.ShardRange(
+            name='.sharded_a/shard_range_%s' % i,
+            timestamp=utils.Timestamp(i), lower=u'%d\u30a2' % i,
+            upper=u'%d\u30e4' % i, object_count=i, bytes_used=i,
+            meta_timestamp=utils.Timestamp(i)) for i in range(1, 4)]
+        shard_ranges[0].state = utils.ShardRange.CLEAVED
+        shard_ranges[1].state = utils.ShardRange.CREATED
+
+        info = dict(
+            account='acct',
+            container='cont',
+            storage_policy_index=0,
+            created_at='0000000100.10000',
+            put_timestamp='0000000106.30000',
+            delete_timestamp='0000000107.90000',
+            status_changed_at='0000000108.30000',
+            object_count='20',
+            bytes_used='42',
+            reported_put_timestamp='0000010106.30000',
+            reported_delete_timestamp='0000010107.90000',
+            reported_object_count='20',
+            reported_bytes_used='42',
+            db_state=SHARDED,
+            is_root=True,
+            shard_ranges=shard_ranges)
+        info['hash'] = 'abaddeadbeefcafe'
+        info['id'] = 'abadf100d0ddba11'
+        info['is_deleted'] = False
+        out = StringIO()
+        with mock.patch('sys.stdout', out):
+            print_db_info_metadata('container', info, {}, verbose=True)
+        if six.PY2:
+            s_a = '\\xe3\\x82\\xa2'
+            s_ya = '\\xe3\\x83\\xa4'
+        else:
+            s_a = '\u30a2'
+            s_ya = '\u30e4'
+        exp_out = '''Path: /acct/cont
+  Account: acct
+  Container: cont
+  Deleted: False
+  Container Hash: d49d0ecbb53be1fcc49624f2f7c7ccae
+Metadata:
+  Created at: 1970-01-01T00:01:40.100000 (0000000100.10000)
+  Put Timestamp: 1970-01-01T00:01:46.300000 (0000000106.30000)
+  Delete Timestamp: 1970-01-01T00:01:47.900000 (0000000107.90000)
+  Status Timestamp: 1970-01-01T00:01:48.300000 (0000000108.30000)
+  Object Count: 20
+  Bytes Used: 42
+  Storage Policy: %s (0)
+  Reported Put Timestamp: 1970-01-01T02:48:26.300000 (0000010106.30000)
+  Reported Delete Timestamp: 1970-01-01T02:48:27.900000 (0000010107.90000)
+  Reported Object Count: 20
+  Reported Bytes Used: 42
+  Chexor: abaddeadbeefcafe
+  UUID: abadf100d0ddba11
+No system metadata found in db file
+No user metadata found in db file
+Sharding Metadata:
+  Type: root
+  State: sharded
+Shard Ranges (3):
+  States:
+        found: 1
+      created: 1
+      cleaved: 1
+  Name: .sharded_a/shard_range_1
+    lower: '1%s', upper: '1%s'
+    Object Count: 1, Bytes Used: 1, State: cleaved (30)
+    Created at: 1970-01-01T00:00:01.000000 (0000000001.00000)
+    Meta Timestamp: 1970-01-01T00:00:01.000000 (0000000001.00000)
+  Name: .sharded_a/shard_range_2
+    lower: '2%s', upper: '2%s'
+    Object Count: 2, Bytes Used: 2, State: created (20)
+    Created at: 1970-01-01T00:00:02.000000 (0000000002.00000)
+    Meta Timestamp: 1970-01-01T00:00:02.000000 (0000000002.00000)
+  Name: .sharded_a/shard_range_3
+    lower: '3%s', upper: '3%s'
+    Object Count: 3, Bytes Used: 3, State: found (10)
+    Created at: 1970-01-01T00:00:03.000000 (0000000003.00000)
+    Meta Timestamp: 1970-01-01T00:00:03.000000 (0000000003.00000)''' %\
+                  (POLICIES[0].name, s_a, s_ya, s_a, s_ya, s_a, s_ya)
+        self.assertEqual(out.getvalue().strip().split('\n'),
+                         exp_out.strip().split('\n'))
 
     def test_print_ring_locations_invalid_args(self):
         self.assertRaises(ValueError, print_ring_locations,
@@ -368,13 +574,10 @@ Shard Ranges (3):
             print_item_locations(None, partition=part, policy_name='zero',
                                  swift_dir=self.testdir)
         exp_part_msg = 'Partition\t%s' % part
-        exp_acct_msg = 'Account  \tNone'
-        exp_cont_msg = 'Container\tNone'
-        exp_obj_msg = 'Object   \tNone'
         self.assertIn(exp_part_msg, out.getvalue())
-        self.assertIn(exp_acct_msg, out.getvalue())
-        self.assertIn(exp_cont_msg, out.getvalue())
-        self.assertIn(exp_obj_msg, out.getvalue())
+        self.assertNotIn('Account', out.getvalue())
+        self.assertNotIn('Container', out.getvalue())
+        self.assertNotIn('Object', out.getvalue())
 
     def test_print_item_locations_dashed_ring_name_partition(self):
         out = StringIO()
@@ -384,13 +587,10 @@ Shard Ranges (3):
                                  ring_name='foo-bar', partition=part,
                                  swift_dir=self.testdir)
         exp_part_msg = 'Partition\t%s' % part
-        exp_acct_msg = 'Account  \tNone'
-        exp_cont_msg = 'Container\tNone'
-        exp_obj_msg = 'Object   \tNone'
         self.assertIn(exp_part_msg, out.getvalue())
-        self.assertIn(exp_acct_msg, out.getvalue())
-        self.assertIn(exp_cont_msg, out.getvalue())
-        self.assertIn(exp_obj_msg, out.getvalue())
+        self.assertNotIn('Account', out.getvalue())
+        self.assertNotIn('Container', out.getvalue())
+        self.assertNotIn('Object', out.getvalue())
 
     def test_print_item_locations_account_with_ring(self):
         out = StringIO()
@@ -404,11 +604,9 @@ Shard Ranges (3):
                       'but ring not named "account"'
         self.assertIn(exp_warning, out.getvalue())
         exp_acct_msg = 'Account  \t%s' % account
-        exp_cont_msg = 'Container\tNone'
-        exp_obj_msg = 'Object   \tNone'
         self.assertIn(exp_acct_msg, out.getvalue())
-        self.assertIn(exp_cont_msg, out.getvalue())
-        self.assertIn(exp_obj_msg, out.getvalue())
+        self.assertNotIn('Container', out.getvalue())
+        self.assertNotIn('Object', out.getvalue())
 
     def test_print_item_locations_account_no_ring(self):
         out = StringIO()
@@ -417,11 +615,9 @@ Shard Ranges (3):
             print_item_locations(None, account=account,
                                  swift_dir=self.testdir)
         exp_acct_msg = 'Account  \t%s' % account
-        exp_cont_msg = 'Container\tNone'
-        exp_obj_msg = 'Object   \tNone'
         self.assertIn(exp_acct_msg, out.getvalue())
-        self.assertIn(exp_cont_msg, out.getvalue())
-        self.assertIn(exp_obj_msg, out.getvalue())
+        self.assertNotIn('Container', out.getvalue())
+        self.assertNotIn('Object', out.getvalue())
 
     def test_print_item_locations_account_container_ring(self):
         out = StringIO()
@@ -433,10 +629,9 @@ Shard Ranges (3):
                                  container=container)
         exp_acct_msg = 'Account  \t%s' % account
         exp_cont_msg = 'Container\t%s' % container
-        exp_obj_msg = 'Object   \tNone'
         self.assertIn(exp_acct_msg, out.getvalue())
         self.assertIn(exp_cont_msg, out.getvalue())
-        self.assertIn(exp_obj_msg, out.getvalue())
+        self.assertNotIn('Object', out.getvalue())
 
     def test_print_item_locations_account_container_no_ring(self):
         out = StringIO()
@@ -447,10 +642,9 @@ Shard Ranges (3):
                                  container=container, swift_dir=self.testdir)
         exp_acct_msg = 'Account  \t%s' % account
         exp_cont_msg = 'Container\t%s' % container
-        exp_obj_msg = 'Object   \tNone'
         self.assertIn(exp_acct_msg, out.getvalue())
         self.assertIn(exp_cont_msg, out.getvalue())
-        self.assertIn(exp_obj_msg, out.getvalue())
+        self.assertNotIn('Object', out.getvalue())
 
     def test_print_item_locations_account_container_object_ring(self):
         out = StringIO()
@@ -562,59 +756,59 @@ Shard Ranges (3):
     def test_parse_get_node_args(self):
         # Capture error messages
         # (without any parameters)
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = ''
         self.assertRaisesMessage(InfoSystemExit,
                                  'Need to specify policy_name or <ring.gz>',
                                  parse_get_node_args, options, args.split())
         # a
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = 'a'
         self.assertRaisesMessage(InfoSystemExit,
                                  'Need to specify policy_name or <ring.gz>',
                                  parse_get_node_args, options, args.split())
         # a c
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = 'a c'
         self.assertRaisesMessage(InfoSystemExit,
                                  'Need to specify policy_name or <ring.gz>',
                                  parse_get_node_args, options, args.split())
         # a c o
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = 'a c o'
         self.assertRaisesMessage(InfoSystemExit,
                                  'Need to specify policy_name or <ring.gz>',
                                  parse_get_node_args, options, args.split())
 
         # a/c
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = 'a/c'
         self.assertRaisesMessage(InfoSystemExit,
                                  'Need to specify policy_name or <ring.gz>',
                                  parse_get_node_args, options, args.split())
         # a/c/o
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = 'a/c/o'
         self.assertRaisesMessage(InfoSystemExit,
                                  'Need to specify policy_name or <ring.gz>',
                                  parse_get_node_args, options, args.split())
 
         # account container junk/test.ring.gz
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = 'account container junk/test.ring.gz'
         self.assertRaisesMessage(InfoSystemExit,
                                  'Need to specify policy_name or <ring.gz>',
                                  parse_get_node_args, options, args.split())
 
         # account container object junk/test.ring.gz
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = 'account container object junk/test.ring.gz'
         self.assertRaisesMessage(InfoSystemExit,
                                  'Need to specify policy_name or <ring.gz>',
                                  parse_get_node_args, options, args.split())
 
         # object.ring.gz(without any arguments i.e. a c o)
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = 'object.ring.gz'
         self.assertRaisesMessage(InfoSystemExit,
                                  'Ring file does not exist',
@@ -622,55 +816,55 @@ Shard Ranges (3):
 
         # Valid policy
         # -P zero
-        options = Namespace(policy_name='zero', partition=None)
+        options = Namespace(policy_name='zero', partition=None, quoted=None)
         args = ''
         self.assertRaisesMessage(InfoSystemExit,
                                  'No target specified',
                                  parse_get_node_args, options, args.split())
         # -P one a/c/o
-        options = Namespace(policy_name='one', partition=None)
+        options = Namespace(policy_name='one', partition=None, quoted=None)
         args = 'a/c/o'
         ring_path, args = parse_get_node_args(options, args.split())
         self.assertIsNone(ring_path)
         self.assertEqual(args, ['a', 'c', 'o'])
         # -P one account container photos/cat.jpg
-        options = Namespace(policy_name='one', partition=None)
+        options = Namespace(policy_name='one', partition=None, quoted=None)
         args = 'account container photos/cat.jpg'
         ring_path, args = parse_get_node_args(options, args.split())
         self.assertIsNone(ring_path)
         self.assertEqual(args, ['account', 'container', 'photos/cat.jpg'])
         # -P one account/container/photos/cat.jpg
-        options = Namespace(policy_name='one', partition=None)
+        options = Namespace(policy_name='one', partition=None, quoted=None)
         args = 'account/container/photos/cat.jpg'
         ring_path, args = parse_get_node_args(options, args.split())
         self.assertIsNone(ring_path)
         self.assertEqual(args, ['account', 'container', 'photos/cat.jpg'])
         # -P one account/container/junk/test.ring.gz(object endswith 'ring.gz')
-        options = Namespace(policy_name='one', partition=None)
+        options = Namespace(policy_name='one', partition=None, quoted=None)
         args = 'account/container/junk/test.ring.gz'
         ring_path, args = parse_get_node_args(options, args.split())
         self.assertIsNone(ring_path)
         self.assertEqual(args, ['account', 'container', 'junk/test.ring.gz'])
         # -P two a c o hooya
-        options = Namespace(policy_name='two', partition=None)
+        options = Namespace(policy_name='two', partition=None, quoted=None)
         args = 'a c o hooya'
         self.assertRaisesMessage(InfoSystemExit,
                                  'Invalid arguments',
                                  parse_get_node_args, options, args.split())
         # -P zero -p 1
-        options = Namespace(policy_name='zero', partition='1')
+        options = Namespace(policy_name='zero', partition='1', quoted=None)
         args = ''
         ring_path, args = parse_get_node_args(options, args.split())
         self.assertIsNone(ring_path)
         self.assertFalse(args)
         # -P one -p 1 a/c/o
-        options = Namespace(policy_name='one', partition='1')
+        options = Namespace(policy_name='one', partition='1', quoted=None)
         args = 'a/c/o'
         ring_path, args = parse_get_node_args(options, args.split())
         self.assertIsNone(ring_path)
         self.assertEqual(args, ['a', 'c', 'o'])
         # -P two -p 1 a c o hooya
-        options = Namespace(policy_name='two', partition='1')
+        options = Namespace(policy_name='two', partition='1', quoted=None)
         args = 'a c o hooya'
         self.assertRaisesMessage(InfoSystemExit,
                                  'Invalid arguments',
@@ -724,7 +918,7 @@ Shard Ranges (3):
 
         # Mock tests
         # /etc/swift/object.ring.gz(without any arguments i.e. a c o)
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = '/etc/swift/object.ring.gz'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -734,7 +928,7 @@ Shard Ranges (3):
                 parse_get_node_args, options, args.split())
         # Similar ring_path and arguments
         # /etc/swift/object.ring.gz /etc/swift/object.ring.gz
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = '/etc/swift/object.ring.gz /etc/swift/object.ring.gz'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -742,7 +936,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, '/etc/swift/object.ring.gz')
         self.assertEqual(args, ['etc', 'swift', 'object.ring.gz'])
         # /etc/swift/object.ring.gz a/c/etc/swift/object.ring.gz
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = '/etc/swift/object.ring.gz a/c/etc/swift/object.ring.gz'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -751,7 +945,7 @@ Shard Ranges (3):
         self.assertEqual(args, ['a', 'c', 'etc/swift/object.ring.gz'])
         # Invalid path as mentioned in BUG#1539275
         # /etc/swift/object.tar.gz account container object
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = '/etc/swift/object.tar.gz account container object'
         self.assertRaisesMessage(
             InfoSystemExit,
@@ -759,7 +953,7 @@ Shard Ranges (3):
             parse_get_node_args, options, args.split())
 
         # object.ring.gz a/
-        options = Namespace(policy_name=None)
+        options = Namespace(policy_name=None, quoted=None)
         args = 'object.ring.gz a/'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -767,7 +961,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertEqual(args, ['a'])
         # object.ring.gz a/c
-        options = Namespace(policy_name=None)
+        options = Namespace(policy_name=None, quoted=None)
         args = 'object.ring.gz a/c'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -775,7 +969,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertEqual(args, ['a', 'c'])
         # object.ring.gz a/c/o
-        options = Namespace(policy_name=None)
+        options = Namespace(policy_name=None, quoted=None)
         args = 'object.ring.gz a/c/o'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -783,7 +977,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertEqual(args, ['a', 'c', 'o'])
         # object.ring.gz a/c/o/junk/test.ring.gz
-        options = Namespace(policy_name=None)
+        options = Namespace(policy_name=None, quoted=None)
         args = 'object.ring.gz a/c/o/junk/test.ring.gz'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -791,7 +985,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertEqual(args, ['a', 'c', 'o/junk/test.ring.gz'])
         # object.ring.gz a
-        options = Namespace(policy_name=None)
+        options = Namespace(policy_name=None, quoted=None)
         args = 'object.ring.gz a'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -799,7 +993,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertEqual(args, ['a'])
         # object.ring.gz a c
-        options = Namespace(policy_name=None)
+        options = Namespace(policy_name=None, quoted=None)
         args = 'object.ring.gz a c'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -807,7 +1001,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertEqual(args, ['a', 'c'])
         # object.ring.gz a c o
-        options = Namespace(policy_name=None)
+        options = Namespace(policy_name=None, quoted=None)
         args = 'object.ring.gz a c o'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -815,7 +1009,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertEqual(args, ['a', 'c', 'o'])
         # object.ring.gz a c o blah blah
-        options = Namespace(policy_name=None)
+        options = Namespace(policy_name=None, quoted=None)
         args = 'object.ring.gz a c o blah blah'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -824,7 +1018,7 @@ Shard Ranges (3):
                 'Invalid arguments',
                 parse_get_node_args, options, args.split())
         # object.ring.gz a/c/o/blah/blah
-        options = Namespace(policy_name=None)
+        options = Namespace(policy_name=None, quoted=None)
         args = 'object.ring.gz a/c/o/blah/blah'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -833,7 +1027,7 @@ Shard Ranges (3):
         self.assertEqual(args, ['a', 'c', 'o/blah/blah'])
 
         # object.ring.gz -p 1
-        options = Namespace(policy_name=None, partition='1')
+        options = Namespace(policy_name=None, partition='1', quoted=None)
         args = 'object.ring.gz'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -841,7 +1035,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertFalse(args)
         # object.ring.gz -p 1 a c o
-        options = Namespace(policy_name=None, partition='1')
+        options = Namespace(policy_name=None, partition='1', quoted=None)
         args = 'object.ring.gz a c o'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -849,7 +1043,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertEqual(args, ['a', 'c', 'o'])
         # object.ring.gz -p 1 a c o forth_arg
-        options = Namespace(policy_name=None, partition='1')
+        options = Namespace(policy_name=None, partition='1', quoted=None)
         args = 'object.ring.gz a c o forth_arg'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -858,7 +1052,7 @@ Shard Ranges (3):
                 'Invalid arguments',
                 parse_get_node_args, options, args.split())
         # object.ring.gz -p 1 a/c/o
-        options = Namespace(policy_name=None, partition='1')
+        options = Namespace(policy_name=None, partition='1', quoted=None)
         args = 'object.ring.gz a/c/o'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -866,7 +1060,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertEqual(args, ['a', 'c', 'o'])
         # object.ring.gz -p 1 a/c/junk/test.ring.gz
-        options = Namespace(policy_name=None, partition='1')
+        options = Namespace(policy_name=None, partition='1', quoted=None)
         args = 'object.ring.gz a/c/junk/test.ring.gz'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -874,7 +1068,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertEqual(args, ['a', 'c', 'junk/test.ring.gz'])
         # object.ring.gz -p 1 a/c/photos/cat.jpg
-        options = Namespace(policy_name=None, partition='1')
+        options = Namespace(policy_name=None, partition='1', quoted=None)
         args = 'object.ring.gz a/c/photos/cat.jpg'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -883,7 +1077,7 @@ Shard Ranges (3):
         self.assertEqual(args, ['a', 'c', 'photos/cat.jpg'])
 
         # --all object.ring.gz a
-        options = Namespace(all=True, policy_name=None)
+        options = Namespace(all=True, policy_name=None, quoted=None)
         args = 'object.ring.gz a'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -891,7 +1085,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertEqual(args, ['a'])
         # --all object.ring.gz a c
-        options = Namespace(all=True, policy_name=None)
+        options = Namespace(all=True, policy_name=None, quoted=None)
         args = 'object.ring.gz a c'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -899,7 +1093,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertEqual(args, ['a', 'c'])
         # --all object.ring.gz a c o
-        options = Namespace(all=True, policy_name=None)
+        options = Namespace(all=True, policy_name=None, quoted=None)
         args = 'object.ring.gz a c o'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -907,7 +1101,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertEqual(args, ['a', 'c', 'o'])
         # object.ring.gz account container photos/cat.jpg
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = 'object.ring.gz account container photos/cat.jpg'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -915,7 +1109,7 @@ Shard Ranges (3):
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertEqual(args, ['account', 'container', 'photos/cat.jpg'])
         # object.ring.gz /account/container/photos/cat.jpg
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = 'object.ring.gz account/container/photos/cat.jpg'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
@@ -924,13 +1118,39 @@ Shard Ranges (3):
         self.assertEqual(args, ['account', 'container', 'photos/cat.jpg'])
         # Object name ends with 'ring.gz'
         # object.ring.gz /account/container/junk/test.ring.gz
-        options = Namespace(policy_name=None, partition=None)
+        options = Namespace(policy_name=None, partition=None, quoted=None)
         args = 'object.ring.gz account/container/junk/test.ring.gz'
         with mock.patch('swift.cli.info.os.path.exists') as exists:
             exists.return_value = True
             ring_path, args = parse_get_node_args(options, args.split())
         self.assertEqual(ring_path, 'object.ring.gz')
         self.assertEqual(args, ['account', 'container', 'junk/test.ring.gz'])
+
+        # Object name has special characters
+        # object.ring.gz /account/container/obj\nwith%0anewline
+        options = Namespace(policy_name=None, partition=None, quoted=None)
+        args = ['object.ring.gz', 'account/container/obj\nwith%0anewline']
+        with mock.patch('swift.cli.info.os.path.exists') as exists:
+            exists.return_value = True
+            ring_path, args = parse_get_node_args(options, args)
+        self.assertEqual(ring_path, 'object.ring.gz')
+        self.assertEqual(args, ['account', 'container', 'obj\nwith%0anewline'])
+
+        options = Namespace(policy_name=None, partition=None, quoted=True)
+        args = ['object.ring.gz', 'account/container/obj\nwith%0anewline']
+        with mock.patch('swift.cli.info.os.path.exists') as exists:
+            exists.return_value = True
+            ring_path, args = parse_get_node_args(options, args)
+        self.assertEqual(ring_path, 'object.ring.gz')
+        self.assertEqual(args, ['account', 'container', 'obj\nwith\nnewline'])
+
+        options = Namespace(policy_name=None, partition=None, quoted=False)
+        args = ['object.ring.gz', 'account/container/obj\nwith%0anewline']
+        with mock.patch('swift.cli.info.os.path.exists') as exists:
+            exists.return_value = True
+            ring_path, args = parse_get_node_args(options, args)
+        self.assertEqual(ring_path, 'object.ring.gz')
+        self.assertEqual(args, ['account', 'container', 'obj\nwith%0anewline'])
 
 
 class TestPrintObj(TestCliInfoBase):
@@ -1059,7 +1279,7 @@ class TestPrintObjFullMeta(TestCliInfoBase):
         exp_curl = (
             'curl -g -I -XHEAD '
             '"http://{host}:{port}/{device}/{part}/AUTH_admin/c/obj" '
-            '-H "X-Backend-Storage-Policy-Index: 2"').format(
+            '-H "X-Backend-Storage-Policy-Index: 2" --path-as-is').format(
                 host=node['ip'],
                 port=node['port'],
                 device=node['device'],
@@ -1100,7 +1320,8 @@ class TestPrintObjFullMeta(TestCliInfoBase):
         exp_curl = (
             'curl -g -I -XHEAD '
             '"http://[{host}]:{port}'
-            '/{device}/{part}/AUTH_admin/c/obj" ').format(
+            '/{device}/{part}/AUTH_admin/c/obj" '
+            '-H "X-Backend-Storage-Policy-Index: 3" --path-as-is').format(
                 host=node['ip'],
                 port=node['port'],
                 device=node['device'],
@@ -1403,6 +1624,69 @@ Other Metadata:
             utils.Timestamp(106.3).internal)
 
         self.assertEqual(out.getvalue().strip(), exp_out)
+
+    def test_print_obj_crypto_metadata(self):
+        cryto_body_meta = '%7B%22body_key%22%3A+%7B%22iv%22%3A+%22HmpwLDjlo' \
+            '6JxFvOOCVyT6Q%3D%3D%22%2C+%22key%22%3A+%22dEox1dyZJPCs4mtmiQDg' \
+            'u%2Fv1RTointi%2FUhm2y%2BgB3F8%3D%22%7D%2C+%22cipher%22%3A+%22A' \
+            'ES_CTR_256%22%2C+%22iv%22%3A+%22l3W0NZekjt4PFkAJXubVYQ%3D%3D%2' \
+            '2%2C+%22key_id%22%3A+%7B%22path%22%3A+%22%2FAUTH_test%2Ftest%2' \
+            'Ftest%22%2C+%22secret_id%22%3A+%222018%22%2C+%22v%22%3A+%221%2' \
+            '2%7D%7D'
+
+        crypto_meta_meta = '%7B%22cipher%22%3A+%22AES_CTR_256%22%2C+%22key_' \
+            'id%22%3A+%7B%22path%22%3A+%22%2FAUTH_test%2Ftest%2Ftest%22%2C+' \
+            '%22secret_id%22%3A+%222018%22%2C+%22v%22%3A+%221%22%7D%7D'
+
+        stub_metadata = {
+            'name': '/AUTH_test/test/test',
+            'Content-Type': 'application/sekret',
+            'X-Timestamp': '1549899598.237075',
+            'X-Object-Sysmeta-Crypto-Body-Meta': cryto_body_meta,
+            'X-Object-Transient-Sysmeta-Crypto-Meta': crypto_meta_meta,
+        }
+        out = StringIO()
+        with mock.patch('sys.stdout', out):
+            print_obj_metadata(stub_metadata)
+        exp_out = '''Path: /AUTH_test/test/test
+  Account: AUTH_test
+  Container: test
+  Object: test
+  Object hash: dc3a7d53522b9392b0d19571a752fdfb
+Content-Type: application/sekret
+Timestamp: 2019-02-11T15:39:58.237080 (1549899598.23708)
+System Metadata:
+  X-Object-Sysmeta-Crypto-Body-Meta: %s
+Transient System Metadata:
+  X-Object-Transient-Sysmeta-Crypto-Meta: %s
+User Metadata:
+  No metadata found
+Other Metadata:
+  No metadata found
+Data crypto details: {
+  "body_key": {
+    "iv": "HmpwLDjlo6JxFvOOCVyT6Q==",
+    "key": "dEox1dyZJPCs4mtmiQDgu/v1RTointi/Uhm2y+gB3F8="
+  },
+  "cipher": "AES_CTR_256",
+  "iv": "l3W0NZekjt4PFkAJXubVYQ==",
+  "key_id": {
+    "path": "/AUTH_test/test/test",
+    "secret_id": "2018",
+    "v": "1"
+  }
+}
+Metadata crypto details: {
+  "cipher": "AES_CTR_256",
+  "key_id": {
+    "path": "/AUTH_test/test/test",
+    "secret_id": "2018",
+    "v": "1"
+  }
+}''' % (cryto_body_meta, crypto_meta_meta)
+
+        self.maxDiff = None
+        self.assertMultiLineEqual(out.getvalue().strip(), exp_out)
 
 
 class TestPrintObjWeirdPath(TestPrintObjFullMeta):

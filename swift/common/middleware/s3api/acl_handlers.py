@@ -49,11 +49,9 @@ Example::
   the end of method.
 
 """
-import sys
-
 from swift.common.middleware.s3api.subresource import ACL, Owner, encode_acl
 from swift.common.middleware.s3api.s3response import MissingSecurityHeader, \
-    MalformedACLError, UnexpectedContent
+    MalformedACLError, UnexpectedContent, AccessDenied
 from swift.common.middleware.s3api.etree import fromstring, XMLSyntaxError, \
     DocumentInvalid
 from swift.common.middleware.s3api.utils import MULTIUPLOAD_SUFFIX, \
@@ -130,9 +128,14 @@ class BaseAclHandler(object):
             raise Exception('No permission to be checked exists')
 
         if resource == 'object':
+            version_id = self.req.params.get('versionId')
+            if version_id is None:
+                query = {}
+            else:
+                query = {'version-id': version_id}
             resp = self.req.get_acl_response(app, 'HEAD',
                                              container, obj,
-                                             headers)
+                                             headers, query=query)
             acl = resp.object_acl
         elif resource == 'container':
             resp = self.req.get_acl_response(app, 'HEAD',
@@ -164,13 +167,12 @@ class BaseAclHandler(object):
             try:
                 elem = fromstring(body, ACL.root_tag)
                 acl = ACL.from_elem(
-                    elem, True, self.req.allow_no_owner)
+                    elem, True, self.req.conf.allow_no_owner)
             except(XMLSyntaxError, DocumentInvalid):
                 raise MalformedACLError()
             except Exception as e:
-                exc_type, exc_value, exc_traceback = sys.exc_info()
                 self.logger.error(e)
-                raise exc_type, exc_value, exc_traceback
+                raise
         else:
             if body:
                 # Specifying grant with both header and xml is not allowed.
@@ -209,10 +211,13 @@ class BucketAclHandler(BaseAclHandler):
         req_acl = ACL.from_headers(self.req.headers,
                                    Owner(self.user_id, self.user_id))
 
+        if not self.req.environ.get('swift_owner'):
+            raise AccessDenied()
+
         # To avoid overwriting the existing bucket's ACL, we send PUT
         # request first before setting the ACL to make sure that the target
         # container does not exist.
-        self.req.get_acl_response(app, 'PUT')
+        self.req.get_acl_response(app, 'PUT', self.container)
 
         # update metadata
         self.req.bucket_acl = req_acl
@@ -243,6 +248,9 @@ class S3AclHandler(BaseAclHandler):
     """
     S3AclHandler: Handler for S3AclController
     """
+    def HEAD(self, app):
+        self._handle_acl(app, 'HEAD', permission='READ_ACP')
+
     def GET(self, app):
         self._handle_acl(app, 'HEAD', permission='READ_ACP')
 
@@ -459,5 +467,10 @@ ACL_MAP = {
     # Complete Multipart Upload, DELETE Multiple Objects,
     # Initiate Multipart Upload
     ('POST', 'HEAD', 'container'):
+    {'Permission': 'WRITE'},
+    # Versioning
+    ('PUT', 'POST', 'container'):
+    {'Permission': 'WRITE'},
+    ('DELETE', 'GET', 'container'):
     {'Permission': 'WRITE'},
 }

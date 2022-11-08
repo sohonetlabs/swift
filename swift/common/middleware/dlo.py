@@ -121,17 +121,18 @@ Here's an example using ``curl`` with tiny 1-byte segments::
 import json
 
 import six
-from six.moves.urllib.parse import unquote
 
-from hashlib import md5
 from swift.common import constraints
 from swift.common.exceptions import ListingIterError, SegmentError
 from swift.common.http import is_success
-from swift.common.swob import Request, Response, \
-    HTTPRequestedRangeNotSatisfiable, HTTPBadRequest, HTTPConflict
+from swift.common.swob import Request, Response, HTTPException, \
+    HTTPRequestedRangeNotSatisfiable, HTTPBadRequest, HTTPConflict, \
+    str_to_wsgi, wsgi_to_str, wsgi_quote, wsgi_unquote, normalize_etag
 from swift.common.utils import get_logger, \
-    RateLimitedIterator, quote, close_if_possible, closing_if_possible
-from swift.common.request_helpers import SegmentedIterable
+    RateLimitedIterator, quote, close_if_possible, closing_if_possible, \
+    drain_and_close, md5
+from swift.common.request_helpers import SegmentedIterable, \
+    update_ignore_range_header
 from swift.common.wsgi import WSGIContext, make_subrequest, load_app_config
 
 
@@ -143,8 +144,18 @@ class GetContext(WSGIContext):
 
     def _get_container_listing(self, req, version, account, container,
                                prefix, marker=''):
+        '''
+        :param version: whatever
+        :param account: native
+        :param container: native
+        :param prefix: native
+        :param marker: native
+        '''
         con_req = make_subrequest(
-            req.environ, path='/'.join(['', version, account, container]),
+            req.environ,
+            path=wsgi_quote('/'.join([
+                '', str_to_wsgi(version),
+                str_to_wsgi(account), str_to_wsgi(container)])),
             method='GET',
             headers={'x-auth-token': req.headers.get('x-auth-token')},
             agent=('%(orig)s ' + 'DLO MultipartGET'), swift_source='DLO')
@@ -155,14 +166,24 @@ class GetContext(WSGIContext):
         con_resp = con_req.get_response(self.dlo.app)
         if not is_success(con_resp.status_int):
             if req.method == 'HEAD':
-                con_resp.body = ''
+                con_resp.body = b''
             return con_resp, None
         with closing_if_possible(con_resp.app_iter):
-            return None, json.loads(''.join(con_resp.app_iter))
+            return None, json.loads(b''.join(con_resp.app_iter))
 
     def _segment_listing_iterator(self, req, version, account, container,
                                   prefix, segments, first_byte=None,
                                   last_byte=None):
+        '''
+        :param req: upstream request
+        :param version: native
+        :param account: native
+        :param container: native
+        :param prefix: native
+        :param segments: array of dicts, with native strings
+        :param first_byte: number
+        :param last_byte: number
+        '''
         # It's sort of hokey that this thing takes in the first page of
         # segments as an argument, but we need to compute the etag and content
         # length from the first page, and it's better to have a hokey
@@ -172,7 +193,6 @@ class GetContext(WSGIContext):
         if last_byte is None:
             last_byte = float("inf")
 
-        marker = ''
         while True:
             for segment in segments:
                 seg_length = int(segment['bytes'])
@@ -187,7 +207,7 @@ class GetContext(WSGIContext):
                     break
 
                 seg_name = segment['name']
-                if isinstance(seg_name, six.text_type):
+                if six.PY2:
                     seg_name = seg_name.encode("utf-8")
 
                 # We deliberately omit the etag and size here;
@@ -226,16 +246,18 @@ class GetContext(WSGIContext):
                     "Got status %d listing container /%s/%s" %
                     (error_response.status_int, account, container))
 
-    def get_or_head_response(self, req, x_object_manifest,
-                             response_headers=None):
-        if response_headers is None:
-            response_headers = self._response_headers
+    def get_or_head_response(self, req, x_object_manifest):
+        '''
+        :param req: user's request
+        :param x_object_manifest: as unquoted, native string
+        '''
+        response_headers = self._response_headers
 
         container, obj_prefix = x_object_manifest.split('/', 1)
-        container = unquote(container)
-        obj_prefix = unquote(obj_prefix)
 
         version, account, _junk = req.split_path(2, 3, True)
+        version = wsgi_to_str(version)
+        account = wsgi_to_str(account)
         error_response, segments = self._get_container_listing(
             req, version, account, container, obj_prefix)
         if error_response:
@@ -283,6 +305,8 @@ class GetContext(WSGIContext):
                 actual_content_length = None
                 content_length_for_swob_range = None
                 req.range = None
+        else:
+            req.range = None
 
         response_headers = [
             (h, v) for h, v in response_headers
@@ -308,9 +332,9 @@ class GetContext(WSGIContext):
         if have_complete_listing:
             response_headers = [(h, v) for h, v in response_headers
                                 if h.lower() != "etag"]
-            etag = md5()
+            etag = md5(usedforsecurity=False)
             for seg_dict in segments:
-                etag.update(seg_dict['hash'].strip('"'))
+                etag.update(normalize_etag(seg_dict['hash']).encode('utf8'))
             response_headers.append(('Etag', '"%s"' % etag.hexdigest()))
 
         app_iter = None
@@ -330,6 +354,8 @@ class GetContext(WSGIContext):
 
             try:
                 app_iter.validate_first_segment()
+            except HTTPException as err_resp:
+                return err_resp
             except (SegmentError, ListingIterError):
                 return HTTPConflict(request=req)
 
@@ -346,13 +372,19 @@ class GetContext(WSGIContext):
 
         Otherwise, simply pass it through.
         """
+        update_ignore_range_header(req, 'X-Object-Manifest')
         resp_iter = self._app_call(req.environ)
 
         # make sure this response is for a dynamic large object manifest
         for header, value in self._response_headers:
             if (header.lower() == 'x-object-manifest'):
+                content_length = self._response_header_value('content-length')
+                if content_length is not None and int(content_length) < 1024:
+                    # Go ahead and consume small bodies
+                    drain_and_close(resp_iter)
                 close_if_possible(resp_iter)
-                response = self.get_or_head_response(req, value)
+                response = self.get_or_head_response(
+                    req, wsgi_to_str(wsgi_unquote(value)))
                 return response(req.environ, start_response)
         # Not a dynamic large object manifest; just pass it through.
         start_response(self._response_status,
@@ -398,7 +430,10 @@ class DynamicLargeObject(object):
         req = Request(env)
         try:
             vrs, account, container, obj = req.split_path(4, 4, True)
+            is_obj_req = True
         except ValueError:
+            is_obj_req = False
+        if not is_obj_req:
             return self.app(env, start_response)
 
         if ((req.method == 'GET' or req.method == 'HEAD') and

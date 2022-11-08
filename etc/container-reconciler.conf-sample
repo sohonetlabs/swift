@@ -1,6 +1,7 @@
 [DEFAULT]
 # swift_dir = /etc/swift
 # user = swift
+# ring_check_interval = 15.0
 # You can specify default log routing here if you want:
 # log_name = swift
 # log_facility = LOG_LOCAL0
@@ -41,7 +42,7 @@
 # in the queue.
 # reclaim_age = 604800
 # The cycle time of the daemon
-# interval = 30
+# interval = 30.0
 # Server errors from requests will be retried by default
 # request_tries = 3
 #
@@ -56,8 +57,26 @@
 # Work only with ionice_class.
 # ionice_class =
 # ionice_priority =
+# Number of objects to process concurrently per process
+# concurrency = 1
+
+# processes is how many parts to divide the work into, one part per process
+# that will be doing the work
+# processes set 0 means that a single process will be doing all the work
+# processes = 0
+#
+# process is which of the parts a particular process will work on
+# process is "zero based", if you want to use 3 processes, you should run
+# processes with process set to 0, 1, and 2
+# process = 0
 
 [pipeline:main]
+# Note that the reconciler's pipeline is intentionally very sparse -- it is
+# only responsible for moving data from one policy to another and should not
+# perform any transformations beyond (potentially) changing erasure coding.
+# It notably MUST NOT include transformative middlewares (such as encryption),
+# redirection middlewares (such as symlink), or composing middlewares (such
+# as slo and dlo).
 pipeline = catch_errors proxy-logging cache proxy-server
 
 [app:proxy-server]

@@ -13,24 +13,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import base64
 import unittest
 from mock import patch, MagicMock
+import calendar
 from datetime import datetime
-import hashlib
 import mock
 import requests
 import json
-import copy
-from urllib import unquote, quote
+import six
+from paste.deploy import loadwsgi
+from six.moves.urllib.parse import unquote, quote
 
 import swift.common.middleware.s3api
+from swift.common.middleware.s3api.utils import Config
 from swift.common.middleware.keystoneauth import KeystoneAuth
-from swift.common import swob, utils
+from swift.common import swob, registry
 from swift.common.swob import Request
+from swift.common.utils import md5
 
 from keystonemiddleware.auth_token import AuthProtocol
 from keystoneauth1.access import AccessInfoV2
 
+from test.debug_logger import debug_logger
 from test.unit.common.middleware.s3api import S3ApiTestCase
 from test.unit.common.middleware.s3api.helpers import FakeSwift
 from test.unit.common.middleware.s3api.test_s3token import \
@@ -42,16 +47,175 @@ from swift.common.middleware.s3api.s3api import filter_factory, \
 from swift.common.middleware.s3api.s3token import S3Token
 
 
+class TestListingMiddleware(S3ApiTestCase):
+    def test_s3_etag_in_json(self):
+        # This translation happens all the time, even on normal swift requests
+        body_data = json.dumps([
+            {'name': 'obj1', 'hash': '0123456789abcdef0123456789abcdef'},
+            {'name': 'obj2', 'hash': 'swiftetag; s3_etag=mu-etag'},
+            {'name': 'obj2', 'hash': 'swiftetag; something=else'},
+            {'subdir': 'path/'},
+        ]).encode('ascii')
+        self.swift.register(
+            'GET', '/v1/a/c', swob.HTTPOk,
+            {'Content-Type': 'application/json; charset=UTF-8'},
+            body_data)
+
+        req = Request.blank('/v1/a/c')
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(json.loads(body), [
+            {'name': 'obj1', 'hash': '0123456789abcdef0123456789abcdef'},
+            {'name': 'obj2', 'hash': 'swiftetag', 's3_etag': '"mu-etag"'},
+            {'name': 'obj2', 'hash': 'swiftetag; something=else'},
+            {'subdir': 'path/'},
+        ])
+
+    def test_s3_etag_non_json(self):
+        self.swift.register(
+            'GET', '/v1/a/c', swob.HTTPOk,
+            {'Content-Type': 'application/json; charset=UTF-8'},
+            b'Not actually JSON')
+        req = Request.blank('/v1/a/c')
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(body, b'Not actually JSON')
+
+        # Yes JSON, but wrong content-type
+        body_data = json.dumps([
+            {'name': 'obj1', 'hash': '0123456789abcdef0123456789abcdef'},
+            {'name': 'obj2', 'hash': 'swiftetag; s3_etag=mu-etag'},
+            {'name': 'obj2', 'hash': 'swiftetag; something=else'},
+            {'subdir': 'path/'},
+        ]).encode('ascii')
+        self.swift.register(
+            'GET', '/v1/a/c', swob.HTTPOk,
+            {'Content-Type': 'text/plain; charset=UTF-8'},
+            body_data)
+        req = Request.blank('/v1/a/c')
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(body, body_data)
+
+
 class TestS3ApiMiddleware(S3ApiTestCase):
     def setUp(self):
         super(TestS3ApiMiddleware, self).setUp()
 
         self.swift.register('GET', '/something', swob.HTTPOk, {}, 'FAKE APP')
 
+    def test_init_config(self):
+        # verify config loading
+        # note: test confs do not have __file__ attribute so check_pipeline
+        # will be short-circuited
+
+        # check all defaults
+        expected = dict(Config())
+        expected.update({
+            'auth_pipeline_check': True,
+            'check_bucket_owner': False,
+            'max_bucket_listing': 1000,
+            'max_multi_delete_objects': 1000,
+            'max_parts_listing': 1000,
+            'max_upload_part_num': 1000,
+            'min_segment_size': 5242880,
+            'multi_delete_concurrency': 2,
+            's3_acl': False,
+            'cors_preflight_allow_origin': [],
+            'ratelimit_as_client_error': False,
+        })
+        s3api = S3ApiMiddleware(None, {})
+        self.assertEqual(expected, s3api.conf)
+
+        # check all non-defaults are loaded
+        conf = {
+            'storage_domain': 'somewhere,some.other.where',
+            'location': 'us-west-1',
+            'force_swift_request_proxy_log': True,
+            'dns_compliant_bucket_names': False,
+            'allow_multipart_uploads': False,
+            'allow_no_owner': True,
+            'allowable_clock_skew': 300,
+            'auth_pipeline_check': False,
+            'check_bucket_owner': True,
+            'max_bucket_listing': 500,
+            'max_multi_delete_objects': 600,
+            'max_parts_listing': 70,
+            'max_upload_part_num': 800,
+            'min_segment_size': 1000000,
+            'multi_delete_concurrency': 1,
+            's3_acl': True,
+            'cors_preflight_allow_origin': 'foo.example.com,bar.example.com',
+            'ratelimit_as_client_error': True,
+        }
+        s3api = S3ApiMiddleware(None, conf)
+        conf['cors_preflight_allow_origin'] = \
+            conf['cors_preflight_allow_origin'].split(',')
+        conf['storage_domains'] = conf.pop('storage_domain').split(',')
+        self.assertEqual(conf, s3api.conf)
+
+        # test allow_origin list with a '*' fails.
+        conf = {
+            'storage_domain': 'somewhere',
+            'location': 'us-west-1',
+            'force_swift_request_proxy_log': True,
+            'dns_compliant_bucket_names': False,
+            'allow_multipart_uploads': False,
+            'allow_no_owner': True,
+            'allowable_clock_skew': 300,
+            'auth_pipeline_check': False,
+            'check_bucket_owner': True,
+            'max_bucket_listing': 500,
+            'max_multi_delete_objects': 600,
+            'max_parts_listing': 70,
+            'max_upload_part_num': 800,
+            'min_segment_size': 1000000,
+            'multi_delete_concurrency': 1,
+            's3_acl': True,
+            'cors_preflight_allow_origin': 'foo.example.com,bar.example.com,*',
+        }
+        with self.assertRaises(ValueError) as ex:
+            S3ApiMiddleware(None, conf)
+        self.assertIn("if cors_preflight_allow_origin should include all "
+                      "domains, * must be the only entry", str(ex.exception))
+
+        def check_bad_positive_ints(**kwargs):
+            bad_conf = dict(conf, **kwargs)
+            self.assertRaises(ValueError, S3ApiMiddleware, None, bad_conf)
+
+        check_bad_positive_ints(allowable_clock_skew=-100)
+        check_bad_positive_ints(allowable_clock_skew=0)
+        check_bad_positive_ints(max_bucket_listing=-100)
+        check_bad_positive_ints(max_bucket_listing=0)
+        check_bad_positive_ints(max_multi_delete_objects=-100)
+        check_bad_positive_ints(max_multi_delete_objects=0)
+        check_bad_positive_ints(max_parts_listing=-100)
+        check_bad_positive_ints(max_parts_listing=0)
+        check_bad_positive_ints(max_upload_part_num=-100)
+        check_bad_positive_ints(max_upload_part_num=0)
+        check_bad_positive_ints(min_segment_size=-100)
+        check_bad_positive_ints(min_segment_size=0)
+        check_bad_positive_ints(multi_delete_concurrency=-100)
+        check_bad_positive_ints(multi_delete_concurrency=0)
+
+    def test_init_passes_wsgi_conf_file_to_check_pipeline(self):
+        # verify that check_pipeline is called during init: add __file__ attr
+        # to test config to make it more representative of middleware being
+        # init'd by wgsi
+        context = mock.Mock()
+        with patch("swift.common.middleware.s3api.s3api.loadcontext",
+                   return_value=context) as loader, \
+                patch("swift.common.middleware.s3api.s3api.PipelineWrapper") \
+                as pipeline:
+            conf = dict(self.conf,
+                        auth_pipeline_check=True,
+                        __file__='proxy-conf-file')
+            pipeline.return_value = 's3api tempauth proxy-server'
+            self.s3api = S3ApiMiddleware(None, conf)
+            loader.assert_called_with(loadwsgi.APP, 'proxy-conf-file')
+            pipeline.assert_called_with(context)
+
     def test_non_s3_request_passthrough(self):
         req = Request.blank('/something')
         status, headers, body = self.call_s3api(req)
-        self.assertEqual(body, 'FAKE APP')
+        self.assertEqual(body, b'FAKE APP')
 
     def test_bad_format_authorization(self):
         req = Request.blank('/something',
@@ -91,6 +255,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         path_info = req.environ['PATH_INFO']
         self.assertEqual(path_info, unquote(raw_path_info))
         self.assertEqual(req.path, quote(path_info))
+        self.assertIn('swift.backend_path', req.environ)
+        self.assertEqual('/v1/AUTH_test/bucket/object:1',
+                         req.environ['swift.backend_path'])
 
     def test_canonical_string_v2(self):
         """
@@ -115,13 +282,15 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                 env[header] = value
 
             with patch('swift.common.middleware.s3api.s3request.'
-                       'S3Request._validate_headers'):
+                       'S3Request._validate_headers'), \
+                    patch('swift.common.middleware.s3api.s3request.'
+                          'S3Request._validate_dates'):
                 req = S3Request(env)
             return req.environ['s3api.auth_details']['string_to_sign']
 
         def verify(hash, path, headers):
             s = canonical_string(path, headers)
-            self.assertEqual(hash, hashlib.md5(s).hexdigest())
+            self.assertEqual(hash, md5(s, usedforsecurity=False).hexdigest())
 
         verify('6dd08c75e42190a1ce9468d1fd2eb787', '/bucket/object',
                {'Content-Type': 'text/plain', 'X-Amz-Something': 'test',
@@ -216,8 +385,11 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '200')
-        for _, _, headers in self.swift.calls_with_headers:
-            self.assertEqual(headers['Authorization'], 'AWS test:tester:X')
+        self.assertIn('swift.backend_path', req.environ)
+        self.assertEqual('/v1/AUTH_test/bucket/object',
+                         req.environ['swift.backend_path'])
+        for _, path, headers in self.swift.calls_with_headers:
+            self.assertNotIn('Authorization', headers)
 
     def test_signed_urls_no_timestamp(self):
         expire = '2147483647'  # 19 Jan 2038 03:14:07
@@ -229,8 +401,11 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         # Curious! But actually S3 doesn't verify any x-amz-date/date headers
         # for signed_url access and it also doesn't check timestamp
         self.assertEqual(status.split()[0], '200')
+        self.assertIn('swift.backend_path', req.environ)
+        self.assertEqual('/v1/AUTH_test/bucket/object',
+                         req.environ['swift.backend_path'])
         for _, _, headers in self.swift.calls_with_headers:
-            self.assertEqual(headers['Authorization'], 'AWS test:tester:X')
+            self.assertNotIn('Authorization', headers)
 
     def test_signed_urls_invalid_expire(self):
         expire = 'invalid'
@@ -268,56 +443,100 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         req = Request.blank(
             '/bucket/object'
             '?X-Amz-Algorithm=AWS4-HMAC-SHA256'
-            '&X-Amz-Credential=test:tester/20T20Z/US/s3/aws4_request'
+            '&X-Amz-Credential=test:tester/%s/us-east-1/s3/aws4_request'
             '&X-Amz-Date=%s'
             '&X-Amz-Expires=1000'
             '&X-Amz-SignedHeaders=host'
-            '&X-Amz-Signature=X' %
-            self.get_v4_amz_date_header(),
+            '&X-Amz-Signature=X' % (
+                self.get_v4_amz_date_header().split('T', 1)[0],
+                self.get_v4_amz_date_header()),
             headers={'Date': self.get_date_header()},
             environ={'REQUEST_METHOD': 'GET'})
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
+        self.assertIn('swift.backend_path', req.environ)
+        self.assertEqual('/v1/AUTH_test/bucket/object',
+                         req.environ['swift.backend_path'])
         self.assertEqual(status.split()[0], '200', body)
         for _, _, headers in self.swift.calls_with_headers:
-            self.assertEqual('AWS test:tester:X', headers['Authorization'])
-            self.assertIn('X-Auth-Token', headers)
+            self.assertNotIn('Authorization', headers)
+            self.assertNotIn('X-Auth-Token', headers)
+
+    def test_signed_urls_v4_bad_credential(self):
+        def test(credential, message, extra=b''):
+            req = Request.blank(
+                '/bucket/object'
+                '?X-Amz-Algorithm=AWS4-HMAC-SHA256'
+                '&X-Amz-Credential=%s'
+                '&X-Amz-Date=%s'
+                '&X-Amz-Expires=1000'
+                '&X-Amz-SignedHeaders=host'
+                '&X-Amz-Signature=X' % (
+                    credential,
+                    self.get_v4_amz_date_header()),
+                headers={'Date': self.get_date_header()},
+                environ={'REQUEST_METHOD': 'GET'})
+            req.content_type = 'text/plain'
+            status, headers, body = self.call_s3api(req)
+            self.assertEqual(status.split()[0], '400', body)
+            self.assertEqual(self._get_error_code(body),
+                             'AuthorizationQueryParametersError')
+            self.assertEqual(self._get_error_message(body), message)
+            self.assertIn(extra, body)
+
+        dt = self.get_v4_amz_date_header().split('T', 1)[0]
+        test('test:tester/not-a-date/us-east-1/s3/aws4_request',
+             'Invalid credential date "not-a-date". This date is not the same '
+             'as X-Amz-Date: "%s".' % dt)
+        test('test:tester/%s/us-west-1/s3/aws4_request' % dt,
+             "Error parsing the X-Amz-Credential parameter; the region "
+             "'us-west-1' is wrong; expecting 'us-east-1'",
+             b'<Region>us-east-1</Region>')
+        test('test:tester/%s/us-east-1/not-s3/aws4_request' % dt,
+             'Error parsing the X-Amz-Credential parameter; incorrect service '
+             '"not-s3". This endpoint belongs to "s3".')
+        test('test:tester/%s/us-east-1/s3/not-aws4_request' % dt,
+             'Error parsing the X-Amz-Credential parameter; incorrect '
+             'terminal "not-aws4_request". This endpoint uses "aws4_request".')
 
     def test_signed_urls_v4_missing_x_amz_date(self):
-        req = Request.blank('/bucket/object'
-                            '?X-Amz-Algorithm=AWS4-HMAC-SHA256'
-                            '&X-Amz-Credential=test/20T20Z/US/s3/aws4_request'
-                            '&X-Amz-Expires=1000'
-                            '&X-Amz-SignedHeaders=host'
-                            '&X-Amz-Signature=X',
-                            environ={'REQUEST_METHOD': 'GET'})
+        req = Request.blank(
+            '/bucket/object'
+            '?X-Amz-Algorithm=AWS4-HMAC-SHA256'
+            '&X-Amz-Credential=test/20T20Z/us-east-1/s3/aws4_request'
+            '&X-Amz-Expires=1000'
+            '&X-Amz-SignedHeaders=host'
+            '&X-Amz-Signature=X',
+            environ={'REQUEST_METHOD': 'GET'})
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
 
     def test_signed_urls_v4_invalid_algorithm(self):
-        req = Request.blank('/bucket/object'
-                            '?X-Amz-Algorithm=FAKE'
-                            '&X-Amz-Credential=test/20T20Z/US/s3/aws4_request'
-                            '&X-Amz-Date=%s'
-                            '&X-Amz-Expires=1000'
-                            '&X-Amz-SignedHeaders=host'
-                            '&X-Amz-Signature=X' %
-                            self.get_v4_amz_date_header(),
-                            environ={'REQUEST_METHOD': 'GET'})
+        req = Request.blank(
+            '/bucket/object'
+            '?X-Amz-Algorithm=FAKE'
+            '&X-Amz-Credential=test/20T20Z/us-east-1/s3/aws4_request'
+            '&X-Amz-Date=%s'
+            '&X-Amz-Expires=1000'
+            '&X-Amz-SignedHeaders=host'
+            '&X-Amz-Signature=X' %
+            self.get_v4_amz_date_header(),
+            environ={'REQUEST_METHOD': 'GET'})
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'InvalidArgument')
 
     def test_signed_urls_v4_missing_signed_headers(self):
-        req = Request.blank('/bucket/object'
-                            '?X-Amz-Algorithm=AWS4-HMAC-SHA256'
-                            '&X-Amz-Credential=test/20T20Z/US/s3/aws4_request'
-                            '&X-Amz-Date=%s'
-                            '&X-Amz-Expires=1000'
-                            '&X-Amz-Signature=X' %
-                            self.get_v4_amz_date_header(),
-                            environ={'REQUEST_METHOD': 'GET'})
+        req = Request.blank(
+            '/bucket/object'
+            '?X-Amz-Algorithm=AWS4-HMAC-SHA256'
+            '&X-Amz-Credential=test/20T20Z/us-east-1/s3/aws4_request'
+            '&X-Amz-Date=%s'
+            '&X-Amz-Expires=1000'
+            '&X-Amz-Signature=X' %
+            self.get_v4_amz_date_header(),
+            environ={'REQUEST_METHOD': 'GET'})
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body),
@@ -338,14 +557,15 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
 
     def test_signed_urls_v4_missing_signature(self):
-        req = Request.blank('/bucket/object'
-                            '?X-Amz-Algorithm=AWS4-HMAC-SHA256'
-                            '&X-Amz-Credential=test/20T20Z/US/s3/aws4_request'
-                            '&X-Amz-Date=%s'
-                            '&X-Amz-Expires=1000'
-                            '&X-Amz-SignedHeaders=host' %
-                            self.get_v4_amz_date_header(),
-                            environ={'REQUEST_METHOD': 'GET'})
+        req = Request.blank(
+            '/bucket/object'
+            '?X-Amz-Algorithm=AWS4-HMAC-SHA256'
+            '&X-Amz-Credential=test/20T20Z/us-east-1/s3/aws4_request'
+            '&X-Amz-Date=%s'
+            '&X-Amz-Expires=1000'
+            '&X-Amz-SignedHeaders=host' %
+            self.get_v4_amz_date_header(),
+            environ={'REQUEST_METHOD': 'GET'})
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'AccessDenied')
@@ -359,6 +579,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                             headers={'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '200')
+        self.assertIn('swift.backend_path', req.environ)
+        self.assertEqual('/v1/AUTH_test/bucket',
+                         req.environ['swift.backend_path'])
 
     def test_object_virtual_hosted_style(self):
         req = Request.blank('/object',
@@ -369,6 +592,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                             headers={'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '200')
+        self.assertIn('swift.backend_path', req.environ)
+        self.assertEqual('/v1/AUTH_test/bucket/object',
+                         req.environ['swift.backend_path'])
 
     def test_token_generation(self):
         self.swift.register('HEAD', '/v1/AUTH_test/bucket+segments/'
@@ -386,13 +612,50 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         with mock.patch('swift.common.middleware.s3api.s3request.'
                         'S3Request.check_signature') as mock_cs:
             status, headers, body = self.call_s3api(req)
+            self.assertIn('swift.backend_path', req.environ)
+            self.assertEqual(
+                '/v1/AUTH_test/bucket+segments/object/123456789abcdef/1',
+                req.environ['swift.backend_path'])
+
         _, _, headers = self.swift.calls_with_headers[-1]
         self.assertEqual(req.environ['s3api.auth_details'], {
             'access_key': 'test:tester',
             'signature': 'hmac',
-            'string_to_sign': '\n'.join([
-                'PUT', '', '', date_header,
-                '/bucket/object?partNumber=1&uploadId=123456789abcdef']),
+            'string_to_sign': b'\n'.join([
+                b'PUT', b'', b'', date_header.encode('ascii'),
+                b'/bucket/object?partNumber=1&uploadId=123456789abcdef']),
+            'check_signature': mock_cs})
+
+    def test_non_ascii_user(self):
+        self.swift.register('HEAD', '/v1/AUTH_test/bucket+segments/'
+                                    'object/123456789abcdef',
+                            swob.HTTPOk, {}, None)
+        self.swift.register('PUT', '/v1/AUTH_test/bucket+segments/'
+                                   'object/123456789abcdef/1',
+                            swob.HTTPCreated, {}, None)
+        req = Request.blank('/bucket/object?uploadId=123456789abcdef'
+                            '&partNumber=1',
+                            environ={'REQUEST_METHOD': 'PUT'})
+        # NB: WSGI string for a snowman
+        req.headers['Authorization'] = 'AWS test:\xe2\x98\x83:sig'
+        date_header = self.get_date_header()
+        req.headers['Date'] = date_header
+        with mock.patch('swift.common.middleware.s3api.s3request.'
+                        'S3Request.check_signature') as mock_cs:
+            status, headers, body = self.call_s3api(req)
+            self.assertIn('swift.backend_path', req.environ)
+            self.assertEqual(
+                '/v1/AUTH_test/bucket+segments/object/123456789abcdef/1',
+                req.environ['swift.backend_path'])
+
+        _, _, headers = self.swift.calls_with_headers[-1]
+        self.assertEqual(req.environ['s3api.auth_details'], {
+            'access_key': (u'test:\N{SNOWMAN}'.encode('utf-8') if six.PY2
+                           else u'test:\N{SNOWMAN}'),
+            'signature': 'sig',
+            'string_to_sign': b'\n'.join([
+                b'PUT', b'', b'', date_header.encode('ascii'),
+                b'/bucket/object?partNumber=1&uploadId=123456789abcdef']),
             'check_signature': mock_cs})
 
     def test_invalid_uri(self):
@@ -413,8 +676,24 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'InvalidDigest')
 
     def test_object_create_bad_md5_too_short(self):
-        too_short_digest = hashlib.md5('hey').hexdigest()[:-1]
-        md5_str = too_short_digest.encode('base64').strip()
+        too_short_digest = md5(b'hey', usedforsecurity=False).digest()[:-1]
+        md5_str = base64.b64encode(too_short_digest).strip()
+        if not six.PY2:
+            md5_str = md5_str.decode('ascii')
+        req = Request.blank(
+            '/bucket/object',
+            environ={'REQUEST_METHOD': 'PUT',
+                     'HTTP_AUTHORIZATION': 'AWS X:Y:Z',
+                     'HTTP_CONTENT_MD5': md5_str},
+            headers={'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(self._get_error_code(body), 'InvalidDigest')
+
+    def test_object_create_bad_md5_bad_padding(self):
+        too_short_digest = md5(b'hey', usedforsecurity=False).digest()
+        md5_str = base64.b64encode(too_short_digest).strip(b'=\n')
+        if not six.PY2:
+            md5_str = md5_str.decode('ascii')
         req = Request.blank(
             '/bucket/object',
             environ={'REQUEST_METHOD': 'PUT',
@@ -425,8 +704,11 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(self._get_error_code(body), 'InvalidDigest')
 
     def test_object_create_bad_md5_too_long(self):
-        too_long_digest = hashlib.md5('hey').hexdigest() + 'suffix'
-        md5_str = too_long_digest.encode('base64').strip()
+        too_long_digest = md5(
+            b'hey', usedforsecurity=False).digest() + b'suffix'
+        md5_str = base64.b64encode(too_long_digest).strip()
+        if not six.PY2:
+            md5_str = md5_str.decode('ascii')
         req = Request.blank(
             '/bucket/object',
             environ={'REQUEST_METHOD': 'PUT',
@@ -455,23 +737,76 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'InvalidStorageClass')
 
-    def _test_unsupported_header(self, header):
+    def test_invalid_ssc(self):
+        req = Request.blank('/',
+                            environ={'REQUEST_METHOD': 'GET',
+                                     'HTTP_AUTHORIZATION': 'AWS X:Y:Z'},
+                            headers={'x-amz-server-side-encryption': 'invalid',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(self._get_error_code(body), 'InvalidArgument')
+
+    def _test_unsupported_header(self, header, value=None):
+        if value is None:
+            value = 'value'
         req = Request.blank('/error',
                             environ={'REQUEST_METHOD': 'GET',
                                      'HTTP_AUTHORIZATION': 'AWS X:Y:Z'},
-                            headers={'x-amz-' + header: 'value',
+                            headers={header: value,
                                      'Date': self.get_date_header()})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(self._get_error_code(body), 'NotImplemented')
 
     def test_mfa(self):
-        self._test_unsupported_header('mfa')
+        self._test_unsupported_header('x-amz-mfa')
 
+    @mock.patch.object(registry, '_swift_admin_info', dict())
     def test_server_side_encryption(self):
-        self._test_unsupported_header('server-side-encryption')
+        sse_header = 'x-amz-server-side-encryption'
+        self._test_unsupported_header(sse_header, 'AES256')
+        self._test_unsupported_header(sse_header, 'aws:kms')
+        registry.register_swift_info('encryption', admin=True, enabled=False)
+        self._test_unsupported_header(sse_header, 'AES256')
+        self._test_unsupported_header(sse_header, 'aws:kms')
+        registry.register_swift_info('encryption', admin=True, enabled=True)
+        # AES256 now works
+        self.swift.register('PUT', '/v1/AUTH_X/bucket/object',
+                            swob.HTTPCreated, {}, None)
+        req = Request.blank('/bucket/object',
+                            environ={'REQUEST_METHOD': 'PUT',
+                                     'HTTP_AUTHORIZATION': 'AWS X:Y:Z'},
+                            headers={sse_header: 'AES256',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status, '200 OK')
+        self.assertIn('swift.backend_path', req.environ)
+        self.assertEqual('/v1/AUTH_X/bucket/object',
+                         req.environ['swift.backend_path'])
+        # ...but aws:kms continues to fail
+        self._test_unsupported_header(sse_header, 'aws:kms')
 
     def test_website_redirect_location(self):
-        self._test_unsupported_header('website-redirect-location')
+        self._test_unsupported_header('x-amz-website-redirect-location')
+
+    def test_aws_chunked(self):
+        self._test_unsupported_header('content-encoding', 'aws-chunked')
+        # https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-streaming.html
+        # has a multi-encoding example:
+        #
+        # > Amazon S3 supports multiple content encodings. For example:
+        # >
+        # >     Content-Encoding : aws-chunked,gzip
+        # > That is, you can specify your custom content-encoding when using
+        # > Signature Version 4 streaming API.
+        self._test_unsupported_header('Content-Encoding', 'aws-chunked,gzip')
+        # Some clients skip the content-encoding,
+        # such as minio-go and aws-sdk-java
+        self._test_unsupported_header('x-amz-content-sha256',
+                                      'STREAMING-AWS4-HMAC-SHA256-PAYLOAD')
+        self._test_unsupported_header('x-amz-decoded-content-length')
+
+    def test_object_tagging(self):
+        self._test_unsupported_header('x-amz-tagging')
 
     def _test_unsupported_resource(self, resource):
         req = Request.blank('/error?' + resource,
@@ -500,7 +835,24 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self._test_unsupported_resource('cors')
 
     def test_tagging(self):
-        self._test_unsupported_resource('tagging')
+        req = Request.blank('/bucket?tagging',
+                            environ={'REQUEST_METHOD': 'GET'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '200')
+        req = Request.blank('/bucket?tagging',
+                            environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(self._get_error_code(body), 'NotImplemented')
+        req = Request.blank('/bucket?tagging',
+                            environ={'REQUEST_METHOD': 'DELETE'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header()})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(self._get_error_code(body), 'NotImplemented')
 
     def test_restore(self):
         self._test_unsupported_resource('restore')
@@ -516,25 +868,39 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(elem.find('./Method').text, 'POST')
         self.assertEqual(elem.find('./ResourceType').text, 'ACL')
 
-    def test_registered_defaults(self):
+    @mock.patch.object(registry, '_sensitive_headers', set())
+    @mock.patch.object(registry, '_sensitive_params', set())
+    def test_registered_sensitive_info(self):
+        self.assertFalse(registry.get_sensitive_headers())
+        self.assertFalse(registry.get_sensitive_params())
         filter_factory(self.conf)
-        swift_info = utils.get_swift_info()
+        sensitive = registry.get_sensitive_headers()
+        self.assertIn('authorization', sensitive)
+        sensitive = registry.get_sensitive_params()
+        self.assertIn('X-Amz-Signature', sensitive)
+        self.assertIn('Signature', sensitive)
+
+    @mock.patch.object(registry, '_swift_info', dict())
+    def test_registered_defaults(self):
+        conf_from_file = {k: str(v) for k, v in self.conf.items()}
+        filter_factory(conf_from_file)
+        swift_info = registry.get_swift_info()
         self.assertTrue('s3api' in swift_info)
-        self.assertEqual(swift_info['s3api'].get('max_bucket_listing'),
-                         self.conf.max_bucket_listing)
-        self.assertEqual(swift_info['s3api'].get('max_parts_listing'),
-                         self.conf.max_parts_listing)
-        self.assertEqual(swift_info['s3api'].get('max_upload_part_num'),
-                         self.conf.max_upload_part_num)
-        self.assertEqual(swift_info['s3api'].get('max_multi_delete_objects'),
-                         self.conf.max_multi_delete_objects)
+        registered_keys = [
+            'max_bucket_listing', 'max_parts_listing', 'max_upload_part_num',
+            'max_multi_delete_objects', 'allow_multipart_uploads',
+            'min_segment_size', 's3_acl']
+        expected = dict((k, self.conf[k]) for k in registered_keys)
+        self.assertEqual(expected, swift_info['s3api'])
 
     def test_check_pipeline(self):
         with patch("swift.common.middleware.s3api.s3api.loadcontext"), \
                 patch("swift.common.middleware.s3api.s3api.PipelineWrapper") \
                 as pipeline:
-            self.conf.auth_pipeline_check = True
-            self.conf.__file__ = ''
+            # cause check_pipeline to not return early...
+            self.conf['__file__'] = ''
+            # ...and enable pipeline auth checking
+            self.s3api.conf.auth_pipeline_check = True
 
             pipeline.return_value = 's3api tempauth proxy-server'
             self.s3api.check_pipeline(self.conf)
@@ -550,9 +916,6 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             pipeline.return_value = 's3api s3token keystoneauth proxy-server'
             self.s3api.check_pipeline(self.conf)
 
-            pipeline.return_value = 's3api swauth proxy-server'
-            self.s3api.check_pipeline(self.conf)
-
             # Note that authtoken would need to have delay_auth_decision=True
             pipeline.return_value = 's3api authtoken s3token keystoneauth ' \
                 'proxy-server'
@@ -562,30 +925,28 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             with self.assertRaises(ValueError) as cm:
                 self.s3api.check_pipeline(self.conf)
             self.assertIn('expected auth between s3api and proxy-server',
-                          cm.exception.message)
+                          cm.exception.args[0])
 
             pipeline.return_value = 'proxy-server'
             with self.assertRaises(ValueError) as cm:
                 self.s3api.check_pipeline(self.conf)
             self.assertIn("missing filters ['s3api']",
-                          cm.exception.message)
+                          cm.exception.args[0])
 
     def test_s3api_initialization_with_disabled_pipeline_check(self):
         with patch("swift.common.middleware.s3api.s3api.loadcontext"), \
                 patch("swift.common.middleware.s3api.s3api.PipelineWrapper") \
                 as pipeline:
-            # Disable pipeline check
-            self.conf.auth_pipeline_check = False
-            self.conf.__file__ = ''
+            # cause check_pipeline to not return early...
+            self.conf['__file__'] = ''
+            # ...but disable pipeline auth checking
+            self.s3api.conf.auth_pipeline_check = False
 
             pipeline.return_value = 's3api tempauth proxy-server'
             self.s3api.check_pipeline(self.conf)
 
             pipeline.return_value = 's3api s3token authtoken keystoneauth ' \
                 'proxy-server'
-            self.s3api.check_pipeline(self.conf)
-
-            pipeline.return_value = 's3api swauth proxy-server'
             self.s3api.check_pipeline(self.conf)
 
             pipeline.return_value = 's3api authtoken s3token keystoneauth ' \
@@ -602,21 +963,26 @@ class TestS3ApiMiddleware(S3ApiTestCase):
     def test_signature_v4(self):
         environ = {
             'REQUEST_METHOD': 'GET'}
+        authz_header = 'AWS4-HMAC-SHA256 ' + ', '.join([
+            'Credential=test:tester/%s/us-east-1/s3/aws4_request' %
+            self.get_v4_amz_date_header().split('T', 1)[0],
+            'SignedHeaders=host;x-amz-date',
+            'Signature=X',
+        ])
         headers = {
-            'Authorization':
-                'AWS4-HMAC-SHA256 '
-                'Credential=test:tester/20130524/US/s3/aws4_request, '
-                'SignedHeaders=host;x-amz-date,'
-                'Signature=X',
+            'Authorization': authz_header,
             'X-Amz-Date': self.get_v4_amz_date_header(),
             'X-Amz-Content-SHA256': '0123456789'}
         req = Request.blank('/bucket/object', environ=environ, headers=headers)
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '200', body)
+        self.assertIn('swift.backend_path', req.environ)
+        self.assertEqual('/v1/AUTH_test/bucket/object',
+                         req.environ['swift.backend_path'])
         for _, _, headers in self.swift.calls_with_headers:
-            self.assertEqual('AWS test:tester:X', headers['Authorization'])
-            self.assertIn('X-Auth-Token', headers)
+            self.assertEqual(authz_header, headers['Authorization'])
+            self.assertNotIn('X-Auth-Token', headers)
 
     def test_signature_v4_no_date(self):
         environ = {
@@ -624,7 +990,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         headers = {
             'Authorization':
                 'AWS4-HMAC-SHA256 '
-                'Credential=test:tester/20130524/US/s3/aws4_request, '
+                'Credential=test:tester/20130524/us-east-1/s3/aws4_request, '
                 'SignedHeaders=host;range;x-amz-date,'
                 'Signature=X',
             'X-Amz-Content-SHA256': '0123456789'}
@@ -640,9 +1006,9 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         headers = {
             'Authorization':
                 'AWS4-HMAC-SHA256 '
-                'Credential=test:tester/20130524/US/s3/aws4_request, '
+                'Credential=test:tester/%s/us-east-1/s3/aws4_request, '
                 'SignedHeaders=host;x-amz-date,'
-                'Signature=X',
+                'Signature=X' % self.get_v4_amz_date_header().split('T', 1)[0],
             'X-Amz-Date': self.get_v4_amz_date_header()}
         req = Request.blank('/bucket/object', environ=environ, headers=headers)
         req.content_type = 'text/plain'
@@ -654,7 +1020,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             'Missing required header for this request: x-amz-content-sha256')
 
     def test_signature_v4_bad_authorization_string(self):
-        def test(auth_str, error, msg):
+        def test(auth_str, error, msg, extra=b''):
             environ = {
                 'REQUEST_METHOD': 'GET'}
             headers = {
@@ -667,23 +1033,52 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             status, headers, body = self.call_s3api(req)
             self.assertEqual(self._get_error_code(body), error)
             self.assertEqual(self._get_error_message(body), msg)
+            self.assertIn(extra, body)
 
         auth_str = ('AWS4-HMAC-SHA256 '
                     'SignedHeaders=host;x-amz-date,'
                     'Signature=X')
         test(auth_str, 'AccessDenied', 'Access Denied.')
 
-        auth_str = ('AWS4-HMAC-SHA256 '
-                    'Credential=test:tester/20130524/US/s3/aws4_request, '
-                    'Signature=X')
+        auth_str = (
+            'AWS4-HMAC-SHA256 '
+            'Credential=test:tester/20130524/us-east-1/s3/aws4_request, '
+            'Signature=X')
         test(auth_str, 'AuthorizationHeaderMalformed',
              'The authorization header is malformed; the authorization '
              'header requires three components: Credential, SignedHeaders, '
              'and Signature.')
 
         auth_str = ('AWS4-HMAC-SHA256 '
-                    'Credential=test:tester/20130524/US/s3/aws4_request, '
-                    'SignedHeaders=host;x-amz-date')
+                    'Credential=test:tester/%s/us-west-2/s3/aws4_request, '
+                    'Signature=X, SignedHeaders=host;x-amz-date' %
+                    self.get_v4_amz_date_header().split('T', 1)[0])
+        test(auth_str, 'AuthorizationHeaderMalformed',
+             "The authorization header is malformed; "
+             "the region 'us-west-2' is wrong; expecting 'us-east-1'",
+             b'<Region>us-east-1</Region>')
+
+        auth_str = ('AWS4-HMAC-SHA256 '
+                    'Credential=test:tester/%s/us-east-1/not-s3/aws4_request, '
+                    'Signature=X, SignedHeaders=host;x-amz-date' %
+                    self.get_v4_amz_date_header().split('T', 1)[0])
+        test(auth_str, 'AuthorizationHeaderMalformed',
+             'The authorization header is malformed; '
+             'incorrect service "not-s3". This endpoint belongs to "s3".')
+
+        auth_str = ('AWS4-HMAC-SHA256 '
+                    'Credential=test:tester/%s/us-east-1/s3/not-aws4_request, '
+                    'Signature=X, SignedHeaders=host;x-amz-date' %
+                    self.get_v4_amz_date_header().split('T', 1)[0])
+        test(auth_str, 'AuthorizationHeaderMalformed',
+             'The authorization header is malformed; '
+             'incorrect terminal "not-aws4_request". '
+             'This endpoint uses "aws4_request".')
+
+        auth_str = (
+            'AWS4-HMAC-SHA256 '
+            'Credential=test:tester/20130524/us-east-1/s3/aws4_request, '
+            'SignedHeaders=host;x-amz-date')
         test(auth_str, 'AccessDenied', 'Access Denied.')
 
     def test_canonical_string_v4(self):
@@ -703,14 +1098,17 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                     '27ae41e4649b934ca495991b7852b855',
                 'HTTP_AUTHORIZATION':
                     'AWS4-HMAC-SHA256 '
-                    'Credential=X:Y/dt/reg/host/blah, '
+                    'Credential=X:Y/20110909/us-east-1/s3/aws4_request, '
                     'SignedHeaders=content-md5;content-type;date, '
                     'Signature=x',
             }
+            fake_time = calendar.timegm((2011, 9, 9, 23, 36, 0))
             env.update(environ)
             with patch('swift.common.middleware.s3api.s3request.'
-                       'S3Request._validate_headers'):
-                req = SigV4Request(env, location=self.conf.location)
+                       'S3Request._validate_headers'), \
+                    patch('swift.common.middleware.s3api.utils.time.time',
+                          return_value=fake_time):
+                req = SigV4Request(env, conf=self.s3api.conf)
             return req
 
         def canonical_string(path, environ):
@@ -720,12 +1118,12 @@ class TestS3ApiMiddleware(S3ApiTestCase):
             # See http://docs.aws.amazon.com/general/latest/gr
             # /signature-v4-test-suite.html for where location, service, and
             # signing key came from
-            with patch.object(self.conf, 'location', 'us-east-1'), \
+            with patch.object(self.s3api.conf, 'location', 'us-east-1'), \
                     patch.object(swift.common.middleware.s3api.s3request,
                                  'SERVICE', 'host'):
                 req = _get_req(path, environ)
-                hash_in_sts = req._string_to_sign().split('\n')[3]
-                self.assertEqual(hash_val, hash_in_sts)
+                hash_in_sts = req._string_to_sign().split(b'\n')[3]
+                self.assertEqual(hash_val, hash_in_sts.decode('ascii'))
                 self.assertTrue(req.check_signature(
                     'wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY'))
 
@@ -786,7 +1184,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                    'validate_bucket_name'):
             verify('27ba31df5dbc6e063d8f87d62eb07143'
                    'f7f271c5330a917840586ac1c85b6f6b',
-                   unquote('/%E1%88%B4'), env)
+                   swob.wsgi_unquote('/%E1%88%B4'), env)
 
         # get-vanilla-query-order-key
         env = {
@@ -872,7 +1270,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         headers = {
             'Authorization':
                 'AWS4-HMAC-SHA256 '
-                'Credential=test/20130524/US/s3/aws4_request_A, '
+                'Credential=test/20130524/us-east-1/s3/aws4_request_A, '
                 'SignedHeaders=hostA;rangeA;x-amz-dateA,'
                 'Signature=X',
             'X-Amz-Date': self.get_v4_amz_date_header(),
@@ -880,13 +1278,14 @@ class TestS3ApiMiddleware(S3ApiTestCase):
 
         # and then, different auth info (Credential, SignedHeaders, Signature)
         # in query
-        req = Request.blank('/bucket/object'
-                            '?X-Amz-Algorithm=AWS4-HMAC-SHA256'
-                            '&X-Amz-Credential=test/20T20Z/US/s3/aws4_requestB'
-                            '&X-Amz-SignedHeaders=hostB'
-                            '&X-Amz-Signature=Y',
-                            environ={'REQUEST_METHOD': 'GET'},
-                            headers=headers)
+        req = Request.blank(
+            '/bucket/object'
+            '?X-Amz-Algorithm=AWS4-HMAC-SHA256'
+            '&X-Amz-Credential=test/20T20Z/us-east-1/s3/aws4_requestB'
+            '&X-Amz-SignedHeaders=hostB'
+            '&X-Amz-Signature=Y',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers=headers)
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         # FIXME: should this failed as 400 or pass via query auth?
@@ -894,12 +1293,13 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.assertEqual(status.split()[0], '403', body)
 
         # But if we are missing Signature in query param
-        req = Request.blank('/bucket/object'
-                            '?X-Amz-Algorithm=AWS4-HMAC-SHA256'
-                            '&X-Amz-Credential=test/20T20Z/US/s3/aws4_requestB'
-                            '&X-Amz-SignedHeaders=hostB',
-                            environ={'REQUEST_METHOD': 'GET'},
-                            headers=headers)
+        req = Request.blank(
+            '/bucket/object'
+            '?X-Amz-Algorithm=AWS4-HMAC-SHA256'
+            '&X-Amz-Credential=test/20T20Z/us-east-1/s3/aws4_requestB'
+            '&X-Amz-SignedHeaders=hostB',
+            environ={'REQUEST_METHOD': 'GET'},
+            headers=headers)
         req.content_type = 'text/plain'
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '403', body)
@@ -911,6 +1311,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.s3_token = S3Token(
             self.keystone_auth, {'auth_uri': 'https://fakehost/identity'})
         self.s3api = S3ApiMiddleware(self.s3_token, self.conf)
+        self.s3api.logger = debug_logger()
         req = Request.blank(
             '/bucket',
             environ={'REQUEST_METHOD': 'PUT'},
@@ -922,13 +1323,16 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                             swob.HTTPOk, {}, None)
         with patch.object(self.s3_token, '_json_request') as mock_req:
             mock_resp = requests.Response()
-            mock_resp._content = json.dumps(GOOD_RESPONSE_V2)
+            mock_resp._content = json.dumps(GOOD_RESPONSE_V2).encode('ascii')
             mock_resp.status_code = 201
             mock_req.return_value = mock_resp
 
             status, headers, body = self.call_s3api(req)
-            self.assertEqual(body, '')
+            self.assertEqual(body, b'')
             self.assertEqual(1, mock_req.call_count)
+            self.assertIn('swift.backend_path', req.environ)
+            self.assertEqual('/v1/AUTH_TENANT_ID/bucket',
+                             req.environ['swift.backend_path'])
 
     def test_s3api_with_only_s3_token_v3(self):
         self.swift = FakeSwift()
@@ -937,6 +1341,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.s3_token = S3Token(
             self.keystone_auth, {'auth_uri': 'https://fakehost/identity'})
         self.s3api = S3ApiMiddleware(self.s3_token, self.conf)
+        self.s3api.logger = debug_logger()
         req = Request.blank(
             '/bucket',
             environ={'REQUEST_METHOD': 'PUT'},
@@ -948,13 +1353,16 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                             swob.HTTPOk, {}, None)
         with patch.object(self.s3_token, '_json_request') as mock_req:
             mock_resp = requests.Response()
-            mock_resp._content = json.dumps(GOOD_RESPONSE_V3)
+            mock_resp._content = json.dumps(GOOD_RESPONSE_V3).encode('ascii')
             mock_resp.status_code = 200
             mock_req.return_value = mock_resp
 
             status, headers, body = self.call_s3api(req)
-            self.assertEqual(body, '')
+            self.assertEqual(body, b'')
             self.assertEqual(1, mock_req.call_count)
+            self.assertIn('swift.backend_path', req.environ)
+            self.assertEqual('/v1/AUTH_PROJECT_ID/bucket',
+                             req.environ['swift.backend_path'])
 
     def test_s3api_with_s3_token_and_auth_token(self):
         self.swift = FakeSwift()
@@ -965,6 +1373,7 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         self.s3_token = S3Token(
             self.auth_token, {'auth_uri': 'https://fakehost/identity'})
         self.s3api = S3ApiMiddleware(self.s3_token, self.conf)
+        self.s3api.logger = debug_logger()
         req = Request.blank(
             '/bucket',
             environ={'REQUEST_METHOD': 'PUT'},
@@ -977,8 +1386,11 @@ class TestS3ApiMiddleware(S3ApiTestCase):
         with patch.object(self.s3_token, '_json_request') as mock_req:
             with patch.object(self.auth_token,
                               '_do_fetch_token') as mock_fetch:
+                # sanity check
+                self.assertIn('id', GOOD_RESPONSE_V2['access']['token'])
                 mock_resp = requests.Response()
-                mock_resp._content = json.dumps(GOOD_RESPONSE_V2)
+                mock_resp._content = json.dumps(
+                    GOOD_RESPONSE_V2).encode('ascii')
                 mock_resp.status_code = 201
                 mock_req.return_value = mock_resp
 
@@ -988,21 +1400,31 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                 mock_fetch.return_value = (MagicMock(), mock_access_info)
 
                 status, headers, body = self.call_s3api(req)
-                self.assertEqual(body, '')
+                # Even though s3token got a token back from keystone, we drop
+                # it on the floor, resulting in a 401 Unauthorized at
+                # `swift.common.middleware.keystoneauth` because
+                # keystonemiddleware's auth_token strips out all auth headers,
+                # significantly 'X-Identity-Status'. Without a token, it then
+                # sets 'X-Identity-Status: Invalid' and never contacts
+                # Keystone.
+                self.assertEqual('403 Forbidden', status)
+                self.assertIn('swift.backend_path', req.environ)
+                self.assertEqual('/v1/AUTH_TENANT_ID/bucket',
+                                 req.environ['swift.backend_path'])
                 self.assertEqual(1, mock_req.call_count)
-                # With X-Auth-Token, auth_token will call _do_fetch_token to
-                # connect to keystone in auth_token, again
-                self.assertEqual(1, mock_fetch.call_count)
+                # it never even tries to contact keystone
+                self.assertEqual(0, mock_fetch.call_count)
 
-    def test_s3api_with_s3_token_no_pass_token_to_auth_token(self):
+    def test_s3api_with_only_s3_token_in_s3acl(self):
         self.swift = FakeSwift()
         self.keystone_auth = KeystoneAuth(
             self.swift, {'operator_roles': 'swift-user'})
-        self.auth_token = AuthProtocol(
-            self.keystone_auth, {'delay_auth_decision': 'True'})
         self.s3_token = S3Token(
-            self.auth_token, {'auth_uri': 'https://fakehost/identity'})
+            self.keystone_auth, {'auth_uri': 'https://fakehost/identity'})
+
+        self.conf['s3_acl'] = True
         self.s3api = S3ApiMiddleware(self.s3_token, self.conf)
+        self.s3api.logger = debug_logger()
         req = Request.blank(
             '/bucket',
             environ={'REQUEST_METHOD': 'PUT'},
@@ -1010,40 +1432,25 @@ class TestS3ApiMiddleware(S3ApiTestCase):
                      'Date': self.get_date_header()})
         self.swift.register('PUT', '/v1/AUTH_TENANT_ID/bucket',
                             swob.HTTPCreated, {}, None)
-        self.swift.register('HEAD', '/v1/AUTH_TENANT_ID',
-                            swob.HTTPOk, {}, None)
+        # For now, s3 acl commits the bucket owner acl via POST
+        # after PUT container so we need to register the resposne here
+        self.swift.register('POST', '/v1/AUTH_TENANT_ID/bucket',
+                            swob.HTTPNoContent, {}, None)
+        self.swift.register('TEST', '/v1/AUTH_TENANT_ID',
+                            swob.HTTPMethodNotAllowed, {}, None)
         with patch.object(self.s3_token, '_json_request') as mock_req:
-            with patch.object(self.auth_token,
-                              '_do_fetch_token') as mock_fetch:
-                mock_resp = requests.Response()
-                no_token_id_good_resp = copy.deepcopy(GOOD_RESPONSE_V2)
-                # delete token id
-                del no_token_id_good_resp['access']['token']['id']
-                mock_resp._content = json.dumps(no_token_id_good_resp)
-                mock_resp.status_code = 201
-                mock_req.return_value = mock_resp
+            mock_resp = requests.Response()
+            mock_resp._content = json.dumps(GOOD_RESPONSE_V2).encode('ascii')
+            mock_resp.status_code = 201
+            mock_req.return_value = mock_resp
 
-                mock_access_info = AccessInfoV2(GOOD_RESPONSE_V2)
-                mock_access_info.will_expire_soon = \
-                    lambda stale_duration: False
-                mock_fetch.return_value = (MagicMock(), mock_access_info)
+            status, headers, body = self.call_s3api(req)
+            self.assertEqual(body, b'')
+            self.assertIn('swift.backend_path', req.environ)
+            self.assertEqual('/v1/AUTH_TENANT_ID/bucket',
+                             req.environ['swift.backend_path'])
+            self.assertEqual(1, mock_req.call_count)
 
-                status, headers, body = self.call_s3api(req)
-                # No token provided from keystone result in 401 Unauthorized
-                # at `swift.common.middleware.keystoneauth` because auth_token
-                # will remove all auth headers including 'X-Identity-Status'[1]
-                # and then, set X-Identity-Status: Invalid at [2]
-                #
-                # 1: https://github.com/openstack/keystonemiddleware/blob/
-                #    master/keystonemiddleware/auth_token/__init__.py#L620
-                # 2: https://github.com/openstack/keystonemiddleware/blob/
-                #    master/keystonemiddleware/auth_token/__init__.py#L627-L629
-
-                self.assertEqual('403 Forbidden', status)
-                self.assertEqual(1, mock_req.call_count)
-                # if no token provided from keystone, we can skip the call to
-                # fetch the token
-                self.assertEqual(0, mock_fetch.call_count)
 
 if __name__ == '__main__':
     unittest.main()

@@ -48,12 +48,18 @@ storage nodes, you must prepare the storage devices.
       # mkdir -p /srv/node/sdb
       # mkdir -p /srv/node/sdc
 
+#. Find the UUID of the new partitions:
+
+   .. code-block:: console
+
+      # blkid
+
 #. Edit the ``/etc/fstab`` file and add the following to it:
 
    .. code-block:: none
 
-        /dev/sdb /srv/node/sdb xfs noatime,nodiratime,nobarrier,logbufs=8 0 2
-        /dev/sdc /srv/node/sdc xfs noatime,nodiratime,nobarrier,logbufs=8 0 2
+      UUID="<UUID-from-output-above>" /srv/node/sdb xfs noatime 0 2
+      UUID="<UUID-from-output-above>" /srv/node/sdc xfs noatime 0 2
 
 #. Mount the devices:
 
@@ -137,9 +143,9 @@ Install and configure components
 
    .. code-block:: console
 
-      # curl -o /etc/swift/account-server.conf https://git.openstack.org/cgit/openstack/swift/plain/etc/account-server.conf-sample?h=stable/queens
-      # curl -o /etc/swift/container-server.conf https://git.openstack.org/cgit/openstack/swift/plain/etc/container-server.conf-sample?h=stable/queens
-      # curl -o /etc/swift/object-server.conf https://git.openstack.org/cgit/openstack/swift/plain/etc/object-server.conf-sample?h=stable/queens
+      # curl -o /etc/swift/account-server.conf https://opendev.org/openstack/swift/raw/branch/master/etc/account-server.conf-sample
+      # curl -o /etc/swift/container-server.conf https://opendev.org/openstack/swift/raw/branch/master/etc/container-server.conf-sample
+      # curl -o /etc/swift/object-server.conf https://opendev.org/openstack/swift/raw/branch/master/etc/object-server.conf-sample
 
 3.  .. include:: storage-include1.txt
 4.  .. include:: storage-include2.txt

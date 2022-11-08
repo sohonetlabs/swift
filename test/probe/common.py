@@ -16,6 +16,9 @@
 from __future__ import print_function
 
 import errno
+import gc
+import json
+import mock
 import os
 from subprocess import Popen, PIPE
 import sys
@@ -24,21 +27,24 @@ from textwrap import dedent
 from time import sleep, time
 from collections import defaultdict
 import unittest
-from hashlib import md5
 from uuid import uuid4
 import shutil
+import six
 from six.moves.http_client import HTTPConnection
 from six.moves.urllib.parse import urlparse
 
 from swiftclient import get_auth, head_account, client
-from swift.common import internal_client
-from swift.obj.diskfile import get_data_dir
+from swift.common import internal_client, direct_client, utils
+from swift.common.direct_client import DirectClientException
 from swift.common.ring import Ring
-from swift.common.utils import readconf, renamer, rsync_module_interpolation
+from swift.common.utils import hash_path, md5, \
+    readconf, renamer, rsync_module_interpolation
 from swift.common.manager import Manager
 from swift.common.storage_policy import POLICIES, EC_POLICY, REPL_POLICY
+from swift.obj.diskfile import get_data_dir
+from test.debug_logger import capture_logger
 
-from test.probe import CHECK_SERVER_TIMEOUT, VALIDATE_RSYNC
+from test.probe import CHECK_SERVER_TIMEOUT, VALIDATE_RSYNC, PROXY_BASE_URL
 
 
 ENABLED_POLICIES = [p for p in POLICIES if not p.is_deprecated]
@@ -79,8 +85,8 @@ def _check_storage(ipport, path):
     return resp
 
 
-def _check_proxy(ipport, user, key):
-    url, token = get_auth('http://%s:%d/auth/v1.0' % ipport,
+def _check_proxy(user, key):
+    url, token = get_auth(PROXY_BASE_URL + '/auth/v1.0',
                           user, key)
     account = url.split('/')[-1]
     head_account(url, token)
@@ -117,7 +123,7 @@ def check_server(ipport, ipport2server):
         rv = _retry_timeout(_check_storage, args=(ipport, path))
     else:
         rv = _retry_timeout(_check_proxy, args=(
-            ipport, 'test:tester', 'testing'))
+            'test:tester', 'testing'))
     return rv
 
 
@@ -164,7 +170,7 @@ def add_ring_devs_to_ipport2server(ring, server_type, ipport2server,
     # We'll number the servers by order of unique occurrence of:
     #   IP, if servers_per_port > 0 OR there > 1 IP in ring
     #   ipport, otherwise
-    unique_ip_count = len(set(dev['ip'] for dev in ring.devs if dev))
+    unique_ip_count = len({dev['ip'] for dev in ring.devs if dev})
     things_to_number = {}
     number = 0
     for dev in filter(None, ring.devs):
@@ -179,7 +185,12 @@ def add_ring_devs_to_ipport2server(ring, server_type, ipport2server,
 
 
 def store_config_paths(name, configs):
-    for server_name in (name, '%s-replicator' % name):
+    server_names = [name, '%s-replicator' % name]
+    if name == 'container':
+        server_names.append('container-sharder')
+    elif name == 'object':
+        server_names.append('object-reconstructor')
+    for server_name in server_names:
         for server in Manager([server_name]):
             for i, conf in enumerate(server.conf_files(), 1):
                 configs[server.server][i] = conf
@@ -244,7 +255,7 @@ def get_ring(ring_name, required_replicas, required_devices,
         if p.returncode:
             raise unittest.SkipTest('unable to connect to rsync '
                                     'export %s (%s)' % (rsync_export, cmd))
-        for line in stdout.splitlines():
+        for line in stdout.decode().splitlines():
             if line.rsplit(None, 1)[-1] == dev['device']:
                 break
         else:
@@ -295,11 +306,11 @@ def kill_orphans():
 class Body(object):
 
     def __init__(self, total=3.5 * 2 ** 20):
-        self.length = total
-        self.hasher = md5()
+        self.length = int(total)
+        self.hasher = md5(usedforsecurity=False)
         self.read_amount = 0
-        self.chunk = uuid4().hex * 2 ** 10
-        self.buff = ''
+        self.chunk = uuid4().hex.encode('ascii') * 2 ** 10
+        self.buff = b''
 
     @property
     def etag(self):
@@ -320,9 +331,9 @@ class Body(object):
     def __iter__(self):
         return self
 
-    def next(self):
+    def __next__(self):
         if self.buff:
-            rv, self.buff = self.buff, ''
+            rv, self.buff = self.buff, b''
             return rv
         if self.read_amount >= self.length:
             raise StopIteration()
@@ -331,8 +342,29 @@ class Body(object):
         self.hasher.update(rv)
         return rv
 
-    def __next__(self):
-        return next(self)
+    # for py2 compat:
+    next = __next__
+
+
+def exclude_nodes(nodes, *excludes):
+    """
+    Iterate over ``nodes`` yielding only those not in ``excludes``.
+
+    The index key of the node dicts is ignored when matching nodes against the
+    ``excludes`` nodes. Index is not a fundamental property of a node but a
+    variable annotation added by the Ring depending upon the partition for
+    which the nodes were generated.
+
+    :param nodes: an iterable of node dicts.
+    :param *excludes: one or more node dicts that should not be yielded.
+    :return: yields node dicts.
+    """
+    for node in nodes:
+        match_node = {k: mock.ANY if k == 'index' else v
+                      for k, v in node.items()}
+        if any(exclude == match_node for exclude in excludes):
+            continue
+        yield node
 
 
 class ProbeTest(unittest.TestCase):
@@ -363,8 +395,15 @@ class ProbeTest(unittest.TestCase):
             server='object',
             ipport2server=self.ipport2server,
             config_paths=self.configs)
+        for server in Manager(['proxy-server']):
+            for conf in server.conf_files():
+                self.configs['proxy-server'] = conf
 
     def setUp(self):
+        # previous test may have left DatabaseBroker instances in garbage with
+        # open connections to db files which will prevent unmounting devices in
+        # resetswift, so collect garbage now
+        gc.collect()
         resetswift()
         kill_orphans()
         self._load_rings_and_configs()
@@ -377,7 +416,10 @@ class ProbeTest(unittest.TestCase):
             Manager(['main']).start(wait=True)
             for ipport in self.ipport2server:
                 check_server(ipport, self.ipport2server)
-            proxy_ipport = ('127.0.0.1', 8080)
+            proxy_conf = readconf(self.configs['proxy-server'],
+                                  section_name='app:proxy-server')
+            proxy_ipport = (proxy_conf.get('bind_ip', '127.0.0.1'),
+                            int(proxy_conf.get('bind_port', 8080)))
             self.ipport2server[proxy_ipport] = 'proxy'
             self.url, self.token, self.account = check_server(
                 proxy_ipport, self.ipport2server)
@@ -385,7 +427,7 @@ class ProbeTest(unittest.TestCase):
                 'url': self.url, 'token': self.token, 'account': self.account}
 
             rv = _retry_timeout(_check_proxy, args=(
-                proxy_ipport, 'test2:tester2', 'testing2'))
+                'test2:tester2', 'testing2'))
             self.account_2 = {
                 k: v for (k, v) in zip(('url', 'token', 'account'), rv)}
 
@@ -409,7 +451,12 @@ class ProbeTest(unittest.TestCase):
     def tearDown(self):
         Manager(['all']).kill()
 
-    def device_dir(self, server, node):
+    def assertLengthEqual(self, obj, length):
+        obj_len = len(obj)
+        self.assertEqual(obj_len, length, 'len(%r) == %d, not %d' % (
+            obj, obj_len, length))
+
+    def device_dir(self, node):
         server_type, config_number = get_server_number(
             (node['ip'], node['port']), self.ipport2server)
         repl_server = '%s-replicator' % server_type
@@ -417,9 +464,9 @@ class ProbeTest(unittest.TestCase):
                         section_name=repl_server)
         return os.path.join(conf['devices'], node['device'])
 
-    def storage_dir(self, server, node, part=None, policy=None):
+    def storage_dir(self, node, part=None, policy=None):
         policy = policy or self.policy
-        device_path = self.device_dir(server, node)
+        device_path = self.device_dir(node)
         path_parts = [device_path, get_data_dir(policy)]
         if part is not None:
             path_parts.append(str(part))
@@ -481,6 +528,7 @@ class ProbeTest(unittest.TestCase):
 
             [app:proxy-server]
             use = egg:swift#proxy
+            allow_account_management = True
 
             [filter:copy]
             use = egg:swift#copy
@@ -518,7 +566,7 @@ class ProbeTest(unittest.TestCase):
         """
         async_pendings = []
         for onode in onodes:
-            device_dir = self.device_dir('', onode)
+            device_dir = self.device_dir(onode)
             for ap_pol_dir in os.listdir(device_dir):
                 if not ap_pol_dir.startswith('async_pending'):
                     # skip 'objects', 'containers', etc.
@@ -540,6 +588,28 @@ class ProbeTest(unittest.TestCase):
                             for ent in os.listdir(ap_dir_fullpath)])
         return async_pendings
 
+    def run_custom_daemon(self, klass, conf_section, conf_index,
+                          custom_conf, **kwargs):
+        conf_file = self.configs[conf_section][conf_index]
+        conf = utils.readconf(conf_file, conf_section)
+        conf.update(custom_conf)
+        # Use a CaptureLogAdapter in order to preserve the pattern of tests
+        # calling the log accessor methods (e.g. get_lines_for_level) directly
+        # on the logger instance
+        with capture_logger(conf, conf.get('log_name', conf_section),
+                            log_to_console=kwargs.pop('verbose', False),
+                            log_route=conf_section) as log_adapter:
+            daemon = klass(conf, log_adapter)
+            daemon.run_once(**kwargs)
+        return daemon
+
+
+def _get_db_file_path(obj_dir):
+    files = sorted(os.listdir(obj_dir), reverse=True)
+    for filename in files:
+        if filename.endswith('db'):
+            return os.path.join(obj_dir, filename)
+
 
 class ReplProbeTest(ProbeTest):
 
@@ -549,6 +619,57 @@ class ReplProbeTest(ProbeTest):
     obj_required_devices = 4
     policy_requirements = {'policy_type': REPL_POLICY}
 
+    def direct_container_op(self, func, account=None, container=None,
+                            expect_failure=False):
+        account = account if account else self.account
+        container = container if container else self.container_to_shard
+        cpart, cnodes = self.container_ring.get_nodes(account, container)
+        unexpected_responses = []
+        results = {}
+        for cnode in cnodes:
+            try:
+                results[cnode['id']] = func(cnode, cpart, account, container)
+            except DirectClientException as err:
+                if not expect_failure:
+                    unexpected_responses.append((cnode, err))
+            else:
+                if expect_failure:
+                    unexpected_responses.append((cnode, 'success'))
+        if unexpected_responses:
+            self.fail('Unexpected responses: %s' % unexpected_responses)
+        return results
+
+    def direct_delete_container(self, account=None, container=None,
+                                expect_failure=False):
+        self.direct_container_op(direct_client.direct_delete_container,
+                                 account, container, expect_failure)
+
+    def direct_head_container(self, account=None, container=None,
+                              expect_failure=False):
+        return self.direct_container_op(direct_client.direct_head_container,
+                                        account, container, expect_failure)
+
+    def direct_get_container(self, account=None, container=None,
+                             expect_failure=False):
+        return self.direct_container_op(direct_client.direct_get_container,
+                                        account, container, expect_failure)
+
+    def get_container_db_files(self, container):
+        opart, onodes = self.container_ring.get_nodes(self.account, container)
+        db_files = []
+        for onode in onodes:
+            node_id = self.config_number(onode)
+            device = onode['device']
+            hash_str = hash_path(self.account, container)
+            server_conf = readconf(self.configs['container-server'][node_id])
+            devices = server_conf['app:container-server']['devices']
+            obj_dir = '%s/%s/containers/%s/%s/%s/' % (devices,
+                                                      device, opart,
+                                                      hash_str[-3:], hash_str)
+            db_files.append(_get_db_file_path(obj_dir))
+
+        return db_files
+
 
 class ECProbeTest(ProbeTest):
 
@@ -557,6 +678,140 @@ class ECProbeTest(ProbeTest):
     obj_required_replicas = 6
     obj_required_devices = 8
     policy_requirements = {'policy_type': EC_POLICY}
+
+    def _make_name(self, prefix):
+        return ('%s%s' % (prefix, uuid4())).encode()
+
+    def setUp(self):
+        super(ECProbeTest, self).setUp()
+        self.container_name = self._make_name('container-')
+        self.object_name = self._make_name('object-')
+        # sanity
+        self.assertEqual(self.policy.policy_type, EC_POLICY)
+        self.reconstructor = Manager(["object-reconstructor"])
+
+    def proxy_put(self, extra_headers=None):
+        contents = Body()
+        headers = {
+            self._make_name('x-object-meta-').decode('utf8'):
+                self._make_name('meta-foo-').decode('utf8'),
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+        self.etag = client.put_object(self.url, self.token,
+                                      self.container_name,
+                                      self.object_name,
+                                      contents=contents, headers=headers)
+
+    def proxy_get(self):
+        # GET object
+        headers, body = client.get_object(self.url, self.token,
+                                          self.container_name,
+                                          self.object_name,
+                                          resp_chunk_size=64 * 2 ** 10)
+        resp_checksum = md5(usedforsecurity=False)
+        for chunk in body:
+            resp_checksum.update(chunk)
+        return headers, resp_checksum.hexdigest()
+
+    def direct_get(self, node, part, require_durable=True, extra_headers=None):
+        req_headers = {'X-Backend-Storage-Policy-Index': int(self.policy)}
+        if extra_headers:
+            req_headers.update(extra_headers)
+        if not require_durable:
+            req_headers.update(
+                {'X-Backend-Fragment-Preferences': json.dumps([])})
+        # node dict has unicode values so utf8 decode our path parts too in
+        # case they have non-ascii characters
+        if six.PY2:
+            acc, con, obj = (s.decode('utf8') for s in (
+                self.account, self.container_name, self.object_name))
+        else:
+            acc, con, obj = self.account, self.container_name, self.object_name
+        headers, data = direct_client.direct_get_object(
+            node, part, acc, con, obj, headers=req_headers,
+            resp_chunk_size=64 * 2 ** 20)
+        hasher = md5(usedforsecurity=False)
+        for chunk in data:
+            hasher.update(chunk)
+        return headers, hasher.hexdigest()
+
+    def assert_direct_get_fails(self, onode, opart, status,
+                                require_durable=True):
+        try:
+            self.direct_get(onode, opart, require_durable=require_durable)
+        except direct_client.DirectClientException as err:
+            self.assertEqual(err.http_status, status)
+            return err
+        else:
+            self.fail('Node data on %r was not fully destroyed!' % (onode,))
+
+    def assert_direct_get_succeeds(self, onode, opart, require_durable=True,
+                                   extra_headers=None):
+        try:
+            return self.direct_get(onode, opart,
+                                   require_durable=require_durable,
+                                   extra_headers=extra_headers)
+        except direct_client.DirectClientException as err:
+            self.fail('Node data on %r was not available: %s' % (onode, err))
+
+    def break_nodes(self, nodes, opart, failed, non_durable):
+        # delete partitions on the failed nodes and remove durable marker from
+        # non-durable nodes
+        made_non_durable = 0
+        for i, node in enumerate(nodes):
+            part_dir = self.storage_dir(node, part=opart)
+            if i in failed:
+                shutil.rmtree(part_dir, True)
+                try:
+                    self.direct_get(node, opart)
+                except direct_client.DirectClientException as err:
+                    self.assertEqual(err.http_status, 404)
+            elif i in non_durable:
+                for dirs, subdirs, files in os.walk(part_dir):
+                    for fname in sorted(files, reverse=True):
+                        # make the newest durable be non-durable
+                        if fname.endswith('.data'):
+                            made_non_durable += 1
+                            non_durable_fname = fname.replace('#d', '')
+                            os.rename(os.path.join(dirs, fname),
+                                      os.path.join(dirs, non_durable_fname))
+
+                            break
+                headers, etag = self.direct_get(node, opart,
+                                                require_durable=False)
+                self.assertNotIn('X-Backend-Durable-Timestamp', headers)
+            try:
+                os.remove(os.path.join(part_dir, 'hashes.pkl'))
+            except OSError as e:
+                if e.errno != errno.ENOENT:
+                    raise
+        return made_non_durable
+
+    def make_durable(self, nodes, opart):
+        # ensure all data files on the specified nodes are durable
+        made_durable = 0
+        for i, node in enumerate(nodes):
+            part_dir = self.storage_dir(node, part=opart)
+            for dirs, subdirs, files in os.walk(part_dir):
+                for fname in sorted(files, reverse=True):
+                    # make the newest non-durable be durable
+                    if (fname.endswith('.data') and
+                            not fname.endswith('#d.data')):
+                        made_durable += 1
+                        non_durable_fname = fname.replace('.data', '#d.data')
+                        os.rename(os.path.join(dirs, fname),
+                                  os.path.join(dirs, non_durable_fname))
+
+                        break
+            headers, etag = self.assert_direct_get_succeeds(node, opart)
+            self.assertIn('X-Backend-Durable-Timestamp', headers)
+            try:
+                os.remove(os.path.join(part_dir, 'hashes.pkl'))
+            except OSError as e:
+                if e.errno != errno.ENOENT:
+                    raise
+        return made_durable
 
 
 if __name__ == "__main__":

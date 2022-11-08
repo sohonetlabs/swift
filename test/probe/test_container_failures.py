@@ -14,8 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from os import listdir
-from os.path import join as path_join
 from unittest import main
 from uuid import uuid4
 
@@ -26,18 +24,11 @@ from swiftclient import client
 
 from swift.common import direct_client
 from swift.common.exceptions import ClientException
-from swift.common.utils import hash_path, readconf
+from swift.common.utils import readconf
 from test.probe.common import kill_nonprimary_server, \
     kill_server, ReplProbeTest, start_server
 
 eventlet.monkey_patch(all=False, socket=True)
-
-
-def get_db_file_path(obj_dir):
-    files = sorted(listdir(obj_dir), reverse=True)
-    for filename in files:
-        if filename.endswith('db'):
-            return path_join(obj_dir, filename)
 
 
 class TestContainerFailures(ReplProbeTest):
@@ -125,29 +116,44 @@ class TestContainerFailures(ReplProbeTest):
         self.assertEqual(headers['x-account-object-count'], '0')
         self.assertEqual(headers['x-account-bytes-used'], '0')
 
-    def _get_container_db_files(self, container):
-        opart, onodes = self.container_ring.get_nodes(self.account, container)
-        onode = onodes[0]
-        db_files = []
-        for onode in onodes:
-            node_id = (onode['port'] - 6000) / 10
-            device = onode['device']
-            hash_str = hash_path(self.account, container)
-            server_conf = readconf(self.configs['container-server'][node_id])
-            devices = server_conf['app:container-server']['devices']
-            obj_dir = '%s/%s/containers/%s/%s/%s/' % (devices,
-                                                      device, opart,
-                                                      hash_str[-3:], hash_str)
-            db_files.append(get_db_file_path(obj_dir))
+    def test_all_nodes_fail(self):
+        # Create container1
+        container1 = 'container-%s' % uuid4()
+        cpart, cnodes = self.container_ring.get_nodes(self.account, container1)
+        client.put_container(self.url, self.token, container1)
+        client.put_object(self.url, self.token, container1, 'obj1', 'data1')
 
-        return db_files
+        # All primaries go down
+        for cnode in cnodes:
+            kill_server((cnode['ip'], cnode['port']), self.ipport2server)
+
+        # Can't GET the container
+        with self.assertRaises(client.ClientException) as caught:
+            client.get_container(self.url, self.token, container1)
+        self.assertEqual(caught.exception.http_status, 503)
+
+        # But we can still write objects! The old info is still in memcache
+        client.put_object(self.url, self.token, container1, 'obj2', 'data2')
+
+        # Can't POST the container, either
+        with self.assertRaises(client.ClientException) as caught:
+            client.post_container(self.url, self.token, container1, {})
+        self.assertEqual(caught.exception.http_status, 503)
+
+        # Though it *does* evict the cache
+        with self.assertRaises(client.ClientException) as caught:
+            client.put_object(self.url, self.token, container1, 'obj3', 'x')
+        self.assertEqual(caught.exception.http_status, 503)
 
     def test_locked_container_dbs(self):
 
         def run_test(num_locks, catch_503):
             container = 'container-%s' % uuid4()
             client.put_container(self.url, self.token, container)
-            db_files = self._get_container_db_files(container)
+            # Get the container info into memcache (so no stray
+            # get_container_info calls muck up our timings)
+            client.get_container(self.url, self.token, container)
+            db_files = self.get_container_db_files(container)
             db_conns = []
             for i in range(num_locks):
                 db_conn = connect(db_files[i])
@@ -163,9 +169,12 @@ class TestContainerFailures(ReplProbeTest):
             else:
                 client.delete_container(self.url, self.token, container)
 
+        proxy_conf = readconf(self.configs['proxy-server'],
+                              section_name='app:proxy-server')
+        node_timeout = int(proxy_conf.get('node_timeout', 10))
         pool = GreenPool()
         try:
-            with Timeout(15):
+            with Timeout(node_timeout + 5):
                 pool.spawn(run_test, 1, False)
                 pool.spawn(run_test, 2, True)
                 pool.spawn(run_test, 3, True)

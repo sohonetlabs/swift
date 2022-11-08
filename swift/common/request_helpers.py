@@ -20,54 +20,168 @@ Why not swift.common.utils, you ask? Because this way we can import things
 from swob in here without creating circular imports.
 """
 
-import hashlib
 import itertools
 import sys
 import time
 
 import six
-from six.moves.urllib.parse import unquote
 from swift.common.header_key_dict import HeaderKeyDict
 
 from swift import gettext_ as _
+from swift.common.constraints import AUTO_CREATE_ACCOUNT_PREFIX, \
+    CONTAINER_LISTING_LIMIT
 from swift.common.storage_policy import POLICIES
 from swift.common.exceptions import ListingIterError, SegmentError
-from swift.common.http import is_success
+from swift.common.http import is_success, is_server_error
 from swift.common.swob import HTTPBadRequest, \
     HTTPServiceUnavailable, Range, is_chunked, multi_range_iterator, \
-    HTTPPreconditionFailed
+    HTTPPreconditionFailed, wsgi_to_bytes, wsgi_unquote, wsgi_to_str
 from swift.common.utils import split_path, validate_device_partition, \
     close_if_possible, maybe_multipart_byteranges_to_document_iters, \
     multipart_byteranges_to_document_iters, parse_content_type, \
-    parse_content_range, csv_append, list_from_csv, Spliterator
-
+    parse_content_range, csv_append, list_from_csv, Spliterator, quote, \
+    RESERVED, config_true_value, md5, CloseableChain
 from swift.common.wsgi import make_subrequest
 
 
 OBJECT_TRANSIENT_SYSMETA_PREFIX = 'x-object-transient-sysmeta-'
+OBJECT_SYSMETA_CONTAINER_UPDATE_OVERRIDE_PREFIX = \
+    'x-object-sysmeta-container-update-override-'
+USE_REPLICATION_NETWORK_HEADER = 'x-backend-use-replication-network'
+MISPLACED_OBJECTS_ACCOUNT = '.misplaced_objects'
+
+
+if six.PY2:
+    import cgi
+
+    def html_escape(s, quote=True):
+        return cgi.escape(s, quote=quote)
+else:
+    from html import escape as html_escape  # noqa: F401
 
 
 def get_param(req, name, default=None):
     """
-    Get parameters from an HTTP request ensuring proper handling UTF-8
+    Get a parameter from an HTTP request ensuring proper handling UTF-8
     encoding.
 
     :param req: request object
     :param name: parameter name
     :param default: result to return if the parameter is not found
-    :returns: HTTP request parameter value
-              (as UTF-8 encoded str, not unicode object)
+    :returns: HTTP request parameter value, as a native string
+              (in py2, as UTF-8 encoded str, not unicode object)
     :raises HTTPBadRequest: if param not valid UTF-8 byte sequence
     """
     value = req.params.get(name, default)
-    if value and not isinstance(value, six.text_type):
-        try:
-            value.decode('utf8')    # Ensure UTF8ness
-        except UnicodeDecodeError:
-            raise HTTPBadRequest(
-                request=req, content_type='text/plain',
-                body='"%s" parameter not valid UTF-8' % name)
+    if six.PY2:
+        if value and not isinstance(value, six.text_type):
+            try:
+                value.decode('utf8')    # Ensure UTF8ness
+            except UnicodeDecodeError:
+                raise HTTPBadRequest(
+                    request=req, content_type='text/plain',
+                    body='"%s" parameter not valid UTF-8' % name)
+    else:
+        if value:
+            # req.params is a dict of WSGI strings, so encoding will succeed
+            value = value.encode('latin1')
+            try:
+                # Ensure UTF8ness since we're at it
+                value = value.decode('utf8')
+            except UnicodeDecodeError:
+                raise HTTPBadRequest(
+                    request=req, content_type='text/plain',
+                    body='"%s" parameter not valid UTF-8' % name)
     return value
+
+
+def validate_params(req, names):
+    """
+    Get list of parameters from an HTTP request, validating the encoding of
+    each parameter.
+
+    :param req: request object
+    :param names: parameter names
+    :returns: a dict mapping parameter names to values for each name that
+              appears in the request parameters
+    :raises HTTPBadRequest: if any parameter value is not a valid UTF-8 byte
+            sequence
+    """
+    params = {}
+    for name in names:
+        value = get_param(req, name)
+        if value is None:
+            continue
+        params[name] = value
+    return params
+
+
+def constrain_req_limit(req, constrained_limit):
+    given_limit = get_param(req, 'limit')
+    limit = constrained_limit
+    if given_limit and given_limit.isdigit():
+        limit = int(given_limit)
+        if limit > constrained_limit:
+            raise HTTPPreconditionFailed(
+                request=req, body='Maximum limit is %d' % constrained_limit)
+    return limit
+
+
+def validate_container_params(req):
+    params = validate_params(req, ('marker', 'end_marker', 'prefix',
+                                   'delimiter', 'path', 'format', 'reverse',
+                                   'states', 'includes'))
+    params['limit'] = constrain_req_limit(req, CONTAINER_LISTING_LIMIT)
+    return params
+
+
+def _validate_internal_name(name, type_='name'):
+    if RESERVED in name and not name.startswith(RESERVED):
+        raise HTTPBadRequest(body='Invalid reserved-namespace %s' % (type_))
+
+
+def validate_internal_account(account):
+    """
+    Validate internal account name.
+
+    :raises: HTTPBadRequest
+    """
+    _validate_internal_name(account, 'account')
+
+
+def validate_internal_container(account, container):
+    """
+    Validate internal account and container names.
+
+    :raises: HTTPBadRequest
+    """
+    if not account:
+        raise ValueError('Account is required')
+    validate_internal_account(account)
+    if container:
+        _validate_internal_name(container, 'container')
+
+
+def validate_internal_obj(account, container, obj):
+    """
+    Validate internal account, container and object names.
+
+    :raises: HTTPBadRequest
+    """
+    if not account:
+        raise ValueError('Account is required')
+    if not container:
+        raise ValueError('Container is required')
+    validate_internal_container(account, container)
+    if obj and not (account.startswith(AUTO_CREATE_ACCOUNT_PREFIX) or
+                    account == MISPLACED_OBJECTS_ACCOUNT):
+        _validate_internal_name(obj, 'object')
+        if container.startswith(RESERVED) and not obj.startswith(RESERVED):
+            raise HTTPBadRequest(body='Invalid user-namespace object '
+                                 'in reserved-namespace container')
+        elif obj.startswith(RESERVED) and not container.startswith(RESERVED):
+            raise HTTPBadRequest(body='Invalid reserved-namespace object '
+                                 'in user-namespace container')
 
 
 def get_name_and_placement(request, minsegs=1, maxsegs=None,
@@ -103,14 +217,13 @@ def split_and_validate_path(request, minsegs=1, maxsegs=None,
     Utility function to split and validate the request path.
 
     :returns: result of :meth:`~swift.common.utils.split_path` if
-              everything's okay
+              everything's okay, as native strings
     :raises HTTPBadRequest: if something's not okay
     """
     try:
-        segs = split_path(unquote(request.path),
-                          minsegs, maxsegs, rest_with_last)
+        segs = request.split_path(minsegs, maxsegs, rest_with_last)
         validate_device_partition(segs[0], segs[1])
-        return segs
+        return [wsgi_to_str(seg) for seg in segs]
     except ValueError as err:
         raise HTTPBadRequest(body=str(err), request=request,
                              content_type='text/plain')
@@ -250,6 +363,39 @@ def get_object_transient_sysmeta(key):
     return '%s%s' % (OBJECT_TRANSIENT_SYSMETA_PREFIX, key)
 
 
+def get_container_update_override_key(key):
+    """
+    Returns the full X-Object-Sysmeta-Container-Update-Override-* header key.
+
+    :param key: the key you want to override in the container update
+    :returns: the full header key
+    """
+    header = '%s%s' % (OBJECT_SYSMETA_CONTAINER_UPDATE_OVERRIDE_PREFIX, key)
+    return header.title()
+
+
+def get_reserved_name(*parts):
+    """
+    Generate a valid reserved name that joins the component parts.
+
+    :returns: a string
+    """
+    if any(RESERVED in p for p in parts):
+        raise ValueError('Invalid reserved part in components')
+    return RESERVED + RESERVED.join(parts)
+
+
+def split_reserved_name(name):
+    """
+    Separate a valid reserved name into the component parts.
+
+    :returns: a list of strings
+    """
+    if not name.startswith(RESERVED):
+        raise ValueError('Invalid reserved name')
+    return name.split(RESERVED)[1:]
+
+
 def remove_items(headers, condition):
     """
     Removes items from a dict whose keys satisfy
@@ -262,7 +408,7 @@ def remove_items(headers, condition):
     :returns: a dict, possibly empty, of headers that have been removed
     """
     removed = {}
-    keys = filter(condition, headers)
+    keys = [key for key in headers if condition(key)]
     removed.update((key, headers.pop(key)) for key in keys)
     return removed
 
@@ -296,7 +442,7 @@ def check_path_header(req, name, length, error_msg):
     :raise: HTTPPreconditionFailed if header value
             is not well formatted.
     """
-    hdr = unquote(req.headers.get(name))
+    hdr = wsgi_unquote(req.headers.get(name))
     if not hdr.startswith('/'):
         hdr = '/' + hdr
     try:
@@ -379,7 +525,7 @@ class SegmentedIterable(object):
                 # segment is a plain old object, not some flavor of large
                 # object; therefore, its etag is its MD5sum and hence we can
                 # check it.
-                path = seg_path + '?multipart-manifest=get'
+                path = quote(seg_path) + '?multipart-manifest=get'
                 seg_req = make_subrequest(
                     self.req.environ, path=path, method='GET',
                     headers={'x-auth-token': self.req.headers.get(
@@ -447,12 +593,20 @@ class SegmentedIterable(object):
             seg_req = data_or_req
             seg_resp = seg_req.get_response(self.app)
             if not is_success(seg_resp.status_int):
-                close_if_possible(seg_resp.app_iter)
-                raise SegmentError(
-                    'While processing manifest %s, '
-                    'got %d while retrieving %s' %
-                    (self.name, seg_resp.status_int, seg_req.path))
-
+                # Error body should be short
+                body = seg_resp.body
+                if not six.PY2:
+                    body = body.decode('utf8')
+                msg = 'While processing manifest %s, got %d (%s) ' \
+                    'while retrieving %s' % (
+                        self.name, seg_resp.status_int,
+                        body if len(body) <= 60 else body[:57] + '...',
+                        seg_req.path)
+                if is_server_error(seg_resp.status_int):
+                    self.logger.error(msg)
+                    raise HTTPServiceUnavailable(
+                        request=seg_req, content_type='text/plain')
+                raise SegmentError(msg)
             elif ((seg_etag and (seg_resp.etag != seg_etag)) or
                     (seg_size and (seg_resp.content_length != seg_size) and
                      not seg_req.range)):
@@ -475,10 +629,11 @@ class SegmentedIterable(object):
             else:
                 self.current_resp = seg_resp
 
+            resp_len = 0
             seg_hash = None
             if seg_resp.etag and not seg_req.headers.get('Range'):
                 # Only calculate the MD5 if it we can use it to validate
-                seg_hash = hashlib.md5()
+                seg_hash = md5(usedforsecurity=False)
 
             document_iters = maybe_multipart_byteranges_to_document_iters(
                 seg_resp.app_iter,
@@ -487,15 +642,26 @@ class SegmentedIterable(object):
             for chunk in itertools.chain.from_iterable(document_iters):
                 if seg_hash:
                     seg_hash.update(chunk)
+                    resp_len += len(chunk)
                 yield (seg_req.path, chunk)
             close_if_possible(seg_resp.app_iter)
 
-            if seg_hash and seg_hash.hexdigest() != seg_resp.etag:
-                raise SegmentError(
-                    "Bad MD5 checksum in %(name)s for %(seg)s: headers had"
-                    " %(etag)s, but object MD5 was actually %(actual)s" %
-                    {'seg': seg_req.path, 'etag': seg_resp.etag,
-                     'name': self.name, 'actual': seg_hash.hexdigest()})
+            if seg_hash:
+                if resp_len != seg_resp.content_length:
+                    raise SegmentError(
+                        "Bad response length for %(seg)s as part of %(name)s: "
+                        "headers had %(from_headers)s, but response length "
+                        "was actually %(actual)s" %
+                        {'seg': seg_req.path,
+                         'from_headers': seg_resp.content_length,
+                         'name': self.name, 'actual': resp_len})
+                if seg_hash.hexdigest() != seg_resp.etag:
+                    raise SegmentError(
+                        "Bad MD5 checksum for %(seg)s as part of %(name)s: "
+                        "headers had %(etag)s, but object MD5 was actually "
+                        "%(actual)s" %
+                        {'seg': seg_req.path, 'etag': seg_resp.etag,
+                         'name': self.name, 'actual': seg_hash.hexdigest()})
 
     def _byte_counting_iter(self):
         # Checks that we give the client the right number of bytes. Raises
@@ -600,7 +766,7 @@ class SegmentedIterable(object):
         if self.peeked_chunk is not None:
             pc = self.peeked_chunk
             self.peeked_chunk = None
-            return itertools.chain([pc], self.app_iter)
+            return CloseableChain([pc], self.app_iter)
         else:
             return self.app_iter
 
@@ -651,7 +817,7 @@ def http_response_to_document_iters(response, read_chunk_size=4096):
         # extracted from the Content-Type header.
         params = dict(params_list)
         return multipart_byteranges_to_document_iters(
-            response, params['boundary'], read_chunk_size)
+            response, wsgi_to_bytes(params['boundary']), read_chunk_size)
 
 
 def update_etag_is_at_header(req, name):
@@ -715,3 +881,33 @@ def resolve_etag_is_at_header(req, metadata):
                 alternate_etag = metadata[name]
                 break
     return alternate_etag
+
+
+def update_ignore_range_header(req, name):
+    """
+    Helper function to update an X-Backend-Ignore-Range-If-Metadata-Present
+    header whose value is a list of header names which, if any are present
+    on an object, mean the object server should respond with a 200 instead
+    of a 206 or 416.
+
+    :param req: a swob Request
+    :param name: name of a header which, if found, indicates the proxy will
+                 want the whole object
+    """
+    if ',' in name:
+        # HTTP header names should not have commas but we'll check anyway
+        raise ValueError('Header name must not contain commas')
+    hdr = 'X-Backend-Ignore-Range-If-Metadata-Present'
+    req.headers[hdr] = csv_append(req.headers.get(hdr), name)
+
+
+def get_ip_port(node, headers):
+    use_replication_network = False
+    for h, v in headers.items():
+        if h.lower() == USE_REPLICATION_NETWORK_HEADER:
+            use_replication_network = config_true_value(v)
+            break
+    if use_replication_network:
+        return node['replication_ip'], node['replication_port']
+    else:
+        return node['ip'], node['port']

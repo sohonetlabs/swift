@@ -14,9 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import mock
-
 import unittest
-
 import socket
 
 from eventlet import spawn, Timeout
@@ -53,28 +51,32 @@ class TestBufferedHTTP(unittest.TestCase):
             try:
                 with Timeout(3):
                     sock, addr = bindsock.accept()
-                    fp = sock.makefile()
-                    fp.write('HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n'
-                             'RESPONSE')
+                    fp = sock.makefile('rwb')
+                    fp.write(b'HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n'
+                             b'RESPONSE')
                     fp.flush()
+                    line = fp.readline()
+                    path = (b'/dev/' + expected_par +
+                            b'/path/..%25/?omg=&no=%7F&%FF=%FF&no=%25ff')
                     self.assertEqual(
-                        fp.readline(),
-                        'PUT /dev/%s/path/..%%25/?omg&no=%%7f HTTP/1.1\r\n' %
-                        expected_par)
+                        line,
+                        b'PUT ' + path + b' HTTP/1.1\r\n')
                     headers = {}
                     line = fp.readline()
-                    while line and line != '\r\n':
-                        headers[line.split(':')[0].lower()] = \
-                            line.split(':')[1].strip()
+                    while line and line != b'\r\n':
+                        headers[line.split(b':')[0].lower()] = \
+                            line.split(b':')[1].strip()
                         line = fp.readline()
-                    self.assertEqual(headers['content-length'], '7')
-                    self.assertEqual(headers['x-header'], 'value')
-                    self.assertEqual(fp.readline(), 'REQUEST\r\n')
+                    self.assertEqual(headers[b'content-length'], b'7')
+                    self.assertEqual(headers[b'x-header'], b'value')
+                    self.assertEqual(fp.readline(), b'REQUEST\r\n')
             except BaseException as err:
                 return err
             return None
-        for par in ('par', 1357):
-            event = spawn(accept, par)
+        for spawn_par, par in (
+                (b'par', b'par'), (b'up%C3%A5r', u'up\xe5r'),
+                (b'%C3%BCpar', b'\xc3\xbcpar'), (b'1357', 1357)):
+            event = spawn(accept, spawn_par)
             try:
                 with Timeout(3):
                     conn = bufferedhttp.http_connect(
@@ -82,8 +84,8 @@ class TestBufferedHTTP(unittest.TestCase):
                         'PUT', '/path/..%/', {
                             'content-length': 7,
                             'x-header': 'value'},
-                        query_string='omg&no=%7f')
-                    conn.send('REQUEST\r\n')
+                        query_string='omg&no=%7f&\xff=%ff&no=%25ff')
+                    conn.send(b'REQUEST\r\n')
                     self.assertTrue(conn.sock.getsockopt(socket.IPPROTO_TCP,
                                                          socket.TCP_NODELAY))
                     resp = conn.getresponse()
@@ -91,11 +93,55 @@ class TestBufferedHTTP(unittest.TestCase):
                     conn.close()
                     self.assertEqual(resp.status, 200)
                     self.assertEqual(resp.reason, 'OK')
-                    self.assertEqual(body, 'RESPONSE')
+                    self.assertEqual(body, b'RESPONSE')
             finally:
                 err = event.wait()
                 if err:
                     raise Exception(err)
+
+    def test_get_expect(self):
+        bindsock = listen_zero()
+        request = []
+
+        def accept():
+            with Timeout(3):
+                sock, addr = bindsock.accept()
+                fp = sock.makefile('rwb')
+                request.append(fp.readline())
+                fp.write(b'HTTP/1.1 100 Continue\r\n\r\n')
+                fp.flush()
+                fp.write(b'HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\n'
+                         b'RESPONSE')
+                fp.flush()
+
+        server = spawn(accept)
+        try:
+            address = '%s:%s' % ('127.0.0.1', bindsock.getsockname()[1])
+            conn = bufferedhttp.BufferedHTTPConnection(address)
+            conn.putrequest('GET', '/path')
+            conn.endheaders()
+            resp = conn.getexpect()
+            self.assertIsInstance(resp, bufferedhttp.BufferedHTTPResponse)
+            self.assertEqual(resp.status, 100)
+            self.assertEqual(resp.version, 11)
+            self.assertEqual(resp.reason, 'Continue')
+            # I don't think you're supposed to "read" a continue response
+            self.assertRaises(AssertionError, resp.read)
+
+            resp = conn.getresponse()
+            self.assertIsInstance(resp, bufferedhttp.BufferedHTTPResponse)
+            self.assertEqual(resp.read(), b'RESPONSE')
+
+        finally:
+            server.wait()
+        self.assertEqual(request[0], b'GET /path HTTP/1.1\r\n')
+
+    def test_closed_response(self):
+        resp = bufferedhttp.BufferedHTTPResponse(None)
+        self.assertEqual(resp.status, 'UNKNOWN')
+        self.assertEqual(resp.version, 'UNKNOWN')
+        self.assertEqual(resp.reason, 'UNKNOWN')
+        self.assertEqual(resp.read(), b'')
 
     def test_nonstr_header_values(self):
         with mock.patch('swift.common.bufferedhttp.HTTPSConnection',

@@ -19,7 +19,6 @@ import socket
 
 from collections import defaultdict
 
-from swift import gettext_ as _
 from random import shuffle
 from time import time
 import functools
@@ -29,20 +28,26 @@ from eventlet import Timeout
 
 from swift import __canonical_version__ as swift_version
 from swift.common import constraints
+from swift.common.http import is_server_error
 from swift.common.storage_policy import POLICIES
 from swift.common.ring import Ring
-from swift.common.utils import cache_from_env, get_logger, \
+from swift.common.error_limiter import ErrorLimiter
+from swift.common.utils import Watchdog, get_logger, \
     get_remote_client, split_path, config_true_value, generate_trans_id, \
     affinity_key_function, affinity_locality_predicate, list_from_csv, \
-    register_swift_info, readconf, config_auto_int_value
+    parse_prefixed_conf, config_auto_int_value, node_to_string, \
+    config_request_node_count_value, config_percent_value
+from swift.common.registry import register_swift_info
 from swift.common.constraints import check_utf8, valid_api_version
 from swift.proxy.controllers import AccountController, ContainerController, \
     ObjectControllerRouter, InfoController
 from swift.proxy.controllers.base import get_container_info, NodeIter, \
-    DEFAULT_RECHECK_CONTAINER_EXISTENCE, DEFAULT_RECHECK_ACCOUNT_EXISTENCE
+    DEFAULT_RECHECK_CONTAINER_EXISTENCE, DEFAULT_RECHECK_ACCOUNT_EXISTENCE, \
+    DEFAULT_RECHECK_UPDATING_SHARD_RANGES, DEFAULT_RECHECK_LISTING_SHARD_RANGES
 from swift.common.swob import HTTPBadRequest, HTTPForbidden, \
     HTTPMethodNotAllowed, HTTPNotFound, HTTPPreconditionFailed, \
-    HTTPServerError, HTTPException, Request, HTTPServiceUnavailable
+    HTTPServerError, HTTPException, Request, HTTPServiceUnavailable, \
+    wsgi_to_str
 from swift.common.exceptions import APIVersionError
 
 
@@ -87,6 +92,9 @@ def _label_for_policy(policy):
     return '(default)'
 
 
+VALID_SORTING_METHODS = ('shuffle', 'timing', 'affinity')
+
+
 class ProxyOverrideOptions(object):
     """
     Encapsulates proxy server options that may be overridden e.g. for
@@ -95,11 +103,17 @@ class ProxyOverrideOptions(object):
     :param conf: the proxy-server config dict.
     :param override_conf: a dict of overriding configuration options.
     """
-    def __init__(self, base_conf, override_conf):
+    def __init__(self, base_conf, override_conf, app):
+
         def get(key, default):
             return override_conf.get(key, base_conf.get(key, default))
 
         self.sorting_method = get('sorting_method', 'shuffle').lower()
+        if self.sorting_method not in VALID_SORTING_METHODS:
+            raise ValueError(
+                'Invalid sorting_method value; must be one of %s, not %r' % (
+                    ', '.join(VALID_SORTING_METHODS), self.sorting_method))
+
         self.read_affinity = get('read_affinity', '')
         try:
             self.read_affinity_sort_key = affinity_key_function(
@@ -107,7 +121,7 @@ class ProxyOverrideOptions(object):
         except ValueError as err:
             # make the message a little more useful
             raise ValueError("Invalid read_affinity value: %r (%s)" %
-                             (self.read_affinity, err.message))
+                             (self.read_affinity, err.args[0]))
 
         self.write_affinity = get('write_affinity', '')
         try:
@@ -116,7 +130,7 @@ class ProxyOverrideOptions(object):
         except ValueError as err:
             # make the message a little more useful
             raise ValueError("Invalid write_affinity value: %r (%s)" %
-                             (self.write_affinity, err.message))
+                             (self.write_affinity, err.args[0]))
         self.write_affinity_node_count = get(
             'write_affinity_node_count', '2 * replicas').lower()
         value = self.write_affinity_node_count.split()
@@ -136,14 +150,28 @@ class ProxyOverrideOptions(object):
             get('write_affinity_handoff_delete_count', 'auto'), None
         )
 
+        self.rebalance_missing_suppression_count = int(get(
+            'rebalance_missing_suppression_count', 1))
+        self.concurrent_gets = config_true_value(get('concurrent_gets', False))
+        self.concurrency_timeout = float(get(
+            'concurrency_timeout', app.conn_timeout))
+        self.concurrent_ec_extra_requests = int(get(
+            'concurrent_ec_extra_requests', 0))
+
     def __repr__(self):
-        return '%s({}, {%s})' % (self.__class__.__name__, ', '.join(
-            '%r: %r' % (k, getattr(self, k)) for k in (
-                'sorting_method',
-                'read_affinity',
-                'write_affinity',
-                'write_affinity_node_count',
-                'write_affinity_handoff_delete_count')))
+        return '%s({}, {%s}, app)' % (
+            self.__class__.__name__, ', '.join(
+                '%r: %r' % (k, getattr(self, k)) for k in (
+                    'sorting_method',
+                    'read_affinity',
+                    'write_affinity',
+                    'write_affinity_node_count',
+                    'write_affinity_handoff_delete_count',
+                    'rebalance_missing_suppression_count',
+                    'concurrent_gets',
+                    'concurrency_timeout',
+                    'concurrent_ec_extra_requests',
+                )))
 
     def __eq__(self, other):
         if not isinstance(other, ProxyOverrideOptions):
@@ -153,25 +181,31 @@ class ProxyOverrideOptions(object):
             'read_affinity',
             'write_affinity',
             'write_affinity_node_count',
-            'write_affinity_handoff_delete_count'))
+            'write_affinity_handoff_delete_count',
+            'rebalance_missing_suppression_count',
+            'concurrent_gets',
+            'concurrency_timeout',
+            'concurrent_ec_extra_requests',
+        ))
 
 
 class Application(object):
     """WSGI application for the proxy server."""
 
-    def __init__(self, conf, memcache=None, logger=None, account_ring=None,
+    def __init__(self, conf, logger=None, account_ring=None,
                  container_ring=None):
+        # This is for the sake of tests which instantiate an Application
+        # directly rather than via loadapp().
+        self._pipeline_final_app = self
+
         if conf is None:
             conf = {}
         if logger is None:
-            self.logger = get_logger(conf, log_route='proxy-server')
+            self.logger = get_logger(conf, log_route='proxy-server',
+                                     statsd_tail_prefix='proxy-server')
         else:
             self.logger = logger
-        self._override_options = self._load_per_policy_config(conf)
-        self.sorts_by_timing = any(pc.sorting_method == 'timing'
-                                   for pc in self._override_options.values())
-
-        self._error_limiting = {}
+        self.backend_user_agent = 'proxy-server %s' % os.getpid()
 
         swift_dir = conf.get('swift_dir', '/etc/swift')
         self.swift_dir = swift_dir
@@ -179,22 +213,39 @@ class Application(object):
         self.recoverable_node_timeout = float(
             conf.get('recoverable_node_timeout', self.node_timeout))
         self.conn_timeout = float(conf.get('conn_timeout', 0.5))
-        self.client_timeout = int(conf.get('client_timeout', 60))
-        self.put_queue_depth = int(conf.get('put_queue_depth', 10))
+        self.client_timeout = float(conf.get('client_timeout', 60))
         self.object_chunk_size = int(conf.get('object_chunk_size', 65536))
         self.client_chunk_size = int(conf.get('client_chunk_size', 65536))
         self.trans_id_suffix = conf.get('trans_id_suffix', '')
         self.post_quorum_timeout = float(conf.get('post_quorum_timeout', 0.5))
-        self.error_suppression_interval = \
-            int(conf.get('error_suppression_interval', 60))
-        self.error_suppression_limit = \
+        error_suppression_interval = \
+            float(conf.get('error_suppression_interval', 60))
+        error_suppression_limit = \
             int(conf.get('error_suppression_limit', 10))
+        self.error_limiter = ErrorLimiter(error_suppression_interval,
+                                          error_suppression_limit)
         self.recheck_container_existence = \
             int(conf.get('recheck_container_existence',
                          DEFAULT_RECHECK_CONTAINER_EXISTENCE))
+        self.recheck_updating_shard_ranges = \
+            int(conf.get('recheck_updating_shard_ranges',
+                         DEFAULT_RECHECK_UPDATING_SHARD_RANGES))
+        self.recheck_listing_shard_ranges = \
+            int(conf.get('recheck_listing_shard_ranges',
+                         DEFAULT_RECHECK_LISTING_SHARD_RANGES))
         self.recheck_account_existence = \
             int(conf.get('recheck_account_existence',
                          DEFAULT_RECHECK_ACCOUNT_EXISTENCE))
+        self.container_existence_skip_cache = config_percent_value(
+            conf.get('container_existence_skip_cache_pct', 0))
+        self.container_updating_shard_ranges_skip_cache = \
+            config_percent_value(conf.get(
+                'container_updating_shard_ranges_skip_cache_pct', 0))
+        self.container_listing_shard_ranges_skip_cache = \
+            config_percent_value(conf.get(
+                'container_listing_shard_ranges_skip_cache_pct', 0))
+        self.account_existence_skip_cache = config_percent_value(
+            conf.get('account_existence_skip_cache_pct', 0))
         self.allow_account_management = \
             config_true_value(conf.get('allow_account_management', 'no'))
         self.container_ring = container_ring or Ring(swift_dir,
@@ -205,13 +256,22 @@ class Application(object):
         for policy in POLICIES:
             policy.load_ring(swift_dir)
         self.obj_controller_router = ObjectControllerRouter()
-        self.memcache = memcache
         mimetypes.init(mimetypes.knownfiles +
                        [os.path.join(swift_dir, 'mime.types')])
         self.account_autocreate = \
             config_true_value(conf.get('account_autocreate', 'no'))
-        self.auto_create_account_prefix = (
-            conf.get('auto_create_account_prefix') or '.')
+        if conf.get('auto_create_account_prefix'):
+            self.logger.warning('Option auto_create_account_prefix is '
+                                'deprecated. Configure '
+                                'auto_create_account_prefix under the '
+                                'swift-constraints section of '
+                                'swift.conf. This option will '
+                                'be ignored in a future release.')
+            self.auto_create_account_prefix = \
+                conf['auto_create_account_prefix']
+        else:
+            self.auto_create_account_prefix = \
+                constraints.AUTO_CREATE_ACCOUNT_PREFIX
         self.expiring_objects_account = self.auto_create_account_prefix + \
             (conf.get('expiring_objects_account_name') or 'expiring_objects')
         self.expiring_objects_container_divisor = \
@@ -238,20 +298,8 @@ class Application(object):
             conf.get('strict_cors_mode', 't'))
         self.node_timings = {}
         self.timing_expiry = int(conf.get('timing_expiry', 300))
-        self.concurrent_gets = \
-            config_true_value(conf.get('concurrent_gets'))
-        self.concurrency_timeout = float(conf.get('concurrency_timeout',
-                                                  self.conn_timeout))
-        value = conf.get('request_node_count', '2 * replicas').lower().split()
-        if len(value) == 1:
-            rnc_value = int(value[0])
-            self.request_node_count = lambda replicas: rnc_value
-        elif len(value) == 3 and value[1] == '*' and value[2] == 'replicas':
-            rnc_value = int(value[0])
-            self.request_node_count = lambda replicas: rnc_value * replicas
-        else:
-            raise ValueError(
-                'Invalid request_node_count value: %r' % ''.join(value))
+        value = conf.get('request_node_count', '2 * replicas')
+        self.request_node_count = config_request_node_count_value(value)
         # swift_owner_headers are stripped by the account and container
         # controllers; we should extend header stripping to object controller
         # when a privileged object header is implemented.
@@ -265,6 +313,17 @@ class Application(object):
         self.swift_owner_headers = [
             name.strip().title()
             for name in swift_owner_headers.split(',') if name.strip()]
+
+        # When upgrading from liberasurecode<=1.5.0, you may want to continue
+        # writing legacy CRCs until all nodes are upgraded and capabale of
+        # reading fragments with zlib CRCs.
+        # See https://bugs.launchpad.net/liberasurecode/+bug/1886088 for more
+        # information.
+        if 'write_legacy_ec_crc' in conf:
+            os.environ['LIBERASURECODE_WRITE_LEGACY_CRC'] = \
+                '1' if config_true_value(conf['write_legacy_ec_crc']) else '0'
+        # else, assume operators know what they're doing and leave env alone
+
         # Initialization was successful, so now apply the client chunk size
         # parameter as the default read / write buffer size for the network
         # sockets.
@@ -283,8 +342,15 @@ class Application(object):
         self.expose_info = config_true_value(
             conf.get('expose_info', 'yes'))
         self.disallowed_sections = list_from_csv(
-            conf.get('disallowed_sections', 'swift.valid_api_versions'))
+            conf.get('disallowed_sections', ', '.join([
+                'swift.auto_create_account_prefix',
+                'swift.valid_api_versions',
+            ])))
         self.admin_key = conf.get('admin_key', None)
+        self._override_options = self._load_per_policy_config(conf)
+        self.sorts_by_timing = any(pc.sorting_method == 'timing'
+                                   for pc in self._override_options.values())
+
         register_swift_info(
             version=swift_version,
             strict_cors_mode=self.strict_cors_mode,
@@ -292,16 +358,18 @@ class Application(object):
             allow_account_management=self.allow_account_management,
             account_autocreate=self.account_autocreate,
             **constraints.EFFECTIVE_CONSTRAINTS)
+        self.watchdog = Watchdog()
+        self.watchdog.spawn()
 
     def _make_policy_override(self, policy, conf, override_conf):
         label_for_policy = _label_for_policy(policy)
         try:
-            override = ProxyOverrideOptions(conf, override_conf)
+            override = ProxyOverrideOptions(conf, override_conf, self)
             self.logger.debug("Loaded override config for %s: %r" %
                               (label_for_policy, override))
             return override
         except ValueError as err:
-            raise ValueError(err.message + ' for %s' % label_for_policy)
+            raise ValueError('%s for %s' % (err, label_for_policy))
 
     def _load_per_policy_config(self, conf):
         """
@@ -333,27 +401,29 @@ class Application(object):
                 raise ValueError(
                     "No policy found for override config, index: %s" % index)
             override = self._make_policy_override(policy, conf, override_conf)
-            overrides[policy] = override
+            overrides[index] = override
         return overrides
 
     def get_policy_options(self, policy):
         """
         Return policy specific options.
 
-        :param policy: an instance of :class:`BaseStoragePolicy`
+        :param policy: an instance of :class:`BaseStoragePolicy` or ``None``
         :return: an instance of :class:`ProxyOverrideOptions`
         """
-        return self._override_options[policy]
+        return self._override_options[policy and policy.idx]
 
     def check_config(self):
         """
         Check the configuration for possible errors
         """
-        for policy, options in self._override_options.items():
+        for policy_idx, options in self._override_options.items():
+            policy = (None if policy_idx is None
+                      else POLICIES.get_by_index(policy_idx))
             if options.read_affinity and options.sorting_method != 'affinity':
                 self.logger.warning(
-                    _("sorting_method is set to '%(method)s', not 'affinity'; "
-                      "%(label)s read_affinity setting will have no effect."),
+                    "sorting_method is set to '%(method)s', not 'affinity'; "
+                    "%(label)s read_affinity setting will have no effect.",
                     {'label': _label_for_policy(policy),
                      'method': options.sorting_method})
 
@@ -383,7 +453,8 @@ class Application(object):
                      admin_key=self.admin_key)
             return InfoController, d
 
-        version, account, container, obj = split_path(req.path, 1, 4, True)
+        version, account, container, obj = split_path(
+            wsgi_to_str(req.path), 1, 4, True)
         d = dict(version=version,
                  account_name=account,
                  container_name=container,
@@ -392,6 +463,8 @@ class Application(object):
             raise APIVersionError('Invalid path')
         if obj and container and account:
             info = get_container_info(req.environ, self)
+            if is_server_error(info.get('status')):
+                raise HTTPServiceUnavailable(request=req)
             policy_index = req.headers.get('X-Backend-Storage-Policy-Index',
                                            info['storage_policy'])
             policy = POLICIES.get_by_index(policy_index)
@@ -422,8 +495,6 @@ class Application(object):
         :param start_response: WSGI callable
         """
         try:
-            if self.memcache is None:
-                self.memcache = cache_from_env(env, True)
             req = self.update_request(Request(env))
             return self.handle_request(req)(env, start_response)
         except UnicodeError:
@@ -433,12 +504,19 @@ class Application(object):
         except (Exception, Timeout):
             start_response('500 Server Error',
                            [('Content-Type', 'text/plain')])
-            return ['Internal server error.\n']
+            return [b'Internal server error.\n']
 
     def update_request(self, req):
         if 'x-storage-token' in req.headers and \
                 'x-auth-token' not in req.headers:
             req.headers['x-auth-token'] = req.headers['x-storage-token']
+        te = req.headers.get('transfer-encoding', '').lower()
+        if te.rsplit(',', 1)[-1].strip() == 'chunked' and \
+                'content-length' in req.headers:
+            # RFC says if both are present, transfer-encoding wins.
+            # Definitely *don't* forward on the header the backend
+            # ought to ignore; that offers request-smuggling vectors.
+            del req.headers['content-length']
         return req
 
     def handle_request(self, req):
@@ -449,14 +527,14 @@ class Application(object):
         :param req: swob.Request object
         """
         try:
-            self.logger.set_statsd_prefix('proxy-server')
             if req.content_length and req.content_length < 0:
                 self.logger.increment('errors')
                 return HTTPBadRequest(request=req,
                                       body='Invalid Content-Length')
 
             try:
-                if not check_utf8(req.path_info):
+                if not check_utf8(wsgi_to_str(req.path_info),
+                                  internal=req.allow_reserved_names):
                     self.logger.increment('errors')
                     return HTTPPreconditionFailed(
                         request=req, body='Invalid UTF8 or contains NULL')
@@ -480,8 +558,6 @@ class Application(object):
                     req.host.split(':')[0] in self.deny_host_headers:
                 return HTTPForbidden(request=req, body='Invalid host header')
 
-            self.logger.set_statsd_prefix('proxy-server.' +
-                                          controller.server_type.lower())
             controller = controller(self, **path_parts)
             if 'swift.trans_id' not in req.environ:
                 # if this wasn't set by an earlier middleware, set it now
@@ -496,9 +572,14 @@ class Application(object):
             controller.trans_id = req.environ['swift.trans_id']
             self.logger.client_ip = get_remote_client(req)
 
-            if req.method not in controller.allowed_methods:
+            allowed_methods = controller.allowed_methods
+            if config_true_value(req.headers.get(
+                    'X-Backend-Allow-Private-Methods', False)):
+                allowed_methods = set(allowed_methods).union(
+                    controller.private_methods)
+            if req.method not in allowed_methods:
                 return HTTPMethodNotAllowed(request=req, headers={
-                    'Allow': ', '.join(controller.allowed_methods)})
+                    'Allow': ', '.join(allowed_methods)})
             handler = getattr(controller, req.method)
 
             old_authorize = None
@@ -531,7 +612,7 @@ class Application(object):
         except HTTPException as error_response:
             return error_response
         except (Exception, Timeout):
-            self.logger.exception(_('ERROR Unhandled exception in request'))
+            self.logger.exception('ERROR Unhandled exception in request')
             return HTTPServerError(request=req)
 
     def sort_nodes(self, nodes, policy=None):
@@ -567,9 +648,6 @@ class Application(object):
         timing = round(timing, 3)  # sort timings to the millisecond
         self.node_timings[node['ip']] = (timing, now + self.timing_expiry)
 
-    def _error_limit_node_key(self, node):
-        return "{ip}:{port}/{device}".format(**node)
-
     def error_limited(self, node):
         """
         Check if the node is currently error limited.
@@ -577,20 +655,10 @@ class Application(object):
         :param node: dictionary of node to check
         :returns: True if error limited, False otherwise
         """
-        now = time()
-        node_key = self._error_limit_node_key(node)
-        error_stats = self._error_limiting.get(node_key)
-
-        if error_stats is None or 'errors' not in error_stats:
-            return False
-        if 'last_error' in error_stats and error_stats['last_error'] < \
-                now - self.error_suppression_interval:
-            self._error_limiting.pop(node_key, None)
-            return False
-        limited = error_stats['errors'] > self.error_suppression_limit
+        limited = self.error_limiter.is_limited(node)
         if limited:
             self.logger.debug(
-                _('Node error limited %(ip)s:%(port)s (%(device)s)'), node)
+                'Node error limited: %s', node_to_string(node))
         return limited
 
     def error_limit(self, node, msg):
@@ -598,24 +666,14 @@ class Application(object):
         Mark a node as error limited. This immediately pretends the
         node received enough errors to trigger error suppression. Use
         this for errors like Insufficient Storage. For other errors
-        use :func:`error_occurred`.
+        use :func:`increment`.
 
         :param node: dictionary of node to error limit
         :param msg: error message
         """
-        node_key = self._error_limit_node_key(node)
-        error_stats = self._error_limiting.setdefault(node_key, {})
-        error_stats['errors'] = self.error_suppression_limit + 1
-        error_stats['last_error'] = time()
-        self.logger.error(_('%(msg)s %(ip)s:%(port)s/%(device)s'),
-                          {'msg': msg, 'ip': node['ip'],
-                          'port': node['port'], 'device': node['device']})
-
-    def _incr_node_errors(self, node):
-        node_key = self._error_limit_node_key(node)
-        error_stats = self._error_limiting.setdefault(node_key, {})
-        error_stats['errors'] = error_stats.get('errors', 0) + 1
-        error_stats['last_error'] = time()
+        self.error_limiter.limit(node)
+        self.logger.error('%(msg)s %(node)s',
+                          {'msg': msg, 'node': node_to_string(node)})
 
     def error_occurred(self, node, msg):
         """
@@ -624,13 +682,14 @@ class Application(object):
         :param node: dictionary of node to handle errors for
         :param msg: error message
         """
-        self._incr_node_errors(node)
-        self.logger.error(_('%(msg)s %(ip)s:%(port)s/%(device)s'),
-                          {'msg': msg.decode('utf-8'), 'ip': node['ip'],
-                          'port': node['port'], 'device': node['device']})
+        self.error_limiter.increment(node)
+        if isinstance(msg, bytes):
+            msg = msg.decode('utf-8')
+        self.logger.error('%(msg)s %(node)s',
+                          {'msg': msg, 'node': node_to_string(node)})
 
-    def iter_nodes(self, ring, partition, node_iter=None, policy=None):
-        return NodeIter(self, ring, partition, node_iter=node_iter,
+    def iter_nodes(self, ring, partition, logger, node_iter=None, policy=None):
+        return NodeIter(self, ring, partition, logger, node_iter=node_iter,
                         policy=policy)
 
     def exception_occurred(self, node, typ, additional_info,
@@ -642,7 +701,7 @@ class Application(object):
         :param typ: server type
         :param additional_info: additional information to log
         """
-        self._incr_node_errors(node)
+        self.error_limiter.increment(node)
         if 'level' in kwargs:
             log = functools.partial(self.logger.log, kwargs.pop('level'))
             if 'exc_info' not in kwargs:
@@ -651,10 +710,9 @@ class Application(object):
             log = self.logger.exception
         if isinstance(additional_info, bytes):
             additional_info = additional_info.decode('utf-8')
-        log(_('ERROR with %(type)s server %(ip)s:%(port)s/%(device)s'
-              ' re: %(info)s'),
-            {'type': typ, 'ip': node['ip'],
-             'port': node['port'], 'device': node['device'],
+        log('ERROR with %(type)s server %(node)s'
+            ' re: %(info)s',
+            {'type': typ, 'node': node_to_string(node),
              'info': additional_info},
             **kwargs)
 
@@ -677,18 +735,18 @@ class Application(object):
                     except ValueError:  # not in pipeline; ignore it
                         pass
                 self.logger.info(
-                    _('Adding required filter %(filter_name)s to pipeline at '
-                      'position %(insert_at)d'),
+                    'Adding required filter %(filter_name)s to pipeline at '
+                    'position %(insert_at)d',
                     {'filter_name': filter_name, 'insert_at': insert_at})
                 ctx = pipe.create_filter(filter_name)
                 pipe.insert_filter(ctx, index=insert_at)
                 pipeline_was_modified = True
 
         if pipeline_was_modified:
-            self.logger.info(_("Pipeline was modified. "
-                               "New pipeline is \"%s\"."), pipe)
+            self.logger.info("Pipeline was modified. "
+                             "New pipeline is \"%s\".", pipe)
         else:
-            self.logger.debug(_("Pipeline is \"%s\""), pipe)
+            self.logger.debug("Pipeline is \"%s\"", pipe)
 
 
 def parse_per_policy_config(conf):
@@ -701,15 +759,8 @@ def parse_per_policy_config(conf):
     :return: a dict mapping policy reference -> dict of policy options
     :raises ValueError: if a policy config section has an invalid name
     """
-    policy_config = {}
-    all_conf = readconf(conf['__file__'])
     policy_section_prefix = conf['__name__'] + ':policy:'
-    for section, options in all_conf.items():
-        if not section.startswith(policy_section_prefix):
-            continue
-        policy_ref = section[len(policy_section_prefix):]
-        policy_config[policy_ref] = options
-    return policy_config
+    return parse_prefixed_conf(conf['__file__'], policy_section_prefix)
 
 
 def app_factory(global_conf, **local_conf):

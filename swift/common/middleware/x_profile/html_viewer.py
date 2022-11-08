@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import cgi
 import os
 import random
 import re
@@ -21,9 +20,14 @@ import string
 import tempfile
 
 from swift import gettext_ as _
-from exceptions import PLOTLIBNotInstalled, ODFLIBNotInstalled,\
-    NotFoundException, MethodNotAllowed, DataLoadFailure, ProfileException
-from profile_model import Stats2
+from swift.common.middleware.x_profile.exceptions import PLOTLIBNotInstalled
+from swift.common.middleware.x_profile.exceptions import ODFLIBNotInstalled
+from swift.common.middleware.x_profile.exceptions import NotFoundException
+from swift.common.middleware.x_profile.exceptions import MethodNotAllowed
+from swift.common.middleware.x_profile.exceptions import DataLoadFailure
+from swift.common.middleware.x_profile.exceptions import ProfileException
+from swift.common.middleware.x_profile.profile_model import Stats2
+from swift.common.request_helpers import html_escape
 
 PLOTLIB_INSTALLED = True
 try:
@@ -319,8 +323,7 @@ class HTMLViewer(object):
         if not fulldirs:
             stats.strip_dirs()
         stats.sort_stats(sort)
-        nfl_filter_esc =\
-            nfl_filter.replace('(', '\(').replace(')', '\)')
+        nfl_filter_esc = nfl_filter.replace(r'(', r'\(').replace(r')', r'\)')
         amount = [nfl_filter_esc, limit] if nfl_filter_esc else [limit]
         profile_html = self.generate_stats_html(stats, self.app_path,
                                                 profile_id, *amount)
@@ -368,7 +371,7 @@ class HTMLViewer(object):
         if len(log_files) == 0:
             raise NotFoundException(_('no log file found'))
         try:
-            nfl_esc = nfl_filter.replace('(', '\(').replace(')', '\)')
+            nfl_esc = nfl_filter.replace(r'(', r'\(').replace(r')', r'\)')
             # remove the slash that is intentionally added in the URL
             # to avoid failure of filtering stats data.
             if nfl_esc.startswith('/'):
@@ -451,15 +454,15 @@ class HTMLViewer(object):
                 fmt = '<span id="L%d" rel="#L%d">%' + max_width\
                     + 'd|<code>%s</code></span>'
                 for line in lines:
-                    l = cgi.escape(line, quote=None)
+                    el = html_escape(line)
                     i = i + 1
                     if i == lineno:
                         fmt2 = '<span id="L%d" style="background-color: \
                             rgb(127,255,127)">%' + max_width +\
                             'd|<code>%s</code></span>'
-                        data.append(fmt2 % (i, i, l))
+                        data.append(fmt2 % (i, i, el))
                     else:
-                        data.append(fmt % (i, i, i, l))
+                        data.append(fmt % (i, i, i, el))
             data = ''.join(data)
         except Exception:
             return _('Can not access the file %s.') % file_path
@@ -515,7 +518,7 @@ class HTMLViewer(object):
                         html.append('<td>-</td>')
                     else:
                         html.append('<td>%f</td>' % (float(ct) / cc))
-                    nfls = cgi.escape(stats.func_std_string(func))
+                    nfls = html_escape(stats.func_std_string(func))
                     if nfls.split(':')[0] not in ['', 'profile'] and\
                             os.path.isfile(nfls.split(':')[0]):
                         html.append('<td><a href="%s/%s%s?format=python#L%d">\
@@ -529,5 +532,5 @@ class HTMLViewer(object):
                                 --></a></td></tr>' % (app_path,
                                                       profile_id, nfls))
         except Exception as ex:
-            html.append("Exception:" % str(ex))
+            html.append("Exception:" + str(ex))
         return ''.join(html)

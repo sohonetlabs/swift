@@ -13,11 +13,13 @@
 
 import time
 from collections import defaultdict
+import functools
 import socket
 import itertools
 import logging
 
 from eventlet import GreenPile, GreenPool, Timeout
+import six
 
 from swift.common import constraints
 from swift.common.daemon import Daemon
@@ -25,11 +27,13 @@ from swift.common.direct_client import (
     direct_head_container, direct_delete_container_object,
     direct_put_container_object, ClientException)
 from swift.common.internal_client import InternalClient, UnexpectedResponse
+from swift.common.request_helpers import MISPLACED_OBJECTS_ACCOUNT, \
+    USE_REPLICATION_NETWORK_HEADER
 from swift.common.utils import get_logger, split_path, majority_size, \
     FileLikeIter, Timestamp, last_modified_date_to_timestamp, \
-    LRUCache, decode_timestamps
+    LRUCache, decode_timestamps, hash_path
+from swift.common.storage_policy import POLICIES
 
-MISPLACED_OBJECTS_ACCOUNT = '.misplaced_objects'
 MISPLACED_OBJECTS_CONTAINER_DIVISOR = 3600  # 1 hour
 CONTAINER_POLICY_TTL = 30
 
@@ -54,6 +58,14 @@ def cmp_policy_info(info, remote_info):
         return (info['delete_timestamp'] > info['put_timestamp'] and
                 info.get('count', info.get('object_count', 0)) == 0)
 
+    def cmp(a, b):
+        if a < b:
+            return -1
+        elif b < a:
+            return 1
+        else:
+            return 0
+
     deleted = is_deleted(info)
     remote_deleted = is_deleted(remote_info)
     if any([deleted, remote_deleted]):
@@ -75,8 +87,13 @@ def cmp_policy_info(info, remote_info):
             return 1
         elif not remote_recreated:
             return -1
-        return cmp(remote_info['status_changed_at'],
-                   info['status_changed_at'])
+        # both have been recreated, everything devoles to here eventually
+        most_recent_successful_delete = max(info['delete_timestamp'],
+                                            remote_info['delete_timestamp'])
+        if info['put_timestamp'] < most_recent_successful_delete:
+            return 1
+        elif remote_info['put_timestamp'] < most_recent_successful_delete:
+            return -1
     return cmp(info['status_changed_at'], remote_info['status_changed_at'])
 
 
@@ -87,12 +104,12 @@ def incorrect_policy_index(info, remote_info):
     """
     if 'storage_policy_index' not in remote_info:
         return False
-    if remote_info['storage_policy_index'] == \
-            info['storage_policy_index']:
+    if remote_info['storage_policy_index'] == info['storage_policy_index']:
         return False
 
-    return info['storage_policy_index'] != sorted(
-        [info, remote_info], cmp=cmp_policy_info)[0]['storage_policy_index']
+    # Only return True if remote_info has the better data;
+    # see the docstring for cmp_policy_info
+    return cmp_policy_info(info, remote_info) > 0
 
 
 def translate_container_headers_to_info(headers):
@@ -109,8 +126,9 @@ def translate_container_headers_to_info(headers):
 
 
 def best_policy_index(headers):
-    container_info = map(translate_container_headers_to_info, headers)
-    container_info.sort(cmp=cmp_policy_info)
+    container_info = [translate_container_headers_to_info(header_set)
+                      for header_set in headers]
+    container_info.sort(key=functools.cmp_to_key(cmp_policy_info))
     return container_info[0]['storage_policy_index']
 
 
@@ -148,8 +166,8 @@ def get_reconciler_content_type(op):
 
 
 def get_row_to_q_entry_translator(broker):
-    account = broker.account
-    container = broker.container
+    account = broker.root_account
+    container = broker.root_container
     op_type = {
         0: get_reconciler_content_type('put'),
         1: get_reconciler_content_type('delete'),
@@ -213,6 +231,7 @@ def add_to_reconciler_queue(container_ring, account, container, obj,
         'X-Etag': obj_timestamp,
         'X-Timestamp': x_timestamp,
         'X-Content-Type': q_op_type,
+        USE_REPLICATION_NETWORK_HEADER: 'true',
     }
 
     def _check_success(*args, **kwargs):
@@ -253,7 +272,10 @@ def parse_raw_obj(obj_info):
     :returns: a queue entry dict with the keys: q_policy_index, account,
               container, obj, q_op, q_ts, q_record, and path
     """
-    raw_obj_name = obj_info['name'].encode('utf-8')
+    if six.PY2:
+        raw_obj_name = obj_info['name'].encode('utf-8')
+    else:
+        raw_obj_name = obj_info['name']
 
     policy_index, obj_name = raw_obj_name.split(':', 1)
     q_policy_index = int(policy_index)
@@ -293,7 +315,8 @@ def direct_get_container_policy_index(container_ring, account_name,
     """
     def _eat_client_exception(*args):
         try:
-            return direct_head_container(*args)
+            return direct_head_container(*args, headers={
+                USE_REPLICATION_NETWORK_HEADER: 'true'})
         except ClientException as err:
             if err.http_status == 404:
                 return err.http_headers
@@ -319,6 +342,10 @@ def direct_delete_container_entry(container_ring, account_name, container_name,
     object listing. Does not talk to object servers; use this only when a
     container entry does not actually have a corresponding object.
     """
+    if headers is None:
+        headers = {}
+    headers[USE_REPLICATION_NETWORK_HEADER] = 'true'
+
     pool = GreenPool()
     part, nodes = container_ring.get_nodes(account_name, container_name)
     for node in nodes:
@@ -334,23 +361,45 @@ class ContainerReconciler(Daemon):
     """
     Move objects that are in the wrong storage policy.
     """
+    log_route = 'container-reconciler'
 
-    def __init__(self, conf):
+    def __init__(self, conf, logger=None, swift=None):
         self.conf = conf
         # This option defines how long an un-processable misplaced object
         # marker will be retried before it is abandoned.  It is not coupled
         # with the tombstone reclaim age in the consistency engine.
         self.reclaim_age = int(conf.get('reclaim_age', 86400 * 7))
-        self.interval = int(conf.get('interval', 30))
+        self.interval = float(conf.get('interval', 30))
         conf_path = conf.get('__file__') or \
             '/etc/swift/container-reconciler.conf'
-        self.logger = get_logger(conf, log_route='container-reconciler')
+        self.logger = logger or get_logger(
+            conf, log_route=self.log_route)
         request_tries = int(conf.get('request_tries') or 3)
-        self.swift = InternalClient(conf_path,
-                                    'Swift Container Reconciler',
-                                    request_tries)
+        self.swift = swift or InternalClient(
+            conf_path,
+            'Swift Container Reconciler',
+            request_tries,
+            use_replication_network=True,
+            global_conf={'log_name': '%s-ic' % conf.get(
+                'log_name', self.log_route)})
+        self.swift_dir = conf.get('swift_dir', '/etc/swift')
         self.stats = defaultdict(int)
         self.last_stat_time = time.time()
+        self.ring_check_interval = float(conf.get('ring_check_interval', 15))
+        self.concurrency = int(conf.get('concurrency', 1))
+        if self.concurrency < 1:
+            raise ValueError("concurrency must be set to at least 1")
+        self.processes = int(self.conf.get('processes', 0))
+        if self.processes < 0:
+            raise ValueError(
+                'processes must be an integer greater than or equal to 0')
+        self.process = int(self.conf.get('process', 0))
+        if self.process < 0:
+            raise ValueError(
+                'process must be an integer greater than or equal to 0')
+        if self.processes and self.process >= self.processes:
+            raise ValueError(
+                'process must be less than processes')
 
     def stats_log(self, metric, msg, *args, **kwargs):
         """
@@ -393,6 +442,13 @@ class ContainerReconciler(Daemon):
         direct_delete_container_entry(
             self.swift.container_ring, MISPLACED_OBJECTS_ACCOUNT,
             container, obj, headers=headers)
+
+    def can_reconcile_policy(self, policy_index):
+        pol = POLICIES.get_by_index(policy_index)
+        if pol:
+            pol.load_ring(self.swift_dir, reload_time=self.ring_check_interval)
+            return pol.object_ring.next_part_power is None
+        return False
 
     def throw_tombstones(self, account, container, obj, timestamp,
                          policy_index, path):
@@ -460,15 +516,33 @@ class ContainerReconciler(Daemon):
                            container_policy_index, q_policy_index)
             return True
 
+        # don't reconcile if the source or container policy_index is in the
+        # middle of a PPI
+        if not self.can_reconcile_policy(q_policy_index):
+            self.stats_log('ppi_skip', 'Source policy (%r) in the middle of '
+                           'a part power increase (PPI)', q_policy_index)
+            return False
+        if not self.can_reconcile_policy(container_policy_index):
+            self.stats_log('ppi_skip', 'Container policy (%r) in the middle '
+                           'of a part power increase (PPI)',
+                           container_policy_index)
+            return False
+
         # check if object exists in the destination already
         self.logger.debug('checking for %r (%f) in destination '
                           'policy_index %s', path, q_ts,
                           container_policy_index)
         headers = {
             'X-Backend-Storage-Policy-Index': container_policy_index}
-        dest_obj = self.swift.get_object_metadata(account, container, obj,
-                                                  headers=headers,
-                                                  acceptable_statuses=(2, 4))
+        try:
+            dest_obj = self.swift.get_object_metadata(
+                account, container, obj, headers=headers,
+                acceptable_statuses=(2, 4))
+        except UnexpectedResponse:
+            self.stats_log('unavailable_destination', '%r (%f) unable to '
+                           'determine the destination timestamp, if any',
+                           path, q_ts)
+            return False
         dest_ts = Timestamp(dest_obj.get('x-backend-timestamp', 0))
         if dest_ts >= q_ts:
             self.stats_log('found_object', '%r (%f) in policy_index %s '
@@ -665,9 +739,9 @@ class ContainerReconciler(Daemon):
         # hit most recent container first instead of waiting on the updaters
         current_container = get_reconciler_container_name(time.time())
         yield current_container
-        container_gen = self.swift.iter_containers(MISPLACED_OBJECTS_ACCOUNT)
         self.logger.debug('looking for containers in %s',
                           MISPLACED_OBJECTS_ACCOUNT)
+        container_gen = self.swift.iter_containers(MISPLACED_OBJECTS_ACCOUNT)
         while True:
             one_page = None
             try:
@@ -683,8 +757,10 @@ class ContainerReconciler(Daemon):
                 break
             # reversed order since we expect older containers to be empty
             for c in reversed(one_page):
-                # encoding here is defensive
-                container = c['name'].encode('utf8')
+                container = c['name']
+                if six.PY2:
+                    # encoding here is defensive
+                    container = container.encode('utf8')
                 if container == current_container:
                     continue  # we've already hit this one this pass
                 yield container
@@ -716,29 +792,57 @@ class ContainerReconciler(Daemon):
                 MISPLACED_OBJECTS_ACCOUNT, container,
                 acceptable_statuses=(2, 404, 409, 412))
 
+    def should_process(self, queue_item):
+        """
+        Check if a given entry should be handled by this process.
+
+        :param container: the queue container
+        :param queue_item: an entry from the queue
+        """
+        if not self.processes:
+            return True
+        hexdigest = hash_path(
+            queue_item['account'], queue_item['container'], queue_item['obj'])
+        return int(hexdigest, 16) % self.processes == self.process
+
+    def process_queue_item(self, q_container, q_entry, queue_item):
+        """
+        Process an entry and remove from queue on success.
+
+        :param q_container: the queue container
+        :param q_entry: the raw_obj name from the q_container
+        :param queue_item: a parsed entry from the queue
+        """
+        finished = self.reconcile_object(queue_item)
+        if finished:
+            self.pop_queue(q_container, q_entry,
+                           queue_item['q_ts'],
+                           queue_item['q_record'])
+
     def reconcile(self):
         """
-        Main entry point for processing misplaced objects.
+        Main entry point for concurrent processing of misplaced objects.
 
-        Iterate over all queue entries and delegate to reconcile_object.
+        Iterate over all queue entries and delegate processing to spawned
+        workers in the pool.
         """
         self.logger.debug('pulling items from the queue')
+        pool = GreenPool(self.concurrency)
         for container in self._iter_containers():
+            self.logger.debug('checking container %s', container)
             for raw_obj in self._iter_objects(container):
                 try:
-                    obj_info = parse_raw_obj(raw_obj)
+                    queue_item = parse_raw_obj(raw_obj)
                 except Exception:
                     self.stats_log('invalid_record',
                                    'invalid queue record: %r', raw_obj,
                                    level=logging.ERROR, exc_info=True)
                     continue
-                finished = self.reconcile_object(obj_info)
-                if finished:
-                    self.pop_queue(container, raw_obj['name'],
-                                   obj_info['q_ts'],
-                                   obj_info['q_record'])
+                if self.should_process(queue_item):
+                    pool.spawn_n(self.process_queue_item,
+                                 container, raw_obj['name'], queue_item)
             self.log_stats()
-            self.logger.debug('finished container %s', container)
+        pool.waitall()
 
     def run_once(self, *args, **kwargs):
         """

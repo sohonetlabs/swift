@@ -13,10 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import unittest2
+import unittest
 import traceback
+from contextlib import contextmanager
+import logging
 import test.functional as tf
-from test.functional.s3api.s3_test_client import Connection
+from test.functional.s3api.s3_test_client import (
+    Connection, get_boto3_conn, tear_down_s3)
 
 
 def setUpModule():
@@ -27,16 +30,31 @@ def tearDownModule():
     tf.teardown_package()
 
 
-class S3ApiBase(unittest2.TestCase):
+class S3ApiBase(unittest.TestCase):
     def __init__(self, method_name):
         super(S3ApiBase, self).__init__(method_name)
         self.method_name = method_name
 
+    @contextmanager
+    def quiet_boto_logging(self):
+        try:
+            logging.getLogger('boto').setLevel(logging.INFO)
+            yield
+        finally:
+            logging.getLogger('boto').setLevel(logging.DEBUG)
+
     def setUp(self):
         if 's3api' not in tf.cluster_info:
             raise tf.SkipTest('s3api middleware is not enabled')
+        if tf.config.get('account'):
+            user_id = '%s:%s' % (tf.config['account'], tf.config['username'])
+        else:
+            user_id = tf.config['username']
         try:
-            self.conn = Connection()
+            self.conn = Connection(
+                tf.config['s3_access_key'], tf.config['s3_secret_key'],
+                user_id=user_id)
+
             self.conn.reset()
         except Exception:
             message = '%s got an error during initialize process.\n\n%s' % \
@@ -59,3 +77,24 @@ class S3ApiBase(unittest2.TestCase):
         if etag is not None:
             self.assertTrue('etag' in headers)  # sanity
             self.assertEqual(etag, headers['etag'].strip('"'))
+
+
+class S3ApiBaseBoto3(S3ApiBase):
+    def setUp(self):
+        if 's3api' not in tf.cluster_info:
+            raise tf.SkipTest('s3api middleware is not enabled')
+        try:
+            self.conn = get_boto3_conn(
+                tf.config['s3_access_key'], tf.config['s3_secret_key'])
+            self.endpoint_url = self.conn._endpoint.host
+            self.access_key = self.conn._request_signer._credentials.access_key
+            self.region = self.conn._client_config.region_name
+            tear_down_s3(self.conn)
+        except Exception:
+            message = '%s got an error during initialize process.\n\n%s' % \
+                      (self.method_name, traceback.format_exc())
+            # TODO: Find a way to make this go to FAIL instead of Error
+            self.fail(message)
+
+    def tearDown(self):
+        tear_down_s3(self.conn)

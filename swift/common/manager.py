@@ -22,10 +22,12 @@ import signal
 import time
 import subprocess
 import re
+import six
 from swift import gettext_ as _
 import tempfile
+from distutils.spawn import find_executable
 
-from swift.common.utils import search_tree, remove_file, write_file
+from swift.common.utils import search_tree, remove_file, write_file, readconf
 from swift.common.exceptions import InvalidPidFileException
 
 SWIFT_DIR = '/etc/swift'
@@ -45,10 +47,11 @@ REST_SERVERS = [s for s in ALL_SERVERS if s not in MAIN_SERVERS]
 # aliases mapping
 ALIASES = {'all': ALL_SERVERS, 'main': MAIN_SERVERS, 'rest': REST_SERVERS}
 GRACEFUL_SHUTDOWN_SERVERS = MAIN_SERVERS
+SEAMLESS_SHUTDOWN_SERVERS = MAIN_SERVERS
 START_ONCE_SERVERS = REST_SERVERS
 # These are servers that match a type (account-*, container-*, object-*) but
 # don't use that type-server.conf file and instead use their own.
-STANDALONE_SERVERS = ['object-expirer', 'container-reconciler']
+STANDALONE_SERVERS = ['container-reconciler']
 
 KILL_WAIT = 15  # seconds to wait for servers to die (by default)
 WARNING_WAIT = 3  # seconds to wait after message that may just be a warning
@@ -96,8 +99,10 @@ def command(func):
     func.publicly_accessible = True
 
     @functools.wraps(func)
-    def wrapped(*a, **kw):
-        rv = func(*a, **kw)
+    def wrapped(self, *a, **kw):
+        rv = func(self, *a, **kw)
+        if len(self.servers) == 0:
+            return 1
         return 1 if rv else 0
     return wrapped
 
@@ -172,6 +177,39 @@ def kill_group(pid, sig):
     os.kill(-pid, sig)
 
 
+def format_server_name(servername):
+    """
+    Formats server name as swift compatible server names
+    E.g. swift-object-server
+
+    :param servername: server name
+    :returns: swift compatible server name and its binary name
+    """
+    if '.' in servername:
+        servername = servername.split('.', 1)[0]
+    if '-' not in servername:
+        servername = '%s-server' % servername
+    cmd = 'swift-%s' % servername
+    return servername, cmd
+
+
+def verify_server(server):
+    """
+    Check whether the server is among swift servers or not, and also
+    checks whether the server's binaries are installed or not.
+
+    :param server: name of the server
+    :returns: True, when the server name is valid and its binaries are found.
+              False, otherwise.
+    """
+    if not server:
+        return False
+    _, cmd = format_server_name(server)
+    if find_executable(cmd) is None:
+        return False
+    return True
+
+
 class UnknownCommandError(Exception):
     pass
 
@@ -201,7 +239,8 @@ class Manager(object):
 
         self.servers = set()
         for name in self.server_names:
-            self.servers.add(Server(name, run_dir))
+            if verify_server(name):
+                self.servers.add(Server(name, run_dir))
 
     def __iter__(self):
         return iter(self.servers)
@@ -365,6 +404,31 @@ class Manager(object):
         return status
 
     @command
+    def reload_seamless(self, **kwargs):
+        """seamlessly re-exec, then shutdown of old listen sockets on
+           supporting servers
+        """
+        kwargs.pop('graceful', None)
+        kwargs['seamless'] = True
+        status = 0
+        for server in self.servers:
+            signaled_pids = server.stop(**kwargs)
+            if not signaled_pids:
+                print(_('No %s running') % server)
+                status += 1
+        return status
+
+    def kill_child_pids(self, **kwargs):
+        """kill child pids, optionally servicing accepted connections"""
+        status = 0
+        for server in self.servers:
+            signaled_pids = server.kill_child_pids(**kwargs)
+            if not signaled_pids:
+                print(_('No %s running') % server)
+                status += 1
+        return status
+
+    @command
     def force_reload(self, **kwargs):
         """alias for reload
         """
@@ -419,10 +483,8 @@ class Server(object):
             self.server, self.conf = self.server.rsplit('.', 1)
         else:
             self.conf = None
-        if '-' not in self.server:
-            self.server = '%s-server' % self.server
+        self.server, self.cmd = format_server_name(self.server)
         self.type = self.server.rsplit('-', 1)[0]
-        self.cmd = 'swift-%s' % self.server
         self.procs = []
         self.run_dir = run_dir
 
@@ -475,24 +537,42 @@ class Server(object):
                     self.server, '%s-server' % self.type, 1).replace(
                         '.pid', '.conf', 1)
 
+    def _find_conf_files(self, server_search):
+        if self.conf is not None:
+            return search_tree(SWIFT_DIR, server_search, self.conf + '.conf',
+                               dir_ext=self.conf + '.conf.d')
+        else:
+            return search_tree(SWIFT_DIR, server_search + '*', '.conf',
+                               dir_ext='.conf.d')
+
     def conf_files(self, **kwargs):
         """Get conf files for this server
 
-        :param: number, if supplied will only lookup the nth server
+        :param number: if supplied will only lookup the nth server
 
         :returns: list of conf files
         """
-        if self.server in STANDALONE_SERVERS:
-            server_search = self.server
+        if self.server == 'object-expirer':
+            def has_expirer_section(conf_path):
+                try:
+                    readconf(conf_path, section_name="object-expirer")
+                except ValueError:
+                    return False
+                else:
+                    return True
+
+            # config of expirer is preferentially read from object-server
+            # section. If all object-server.conf doesn't have object-expirer
+            # section, object-expirer.conf is used.
+            found_conf_files = [
+                conf for conf in self._find_conf_files("object-server")
+                if has_expirer_section(conf)
+            ] or self._find_conf_files("object-expirer")
+        elif self.server in STANDALONE_SERVERS:
+            found_conf_files = self._find_conf_files(self.server)
         else:
-            server_search = "%s-server" % self.type
-        if self.conf is not None:
-            found_conf_files = search_tree(SWIFT_DIR, server_search,
-                                           self.conf + '.conf',
-                                           dir_ext=self.conf + '.conf.d')
-        else:
-            found_conf_files = search_tree(SWIFT_DIR, server_search + '*',
-                                           '.conf', dir_ext='.conf.d')
+            found_conf_files = self._find_conf_files("%s-server" % self.type)
+
         number = kwargs.get('number')
         if number:
             try:
@@ -501,6 +581,13 @@ class Server(object):
                 conf_files = []
         else:
             conf_files = found_conf_files
+
+        def dump_found_configs():
+            if found_conf_files:
+                print(_('Found configs:'))
+            for i, conf_file in enumerate(found_conf_files):
+                print('  %d) %s' % (i + 1, conf_file))
+
         if not conf_files:
             # maybe there's a config file(s) out there, but I couldn't find it!
             if not kwargs.get('quiet'):
@@ -511,17 +598,21 @@ class Server(object):
                 else:
                     print(_('Unable to locate config for %s') % self.server)
             if kwargs.get('verbose') and not kwargs.get('quiet'):
-                if found_conf_files:
-                    print(_('Found configs:'))
-                for i, conf_file in enumerate(found_conf_files):
-                    print('  %d) %s' % (i + 1, conf_file))
+                dump_found_configs()
+        elif any(["object-expirer" in name for name in conf_files]) and \
+                not kwargs.get('quiet'):
+            print(_("WARNING: object-expirer.conf is deprecated. "
+                    "Move object-expirers' configuration into "
+                    "object-server.conf."))
+            if kwargs.get('verbose'):
+                dump_found_configs()
 
         return conf_files
 
     def pid_files(self, **kwargs):
         """Get pid files for this server
 
-        :param: number, if supplied will only lookup the nth server
+        :param number: if supplied will only lookup the nth server
 
         :returns: list of pid files
         """
@@ -548,6 +639,32 @@ class Server(object):
                 pid = None
             yield pid_file, pid
 
+    def _signal_pid(self, sig, pid, pid_file, verbose):
+        try:
+            if sig != signal.SIG_DFL:
+                print(_('Signal %(server)s  pid: %(pid)s  signal: '
+                        '%(signal)s') %
+                      {'server': self.server, 'pid': pid, 'signal': sig})
+            safe_kill(pid, sig, 'swift-%s' % self.server)
+        except InvalidPidFileException:
+            if verbose:
+                print(_('Removing pid file %(pid_file)s with wrong pid '
+                        '%(pid)d') % {'pid_file': pid_file, 'pid': pid})
+            remove_file(pid_file)
+            return False
+        except OSError as e:
+            if e.errno == errno.ESRCH:
+                # pid does not exist
+                if verbose:
+                    print(_("Removing stale pid file %s") % pid_file)
+                remove_file(pid_file)
+            elif e.errno == errno.EPERM:
+                print(_("No permission to signal PID %d") % pid)
+            return False
+        else:
+            # process exists
+            return True
+
     def signal_pids(self, sig, **kwargs):
         """Send a signal to pids for this server
 
@@ -562,28 +679,29 @@ class Server(object):
                 print(_('Removing pid file %s with invalid pid') % pid_file)
                 remove_file(pid_file)
                 continue
-            try:
-                if sig != signal.SIG_DFL:
-                    print(_('Signal %(server)s  pid: %(pid)s  signal: '
-                            '%(signal)s') %
-                          {'server': self.server, 'pid': pid, 'signal': sig})
-                safe_kill(pid, sig, 'swift-%s' % self.server)
-            except InvalidPidFileException as e:
-                if kwargs.get('verbose'):
-                    print(_('Removing pid file %(pid_file)s with wrong pid '
-                            '%(pid)d') % {'pid_file': pid_file, 'pid': pid})
-                remove_file(pid_file)
-            except OSError as e:
-                if e.errno == errno.ESRCH:
-                    # pid does not exist
-                    if kwargs.get('verbose'):
-                        print(_("Removing stale pid file %s") % pid_file)
-                    remove_file(pid_file)
-                elif e.errno == errno.EPERM:
-                    print(_("No permission to signal PID %d") % pid)
-            else:
-                # process exists
+            if self._signal_pid(sig, pid, pid_file, kwargs.get('verbose')):
                 pids[pid] = pid_file
+        return pids
+
+    def signal_children(self, sig, **kwargs):
+        """Send a signal to child pids for this server
+
+        :param sig: signal to send
+
+        :returns: a dict mapping pids (ints) to pid_files (paths)
+
+        """
+        pids = {}
+        for pid_file, pid in self.iter_pid_files(**kwargs):
+            if not pid:  # Catches None and 0
+                print(_('Removing pid file %s with invalid pid') % pid_file)
+                remove_file(pid_file)
+                continue
+            ps_cmd = ['ps', '--ppid', str(pid), '--no-headers', '-o', 'pid']
+            for pid in subprocess.check_output(ps_cmd).split():
+                pid = int(pid)
+                if self._signal_pid(sig, pid, pid_file, kwargs.get('verbose')):
+                    pids[pid] = pid_file
         return pids
 
     def get_running_pids(self, **kwargs):
@@ -598,22 +716,45 @@ class Server(object):
         """Kill running pids
 
         :param graceful: if True, attempt SIGHUP on supporting servers
+        :param seamless: if True, attempt SIGUSR1 on supporting servers
 
         :returns: a dict mapping pids (ints) to pid_files (paths)
 
         """
         graceful = kwargs.get('graceful')
+        seamless = kwargs.get('seamless')
         if graceful and self.server in GRACEFUL_SHUTDOWN_SERVERS:
             sig = signal.SIGHUP
+        elif seamless and self.server in SEAMLESS_SHUTDOWN_SERVERS:
+            sig = signal.SIGUSR1
         else:
             sig = signal.SIGTERM
         return self.signal_pids(sig, **kwargs)
 
+    def kill_child_pids(self, **kwargs):
+        """Kill child pids, leaving server overseer to respawn them
+
+        :param graceful: if True, attempt SIGHUP on supporting servers
+        :param seamless: if True, attempt SIGUSR1 on supporting servers
+
+        :returns: a dict mapping pids (ints) to pid_files (paths)
+
+        """
+        graceful = kwargs.get('graceful')
+        seamless = kwargs.get('seamless')
+        if graceful and self.server in GRACEFUL_SHUTDOWN_SERVERS:
+            sig = signal.SIGHUP
+        elif seamless and self.server in SEAMLESS_SHUTDOWN_SERVERS:
+            sig = signal.SIGUSR1
+        else:
+            sig = signal.SIGTERM
+        return self.signal_children(sig, **kwargs)
+
     def status(self, pids=None, **kwargs):
         """Display status of server
 
-        :param: pids, if not supplied pids will be populated automatically
-        :param: number, if supplied will only lookup the nth server
+        :param pids: if not supplied pids will be populated automatically
+        :param number: if supplied will only lookup the nth server
 
         :returns: 1 if server is not running, 0 otherwise
         """
@@ -691,6 +832,8 @@ class Server(object):
             else:
                 output = proc.stdout.read()
                 proc.stdout.close()
+                if not six.PY2:
+                    output = output.decode('utf8', 'backslashreplace')
 
             if kwargs.get('once', False):
                 # if you don't want once to wait you can send it to the

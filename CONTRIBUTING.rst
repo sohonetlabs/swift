@@ -18,8 +18,18 @@ review and all tests before it can be included in the project. Reviewing
 proposed patches is a very helpful way to be a contributor.
 
 Swift is nothing without the community behind it. We'd love to welcome you to
-our community. Come find us in #openstack-swift on freenode IRC or on the
+our community. Come find us in #openstack-swift on OFTC IRC or on the
 OpenStack dev mailing list.
+
+For general information on contributing to OpenStack, please check out the
+`contributor guide <https://docs.openstack.org/contributors/>`_ to get started.
+It covers all the basics that are common to all OpenStack projects: the accounts
+you need, the basics of interacting with our Gerrit review system, how we
+communicate as a community, etc.
+
+If you want more Swift related project documentation make sure you checkout
+the Swift developer (contributor) documentation at
+https://docs.openstack.org/swift/latest/
 
 Filing a Bug
 ~~~~~~~~~~~~
@@ -52,7 +62,7 @@ Reviewing Someone Else's Code
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 All code reviews in OpenStack projects are done on
-https://review.openstack.org/. Reviewing patches is one of the most effective
+https://review.opendev.org/. Reviewing patches is one of the most effective
 ways you can contribute to the community.
 
 We've written REVIEW_GUIDELINES.rst (found in this source tree) to help you
@@ -69,8 +79,7 @@ what to work on, check out the "wishlist" bugs in the bug tracker. These are
 normally smaller items that someone took the time to write down but didn't
 have time to implement.
 
-And please join #openstack-swift on freenode IRC to tell us what you're
-working on.
+And please join #openstack-swift on OFTC IRC to tell us what you're working on.
 
 Getting Started
 ---------------
@@ -109,7 +118,7 @@ advocate for your change and iterate on it based on feedback. Reach out
 to other people working on the project on
 `IRC <http://eavesdrop.openstack.org/irclogs/%23openstack-swift/>`__ or
 the `mailing
-list <http://lists.openstack.org/pipermail/openstack-dev/>`__ - we want
+list <http://lists.openstack.org/pipermail/openstack-discuss/>`__ - we want
 to help.
 
 Recommended workflow

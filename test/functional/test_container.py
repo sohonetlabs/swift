@@ -16,13 +16,14 @@
 # limitations under the License.
 
 import json
-import unittest2
+import unittest
 from uuid import uuid4
 
 from test.functional import check_response, cluster_info, retry, \
     requires_acls, load_constraint, requires_policies, SkipTest
 import test.functional as tf
 
+import six
 from six.moves import range
 
 
@@ -34,7 +35,7 @@ def tearDownModule():
     tf.teardown_package()
 
 
-class TestContainer(unittest2.TestCase):
+class TestContainer(unittest.TestCase):
 
     def setUp(self):
         if tf.skip:
@@ -50,7 +51,10 @@ class TestContainer(unittest2.TestCase):
 
         resp = retry(put)
         resp.read()
-        self.assertEqual(resp.status, 201)
+        # If the request was received and processed but the container-server
+        # timed out getting the response back to the proxy, or the proxy timed
+        # out getting the response back to the client, the next retry will 202
+        self.assertIn(resp.status, (201, 202))
 
         self.max_meta_count = load_constraint('max_meta_count')
         self.max_meta_name_length = load_constraint('max_meta_name_length')
@@ -68,8 +72,11 @@ class TestContainer(unittest2.TestCase):
             return check_response(conn)
 
         def delete(url, token, parsed, conn, container, obj):
-            path = '/'.join([parsed.path, container,
-                             obj['name'].encode('utf8')])
+            if six.PY2:
+                obj_name = obj['name'].encode('utf8')
+            else:
+                obj_name = obj['name']
+            path = '/'.join([parsed.path, container, obj_name])
             conn.request('DELETE', path, '', {'X-Auth-Token': token})
             return check_response(conn)
 
@@ -86,21 +93,23 @@ class TestContainer(unittest2.TestCase):
                 for obj in objs:
                     resp = retry(delete, container, obj)
                     resp.read()
-                    self.assertEqual(resp.status, 204)
+                    # Under load, container listing may not upate immediately,
+                    # so we may attempt to delete the same object multiple
+                    # times. Tolerate the object having already been deleted.
+                    self.assertIn(resp.status, (204, 404))
 
         def delete(url, token, parsed, conn, container):
             conn.request('DELETE', parsed.path + '/' + container, '',
                          {'X-Auth-Token': token})
             return check_response(conn)
 
-        resp = retry(delete, self.name)
-        resp.read()
-        self.assertEqual(resp.status, 204)
-
-        # container may have not been created
-        resp = retry(delete, self.container)
-        resp.read()
-        self.assertIn(resp.status, (204, 404))
+        for container in (self.name, self.container):
+            resp = retry(delete, container)
+            resp.read()
+            # self.container may not have been created at all, but even if it
+            # has, for either container there may be a failure that trips the
+            # retry despite the request having been successfully processed.
+            self.assertIn(resp.status, (204, 404))
 
     def test_multi_metadata(self):
         if tf.skip:
@@ -148,7 +157,9 @@ class TestContainer(unittest2.TestCase):
 
         uni_key = u'X-Container-Meta-uni\u0E12'
         uni_value = u'uni\u0E12'
-        if (tf.web_front_end == 'integral'):
+        # Note that py3 has issues with non-ascii header names; see
+        # https://bugs.python.org/issue37093
+        if (tf.web_front_end == 'integral' and six.PY2):
             resp = retry(post, uni_key, '1')
             resp.read()
             self.assertEqual(resp.status, 204)
@@ -162,9 +173,14 @@ class TestContainer(unittest2.TestCase):
         resp = retry(head)
         resp.read()
         self.assertIn(resp.status, (200, 204))
-        self.assertEqual(resp.getheader('X-Container-Meta-uni'),
-                         uni_value.encode('utf-8'))
-        if (tf.web_front_end == 'integral'):
+        if six.PY2:
+            self.assertEqual(resp.getheader('X-Container-Meta-uni'),
+                             uni_value.encode('utf-8'))
+        else:
+            self.assertEqual(resp.getheader('X-Container-Meta-uni'),
+                             uni_value)
+        # See above note about py3 and non-ascii header names
+        if (tf.web_front_end == 'integral' and six.PY2):
             resp = retry(post, uni_key, uni_value)
             resp.read()
             self.assertEqual(resp.status, 204)
@@ -202,7 +218,7 @@ class TestContainer(unittest2.TestCase):
         name = uuid4().hex
         resp = retry(put, name, 'Value')
         resp.read()
-        self.assertEqual(resp.status, 201)
+        self.assertIn(resp.status, (201, 202))
         resp = retry(head, name)
         resp.read()
         self.assertIn(resp.status, (200, 204))
@@ -213,12 +229,12 @@ class TestContainer(unittest2.TestCase):
         self.assertEqual(resp.getheader('x-container-meta-test'), 'Value')
         resp = retry(delete, name)
         resp.read()
-        self.assertEqual(resp.status, 204)
+        self.assertIn(resp.status, (204, 404))
 
         name = uuid4().hex
         resp = retry(put, name, '')
         resp.read()
-        self.assertEqual(resp.status, 201)
+        self.assertIn(resp.status, (201, 202))
         resp = retry(head, name)
         resp.read()
         self.assertIn(resp.status, (200, 204))
@@ -229,7 +245,7 @@ class TestContainer(unittest2.TestCase):
         self.assertIsNone(resp.getheader('x-container-meta-test'))
         resp = retry(delete, name)
         resp.read()
-        self.assertEqual(resp.status, 204)
+        self.assertIn(resp.status, (204, 404))
 
     def test_POST_metadata(self):
         if tf.skip:
@@ -291,10 +307,10 @@ class TestContainer(unittest2.TestCase):
             put, name,
             {'X-Container-Meta-' + ('k' * self.max_meta_name_length): 'v'})
         resp.read()
-        self.assertEqual(resp.status, 201)
+        self.assertIn(resp.status, (201, 202))
         resp = retry(delete, name)
         resp.read()
-        self.assertEqual(resp.status, 204)
+        self.assertIn(resp.status, (204, 404))
         name = uuid4().hex
         resp = retry(
             put, name,
@@ -311,10 +327,10 @@ class TestContainer(unittest2.TestCase):
             put, name,
             {'X-Container-Meta-Too-Long': 'k' * self.max_meta_value_length})
         resp.read()
-        self.assertEqual(resp.status, 201)
+        self.assertIn(resp.status, (201, 202))
         resp = retry(delete, name)
         resp.read()
-        self.assertEqual(resp.status, 204)
+        self.assertIn(resp.status, (204, 404))
         name = uuid4().hex
         resp = retry(
             put, name,
@@ -332,10 +348,10 @@ class TestContainer(unittest2.TestCase):
             headers['X-Container-Meta-%d' % x] = 'v'
         resp = retry(put, name, headers)
         resp.read()
-        self.assertEqual(resp.status, 201)
+        self.assertIn(resp.status, (201, 202))
         resp = retry(delete, name)
         resp.read()
-        self.assertEqual(resp.status, 204)
+        self.assertIn(resp.status, (204, 404))
         name = uuid4().hex
         headers = {}
         for x in range(self.max_meta_count + 1):
@@ -362,10 +378,10 @@ class TestContainer(unittest2.TestCase):
                 'v' * (self.max_meta_overall_size - size - 1)
         resp = retry(put, name, headers)
         resp.read()
-        self.assertEqual(resp.status, 201)
+        self.assertIn(resp.status, (201, 202))
         resp = retry(delete, name)
         resp.read()
-        self.assertEqual(resp.status, 204)
+        self.assertIn(resp.status, (204, 404))
         name = uuid4().hex
         headers['X-Container-Meta-k'] = \
             'v' * (self.max_meta_overall_size - size)
@@ -758,6 +774,8 @@ class TestContainer(unittest2.TestCase):
         # read-only can list containers
         resp = retry(get, use_account=3)
         listing = resp.read()
+        if not six.PY2:
+            listing = listing.decode('utf8')
         self.assertEqual(resp.status, 200)
         self.assertIn(self.name, listing)
 
@@ -773,6 +791,8 @@ class TestContainer(unittest2.TestCase):
         self.assertEqual(resp.status, 201)
         resp = retry(get, use_account=3)
         listing = resp.read()
+        if not six.PY2:
+            listing = listing.decode('utf8')
         self.assertEqual(resp.status, 200)
         self.assertIn(new_container_name, listing)
 
@@ -873,6 +893,8 @@ class TestContainer(unittest2.TestCase):
         # can list containers
         resp = retry(get, use_account=3)
         listing = resp.read()
+        if not six.PY2:
+            listing = listing.decode('utf8')
         self.assertEqual(resp.status, 200)
         self.assertIn(self.name, listing)
 
@@ -880,18 +902,22 @@ class TestContainer(unittest2.TestCase):
         new_container_name = str(uuid4())
         resp = retry(put, new_container_name, use_account=3)
         resp.read()
-        self.assertEqual(resp.status, 201)
+        self.assertIn(resp.status, (201, 202))
         resp = retry(get, use_account=3)
         listing = resp.read()
+        if not six.PY2:
+            listing = listing.decode('utf8')
         self.assertEqual(resp.status, 200)
         self.assertIn(new_container_name, listing)
 
         # can also delete them
         resp = retry(delete, new_container_name, use_account=3)
         resp.read()
-        self.assertEqual(resp.status, 204)
+        self.assertIn(resp.status, (204, 404))
         resp = retry(get, use_account=3)
         listing = resp.read()
+        if not six.PY2:
+            listing = listing.decode('utf8')
         self.assertEqual(resp.status, 200)
         self.assertNotIn(new_container_name, listing)
 
@@ -899,10 +925,10 @@ class TestContainer(unittest2.TestCase):
         empty_container_name = str(uuid4())
         resp = retry(put, empty_container_name, use_account=1)
         resp.read()
-        self.assertEqual(resp.status, 201)
+        self.assertIn(resp.status, (201, 202))
         resp = retry(delete, empty_container_name, use_account=3)
         resp.read()
-        self.assertEqual(resp.status, 204)
+        self.assertIn(resp.status, (204, 404))
 
     @requires_acls
     def test_read_write_acl_metadata(self):
@@ -1015,6 +1041,8 @@ class TestContainer(unittest2.TestCase):
         # can list containers
         resp = retry(get, use_account=3)
         listing = resp.read()
+        if not six.PY2:
+            listing = listing.decode('utf8')
         self.assertEqual(resp.status, 200)
         self.assertIn(self.name, listing)
 
@@ -1025,6 +1053,8 @@ class TestContainer(unittest2.TestCase):
         self.assertEqual(resp.status, 201)
         resp = retry(get, use_account=3)
         listing = resp.read()
+        if not six.PY2:
+            listing = listing.decode('utf8')
         self.assertEqual(resp.status, 200)
         self.assertIn(new_container_name, listing)
 
@@ -1034,6 +1064,8 @@ class TestContainer(unittest2.TestCase):
         self.assertEqual(resp.status, 204)
         resp = retry(get, use_account=3)
         listing = resp.read()
+        if not six.PY2:
+            listing = listing.decode('utf8')
         self.assertEqual(resp.status, 200)
         self.assertNotIn(new_container_name, listing)
 
@@ -1403,7 +1435,7 @@ class TestContainer(unittest2.TestCase):
         if (tf.web_front_end == 'apache2'):
             self.assertEqual(resp.status, 404)
         else:
-            self.assertEqual(resp.read(), 'Invalid UTF8 or contains NULL')
+            self.assertEqual(resp.read(), b'Invalid UTF8 or contains NULL')
             self.assertEqual(resp.status, 412)
 
     def test_create_container_gets_default_policy_by_default(self):
@@ -1599,12 +1631,12 @@ class TestContainer(unittest2.TestCase):
             return check_response(conn)
 
         # upload 11 bytes object
-        resp = retry(put, '01234567890')
+        resp = retry(put, b'01234567890')
         resp.read()
         self.assertEqual(resp.status, 413)
 
         # upload 10 bytes object
-        resp = retry(put, '0123456789')
+        resp = retry(put, b'0123456789')
         resp.read()
         self.assertEqual(resp.status, 201)
 
@@ -1617,10 +1649,10 @@ class TestContainer(unittest2.TestCase):
         resp = retry(get)
         body = resp.read()
         self.assertEqual(resp.status, 200)
-        self.assertEqual(body, '0123456789')
+        self.assertEqual(body, b'0123456789')
 
 
-class BaseTestContainerACLs(unittest2.TestCase):
+class BaseTestContainerACLs(unittest.TestCase):
     # subclasses can change the account in which container
     # is created/deleted by setUp/tearDown
     account = 1
@@ -1795,4 +1827,4 @@ class TestContainerACLsAccount4(BaseTestContainerACLs):
 
 
 if __name__ == '__main__':
-    unittest2.main()
+    unittest.main()

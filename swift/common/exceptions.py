@@ -113,7 +113,11 @@ class DeviceUnavailable(SwiftException):
     pass
 
 
-class InvalidAccountInfo(SwiftException):
+class DatabaseAuditorException(SwiftException):
+    pass
+
+
+class InvalidAccountInfo(DatabaseAuditorException):
     pass
 
 
@@ -122,6 +126,10 @@ class PathNotDir(OSError):
 
 
 class ChunkReadError(SwiftException):
+    pass
+
+
+class ShortReadError(SwiftException):
     pass
 
 
@@ -211,6 +219,10 @@ class ReplicationLockTimeout(LockTimeout):
     pass
 
 
+class PartitionLockTimeout(LockTimeout):
+    pass
+
+
 class MimeInvalid(SwiftException):
     pass
 
@@ -220,6 +232,14 @@ class APIVersionError(SwiftException):
 
 
 class EncryptionException(SwiftException):
+    pass
+
+
+class UnknownSecretIdError(EncryptionException):
+    pass
+
+
+class QuarantineRequest(SwiftException):
     pass
 
 

@@ -290,6 +290,16 @@ A ``DELETE`` with a query parameter::
 will delete all the segments referenced in the manifest and then the manifest
 itself. The failure response will be similar to the bulk delete middleware.
 
+A ``DELETE`` with the query parameters::
+
+    ?multipart-manifest=delete&async=yes
+
+will schedule all the segments referenced in the manifest to be deleted
+asynchronously and then delete the manifest itself. Note that segments will
+continue to appear in listings and be counted for quotas until they are
+cleaned up by the object-expirer. This option is only available when all
+segments are in the same container and none of them are nested SLOs.
+
 ------------------------
 Modifying a Large Object
 ------------------------
@@ -313,31 +323,42 @@ metadata which can be used for stats and billing purposes.
 """
 
 import base64
+from cgi import parse_header
 from collections import defaultdict
 from datetime import datetime
 import json
 import mimetypes
 import re
-import six
 import time
-from hashlib import md5
+
+import six
+
+from swift.cli.container_deleter import make_delete_jobs
 from swift.common.exceptions import ListingIterError, SegmentError
+from swift.common.middleware.listing_formats import \
+    MAX_CONTAINER_LISTING_CONTENT_LENGTH
 from swift.common.swob import Request, HTTPBadRequest, HTTPServerError, \
     HTTPMethodNotAllowed, HTTPRequestEntityTooLarge, HTTPLengthRequired, \
     HTTPOk, HTTPPreconditionFailed, HTTPException, HTTPNotFound, \
-    HTTPUnauthorized, HTTPConflict, HTTPUnprocessableEntity, Response, Range, \
-    RESPONSE_REASONS
+    HTTPUnauthorized, HTTPConflict, HTTPUnprocessableEntity, \
+    HTTPServiceUnavailable, Response, Range, normalize_etag, \
+    RESPONSE_REASONS, str_to_wsgi, bytes_to_wsgi, wsgi_to_str, wsgi_quote
 from swift.common.utils import get_logger, config_true_value, \
     get_valid_utf8_str, override_bytes_from_content_type, split_path, \
-    register_swift_info, RateLimitedIterator, quote, close_if_possible, \
-    closing_if_possible, LRUCache, StreamingPile, strict_b64decode
+    RateLimitedIterator, quote, close_if_possible, closing_if_possible, \
+    LRUCache, StreamingPile, strict_b64decode, Timestamp, drain_and_close, \
+    get_expirer_container, md5
+from swift.common.registry import register_swift_info
 from swift.common.request_helpers import SegmentedIterable, \
-    get_sys_meta_prefix, update_etag_is_at_header, resolve_etag_is_at_header
-from swift.common.constraints import check_utf8, MAX_BUFFERED_SLO_SEGMENTS
+    get_sys_meta_prefix, update_etag_is_at_header, resolve_etag_is_at_header, \
+    get_container_update_override_key, update_ignore_range_header
+from swift.common.constraints import check_utf8, AUTO_CREATE_ACCOUNT_PREFIX
 from swift.common.http import HTTP_NOT_FOUND, HTTP_UNAUTHORIZED, is_success
-from swift.common.wsgi import WSGIContext, make_subrequest
+from swift.common.wsgi import WSGIContext, make_subrequest, make_env, \
+    make_pre_authed_request
 from swift.common.middleware.bulk import get_response_body, \
     ACCEPTABLE_FORMATS, Bulk
+from swift.proxy.controllers.base import get_container_info
 
 
 DEFAULT_RATE_LIMIT_UNDER_SIZE = 1024 ** 2  # 1 MiB
@@ -454,8 +475,8 @@ def parse_and_validate_input(req_body, req_path):
                     continue
 
             obj_path = '/'.join(['', vrs, account,
-                                 seg_dict['path'].lstrip('/')])
-            if req_path == quote(obj_path):
+                                 quote(seg_dict['path'].lstrip('/'))])
+            if req_path == obj_path:
                 errors.append(
                     b"Index %d: manifest must not include itself as a segment"
                     % seg_index)
@@ -495,7 +516,7 @@ def parse_and_validate_input(req_body, req_path):
                               % (seg_index,))
                 continue
             # re-encode to normalize padding
-            seg_dict['data'] = base64.b64encode(data)
+            seg_dict['data'] = base64.b64encode(data).decode('ascii')
 
     if parsed_data and all('data' in d for d in parsed_data):
         errors.append(b"Inline data segments require at least one "
@@ -521,24 +542,37 @@ class SloGetContext(WSGIContext):
         """
         Fetch the submanifest, parse it, and return it.
         Raise exception on failures.
+
+        :param req: the upstream request
+        :param version: whatever
+        :param acc: native
+        :param con: native
+        :param obj: native
         """
         sub_req = make_subrequest(
-            req.environ, path='/'.join(['', version, acc, con, obj]),
+            req.environ,
+            path=wsgi_quote('/'.join([
+                '', str_to_wsgi(version),
+                str_to_wsgi(acc), str_to_wsgi(con), str_to_wsgi(obj)])),
             method='GET',
             headers={'x-auth-token': req.headers.get('x-auth-token')},
             agent='%(orig)s SLO MultipartGET', swift_source='SLO')
         sub_resp = sub_req.get_response(self.slo.app)
 
         if not sub_resp.is_success:
-            close_if_possible(sub_resp.app_iter)
-            raise ListingIterError(
-                'while fetching %s, GET of submanifest %s '
-                'failed with status %d' % (req.path, sub_req.path,
-                                           sub_resp.status_int))
+            # Error message should be short
+            body = sub_resp.body
+            if not six.PY2:
+                body = body.decode('utf-8')
+            msg = ('while fetching %s, GET of submanifest %s '
+                   'failed with status %d (%s)')
+            raise ListingIterError(msg % (
+                req.path, sub_req.path, sub_resp.status_int,
+                body if len(body) <= 60 else body[:57] + '...'))
 
         try:
             with closing_if_possible(sub_resp.app_iter):
-                return json.loads(''.join(sub_resp.app_iter))
+                return json.loads(b''.join(sub_resp.app_iter))
         except ValueError as err:
             raise ListingIterError(
                 'while fetching %s, JSON-decoding of submanifest %s '
@@ -653,7 +687,10 @@ class SloGetContext(WSGIContext):
                         "While processing manifest %r, "
                         "max recursion depth was exceeded" % req.path)
 
-                sub_path = get_valid_utf8_str(seg_dict['name'])
+                if six.PY2:
+                    sub_path = get_valid_utf8_str(seg_dict['name'])
+                else:
+                    sub_path = seg_dict['name']
                 sub_cont, sub_obj = split_path(sub_path, 2, 2, True)
                 if last_sub_path != sub_path:
                     sub_segments = cached_fetch_sub_slo_segments(
@@ -672,7 +709,7 @@ class SloGetContext(WSGIContext):
                         recursion_depth=recursion_depth + 1):
                     yield sub_seg_dict
             else:
-                if isinstance(seg_dict['name'], six.text_type):
+                if six.PY2 and isinstance(seg_dict['name'], six.text_type):
                     seg_dict['name'] = seg_dict['name'].encode("utf-8")
                 yield dict(seg_dict,
                            first_byte=max(0, first_byte) + range_start,
@@ -714,7 +751,7 @@ class SloGetContext(WSGIContext):
                     content_range = value
                     break
             # e.g. Content-Range: bytes 0-14289/14290
-            match = re.match('bytes (\d+)-(\d+)/(\d+)$', content_range)
+            match = re.match(r'bytes (\d+)-(\d+)/(\d+)$', content_range)
             if not match:
                 # Malformed or missing, so we don't know what we got.
                 return True
@@ -744,10 +781,13 @@ class SloGetContext(WSGIContext):
             # saved, we can trust the object-server to respond appropriately
             # to If-Match/If-None-Match requests.
             update_etag_is_at_header(req, SYSMETA_SLO_ETAG)
+            # Tell the object server that if it's a manifest,
+            # we want the whole thing
+            update_ignore_range_header(req, 'X-Static-Large-Object')
         resp_iter = self._app_call(req.environ)
 
         # make sure this response is for a static large object manifest
-        slo_marker = slo_etag = slo_size = None
+        slo_marker = slo_etag = slo_size = slo_timestamp = None
         for header, value in self._response_headers:
             header = header.lower()
             if header == SYSMETA_SLO_ETAG:
@@ -757,8 +797,10 @@ class SloGetContext(WSGIContext):
             elif (header == 'x-static-large-object' and
                   config_true_value(value)):
                 slo_marker = value
+            elif header == 'x-backend-timestamp':
+                slo_timestamp = value
 
-            if slo_marker and slo_etag and slo_size:
+            if slo_marker and slo_etag and slo_size and slo_timestamp:
                 break
 
         if not slo_marker:
@@ -802,6 +844,7 @@ class SloGetContext(WSGIContext):
                 conditional_response=True)
             resp.headers.update({
                 'Etag': '"%s"' % slo_etag,
+                'X-Manifest-Etag': self._response_header_value('etag'),
                 'Content-Length': slo_size,
             })
             return resp(req.environ, start_response)
@@ -816,6 +859,35 @@ class SloGetContext(WSGIContext):
                 headers={'x-auth-token': req.headers.get('x-auth-token')},
                 agent='%(orig)s SLO MultipartGET', swift_source='SLO')
             resp_iter = self._app_call(get_req.environ)
+            slo_marker = config_true_value(self._response_header_value(
+                'x-static-large-object'))
+            if not slo_marker:  # will also catch non-2xx responses
+                got_timestamp = self._response_header_value(
+                    'x-backend-timestamp') or '0'
+                if Timestamp(got_timestamp) >= Timestamp(slo_timestamp):
+                    # We've got a newer response available, so serve that.
+                    # Note that if there's data, it's going to be a 200 now,
+                    # not a 206, and we're not going to drop bytes in the
+                    # proxy on the client's behalf. Fortunately, the RFC is
+                    # pretty forgiving for a server; there's no guarantee that
+                    # a Range header will be respected.
+                    resp = Response(
+                        status=self._response_status,
+                        headers=self._response_headers,
+                        app_iter=resp_iter,
+                        request=req,
+                        conditional_etag=resolve_etag_is_at_header(
+                            req, self._response_headers),
+                        conditional_response=is_success(
+                            int(self._response_status[:3])))
+                    return resp(req.environ, start_response)
+                else:
+                    # We saw newer data that indicated it's an SLO, but
+                    # couldn't fetch the whole thing; 503 seems reasonable?
+                    close_if_possible(resp_iter)
+                    raise HTTPServiceUnavailable(request=req)
+            # NB: we might have gotten an out-of-date manifest -- that's OK;
+            # we'll just try to serve the old data
 
         # Any Content-Range from a manifest is almost certainly wrong for the
         # full large object.
@@ -846,7 +918,7 @@ class SloGetContext(WSGIContext):
             seg_dict['size_bytes'] = seg_dict.pop('bytes', None)
             seg_dict['etag'] = seg_dict.pop('hash', None)
 
-        json_data = json.dumps(segments)  # convert to string
+        json_data = json.dumps(segments, sort_keys=True)  # convert to string
         if six.PY3:
             json_data = json_data.encode('utf-8')
 
@@ -854,6 +926,10 @@ class SloGetContext(WSGIContext):
         for header, value in resp_headers:
             if header.lower() == 'content-length':
                 new_headers.append(('Content-Length', len(json_data)))
+            elif header.lower() == 'etag':
+                new_headers.append(
+                    ('Etag', md5(json_data, usedforsecurity=False)
+                     .hexdigest()))
             else:
                 new_headers.append((header, value))
         self._response_headers = new_headers
@@ -862,7 +938,7 @@ class SloGetContext(WSGIContext):
 
     def _get_manifest_read(self, resp_iter):
         with closing_if_possible(resp_iter):
-            resp_body = ''.join(resp_iter)
+            resp_body = b''.join(resp_iter)
         try:
             segments = json.loads(resp_body)
         except ValueError:
@@ -877,7 +953,9 @@ class SloGetContext(WSGIContext):
         response_headers = []
         for header, value in resp_headers:
             lheader = header.lower()
-            if lheader not in ('etag', 'content-length'):
+            if lheader == 'etag':
+                response_headers.append(('X-Manifest-Etag', value))
+            elif lheader != 'content-length':
                 response_headers.append((header, value))
 
             if lheader == SYSMETA_SLO_ETAG:
@@ -889,7 +967,7 @@ class SloGetContext(WSGIContext):
 
         # Prep to calculate content_length & etag if necessary
         if slo_etag is None:
-            calculated_etag = md5()
+            calculated_etag = md5(usedforsecurity=False)
         if content_length is None:
             calculated_content_length = 0
 
@@ -901,13 +979,13 @@ class SloGetContext(WSGIContext):
 
             if slo_etag is None:
                 if 'raw_data' in seg_dict:
-                    calculated_etag.update(
-                        md5(seg_dict['raw_data']).hexdigest())
+                    r = md5(seg_dict['raw_data'],
+                            usedforsecurity=False).hexdigest()
                 elif seg_dict.get('range'):
-                    calculated_etag.update(
-                        '%s:%s;' % (seg_dict['hash'], seg_dict['range']))
+                    r = '%s:%s;' % (seg_dict['hash'], seg_dict['range'])
                 else:
-                    calculated_etag.update(seg_dict['hash'])
+                    r = seg_dict['hash']
+                calculated_etag.update(r.encode('ascii'))
 
             if content_length is None:
                 if config_true_value(seg_dict.get('sub_slo')):
@@ -931,7 +1009,7 @@ class SloGetContext(WSGIContext):
 
     def _manifest_head_response(self, req, response_headers):
         conditional_etag = resolve_etag_is_at_header(req, response_headers)
-        return HTTPOk(request=req, headers=response_headers, body='',
+        return HTTPOk(request=req, headers=response_headers, body=b'',
                       conditional_etag=conditional_etag,
                       conditional_response=True)
 
@@ -947,6 +1025,7 @@ class SloGetContext(WSGIContext):
             byteranges = []
 
         ver, account, _junk = req.split_path(3, 3, rest_with_last=True)
+        account = wsgi_to_str(account)
         plain_listing_iter = self._segment_listing_iterator(
             req, ver, account, segments, byteranges)
 
@@ -1023,13 +1102,15 @@ class StaticLargeObject(object):
     def __init__(self, app, conf,
                  max_manifest_segments=DEFAULT_MAX_MANIFEST_SEGMENTS,
                  max_manifest_size=DEFAULT_MAX_MANIFEST_SIZE,
-                 yield_frequency=DEFAULT_YIELD_FREQUENCY):
+                 yield_frequency=DEFAULT_YIELD_FREQUENCY,
+                 allow_async_delete=False):
         self.conf = conf
         self.app = app
         self.logger = get_logger(conf, log_route='slo')
         self.max_manifest_segments = max_manifest_segments
         self.max_manifest_size = max_manifest_size
         self.yield_frequency = yield_frequency
+        self.allow_async_delete = allow_async_delete
         self.max_get_time = int(self.conf.get('max_get_time', 86400))
         self.rate_limit_under_size = int(self.conf.get(
             'rate_limit_under_size', DEFAULT_RATE_LIMIT_UNDER_SIZE))
@@ -1042,7 +1123,21 @@ class StaticLargeObject(object):
         delete_concurrency = int(self.conf.get(
             'delete_concurrency', self.concurrency))
         self.bulk_deleter = Bulk(
-            app, {}, delete_concurrency=delete_concurrency, logger=self.logger)
+            app, {},
+            max_deletes_per_request=float('inf'),
+            delete_concurrency=delete_concurrency,
+            logger=self.logger)
+
+        # Need to know how to expire things to do async deletes
+        if conf.get('auto_create_account_prefix'):
+            # proxy app will log about how this should get moved to swift.conf
+            prefix = conf['auto_create_account_prefix']
+        else:
+            prefix = AUTO_CREATE_ACCOUNT_PREFIX
+        self.expiring_objects_account = prefix + (
+            conf.get('expiring_objects_account_name') or 'expiring_objects')
+        self.expiring_objects_container_divisor = int(
+            conf.get('expiring_objects_container_divisor', 86400))
 
     def handle_multipart_get_or_head(self, req, start_response):
         """
@@ -1070,18 +1165,19 @@ class StaticLargeObject(object):
         :raises HttpException: on errors
         """
         vrs, account, container, obj = req.split_path(4, rest_with_last=True)
-        if req.content_length > self.max_manifest_size:
-            raise HTTPRequestEntityTooLarge(
-                "Manifest File > %d bytes" % self.max_manifest_size)
         if req.headers.get('X-Copy-From'):
             raise HTTPMethodNotAllowed(
                 'Multipart Manifest PUTs cannot be COPY requests')
-        if req.content_length is None and \
-                req.headers.get('transfer-encoding', '').lower() != 'chunked':
-            raise HTTPLengthRequired(request=req)
+        if req.content_length is None:
+            if req.headers.get('transfer-encoding', '').lower() != 'chunked':
+                raise HTTPLengthRequired(request=req)
+        else:
+            if req.content_length > self.max_manifest_size:
+                raise HTTPRequestEntityTooLarge(
+                    "Manifest File > %d bytes" % self.max_manifest_size)
         parsed_data = parse_and_validate_input(
             req.body_file.read(self.max_manifest_size),
-            req.path)
+            wsgi_to_str(req.path))
         problem_segments = []
 
         object_segments = [seg for seg in parsed_data if 'path' in seg]
@@ -1106,8 +1202,13 @@ class StaticLargeObject(object):
                 path2indices[seg_dict['path']].append(index)
 
         def do_head(obj_name):
-            obj_path = '/'.join(['', vrs, account,
-                                 get_valid_utf8_str(obj_name).lstrip('/')])
+            if six.PY2:
+                obj_path = '/'.join(['', vrs, account,
+                                     get_valid_utf8_str(obj_name).lstrip('/')])
+            else:
+                obj_path = '/'.join(['', vrs, account,
+                                     str_to_wsgi(obj_name.lstrip('/'))])
+            obj_path = wsgi_quote(obj_path)
 
             sub_req = make_subrequest(
                 req.environ, path=obj_path + '?',  # kill the query string
@@ -1191,7 +1292,7 @@ class StaticLargeObject(object):
             return segment_length, seg_data
 
         heartbeat = config_true_value(req.params.get('heartbeat'))
-        separator = ''
+        separator = b''
         if heartbeat:
             # Apparently some ways of deploying require that this to happens
             # *before* the return? Not sure why.
@@ -1199,13 +1300,13 @@ class StaticLargeObject(object):
             start_response('202 Accepted', [  # NB: not 201 !
                 ('Content-Type', out_content_type),
             ])
-            separator = '\r\n\r\n'
+            separator = b'\r\n\r\n'
 
         def resp_iter(total_size=total_size):
             # wsgi won't propagate start_response calls until some data has
             # been yielded so make sure first heartbeat is sent immediately
             if heartbeat:
-                yield ' '
+                yield b' '
             last_yield_time = time.time()
             with StreamingPile(self.concurrency) as pile:
                 for obj_name, resp in pile.asyncstarmap(do_head, (
@@ -1215,7 +1316,7 @@ class StaticLargeObject(object):
                                       self.yield_frequency):
                         # Make sure we've called start_response before
                         # sending data
-                        yield ' '
+                        yield b' '
                         last_yield_time = now
                     for i in path2indices[obj_name]:
                         segment_length, seg_data = validate_seg_dict(
@@ -1224,12 +1325,22 @@ class StaticLargeObject(object):
                         data_for_storage[i] = seg_data
                         total_size += segment_length
 
+            # Middleware left of SLO can add a callback to the WSGI
+            # environment to perform additional validation and/or
+            # manipulation on the manifest that will be written.
+            hook = req.environ.get('swift.callback.slo_manifest_hook')
+            if hook:
+                more_problems = hook(data_for_storage)
+                if more_problems:
+                    problem_segments.extend(more_problems)
+
             if problem_segments:
                 err = HTTPBadRequest(content_type=out_content_type)
                 resp_dict = {}
                 if heartbeat:
                     resp_dict['Response Status'] = err.status
-                    resp_dict['Response Body'] = err.body or '\n'.join(
+                    err_body = err.body.decode('utf-8')
+                    resp_dict['Response Body'] = err_body or '\n'.join(
                         RESPONSE_REASONS.get(err.status_int, ['']))
                 else:
                     start_response(err.status,
@@ -1239,27 +1350,32 @@ class StaticLargeObject(object):
                     out_content_type, resp_dict, problem_segments, 'upload')
                 return
 
-            slo_etag = md5()
+            slo_etag = md5(usedforsecurity=False)
             for seg_data in data_for_storage:
                 if 'data' in seg_data:
                     raw_data = base64.b64decode(seg_data['data'])
-                    slo_etag.update(md5(raw_data).hexdigest())
+                    r = md5(raw_data, usedforsecurity=False).hexdigest()
                 elif seg_data.get('range'):
-                    slo_etag.update('%s:%s;' % (seg_data['hash'],
-                                                seg_data['range']))
+                    r = '%s:%s;' % (seg_data['hash'], seg_data['range'])
                 else:
-                    slo_etag.update(seg_data['hash'])
+                    r = seg_data['hash']
+                slo_etag.update(r.encode('ascii') if six.PY3 else r)
 
             slo_etag = slo_etag.hexdigest()
-            client_etag = req.headers.get('Etag')
-            if client_etag and client_etag.strip('"') != slo_etag:
+            client_etag = normalize_etag(req.headers.get('Etag'))
+            if client_etag and client_etag != slo_etag:
                 err = HTTPUnprocessableEntity(request=req)
                 if heartbeat:
-                    yield separator + get_response_body(out_content_type, {
-                        'Response Status': err.status,
-                        'Response Body': err.body or '\n'.join(
-                            RESPONSE_REASONS.get(err.status_int, [''])),
-                    }, problem_segments, 'upload')
+                    resp_dict = {}
+                    resp_dict['Response Status'] = err.status
+                    err_body = err.body
+                    if six.PY3 and isinstance(err_body, bytes):
+                        err_body = err_body.decode('utf-8', errors='replace')
+                    resp_dict['Response Body'] = err_body or '\n'.join(
+                        RESPONSE_REASONS.get(err.status_int, ['']))
+                    yield separator + get_response_body(
+                        out_content_type, resp_dict, problem_segments,
+                        'upload')
                 else:
                     for chunk in err(req.environ, start_response):
                         yield chunk
@@ -1273,12 +1389,21 @@ class StaticLargeObject(object):
                 SYSMETA_SLO_ETAG: slo_etag,
                 SYSMETA_SLO_SIZE: total_size,
                 'X-Static-Large-Object': 'True',
-                'Etag': md5(json_data).hexdigest(),
+                'Etag': md5(json_data, usedforsecurity=False).hexdigest(),
             })
+
+            # Ensure container listings have both etags. However, if any
+            # middleware to the left of us touched the base value, trust them.
+            override_header = get_container_update_override_key('etag')
+            val, sep, params = req.headers.get(
+                override_header, '').partition(';')
+            req.headers[override_header] = '%s; slo_etag=%s' % (
+                (val or req.headers['Etag']) + sep + params, slo_etag)
 
             env = req.environ
             if not env.get('CONTENT_TYPE'):
-                guessed_type, _junk = mimetypes.guess_type(req.path_info)
+                guessed_type, _junk = mimetypes.guess_type(
+                    wsgi_to_str(req.path_info))
                 env['CONTENT_TYPE'] = (guessed_type or
                                        'application/octet-stream')
             env['swift.content_type_overridden'] = True
@@ -1292,7 +1417,10 @@ class StaticLargeObject(object):
                 resp_dict['Last Modified'] = resp.headers['Last-Modified']
 
             if heartbeat:
-                resp_dict['Response Body'] = resp.body
+                resp_body = resp.body
+                if six.PY3 and isinstance(resp_body, bytes):
+                    resp_body = resp_body.decode('utf-8')
+                resp_dict['Response Body'] = resp_body
                 yield separator + get_response_body(
                     out_content_type, resp_dict, [], 'upload')
             else:
@@ -1312,16 +1440,29 @@ class StaticLargeObject(object):
         :raises HTTPBadRequest: on too many buffered sub segments and
                                 on invalid SLO manifest path
         """
-        if not check_utf8(req.path_info):
+        if not check_utf8(wsgi_to_str(req.path_info)):
             raise HTTPPreconditionFailed(
                 request=req, body='Invalid UTF8 or contains NULL')
         vrs, account, container, obj = req.split_path(4, 4, True)
+        if six.PY2:
+            obj_path = ('/%s/%s' % (container, obj)).decode('utf-8')
+        else:
+            obj_path = '/%s/%s' % (wsgi_to_str(container), wsgi_to_str(obj))
 
         segments = [{
             'sub_slo': True,
-            'name': ('/%s/%s' % (container, obj)).decode('utf-8')}]
+            'name': obj_path}]
+        if 'version-id' in req.params:
+            segments[0]['version_id'] = req.params['version-id']
+
         while segments:
-            if len(segments) > MAX_BUFFERED_SLO_SEGMENTS:
+            # We chose not to set the limit at max_manifest_segments
+            # in the case this value was decreased by operators.
+            # Still it is important to set a limit to avoid this list
+            # growing too large and causing OOM failures.
+            # x10 is a best guess as to how much operators would change
+            # the value of max_manifest_segments.
+            if len(segments) > self.max_manifest_segments * 10:
                 raise HTTPBadRequest(
                     'Too many buffered slo segments to delete.')
             seg_data = segments.pop(0)
@@ -1333,14 +1474,18 @@ class StaticLargeObject(object):
                         self.get_slo_segments(seg_data['name'], req))
                 except HTTPException as err:
                     # allow bulk delete response to report errors
+                    err_body = err.body
+                    if six.PY3 and isinstance(err_body, bytes):
+                        err_body = err_body.decode('utf-8', errors='replace')
                     seg_data['error'] = {'code': err.status_int,
-                                         'message': err.body}
+                                         'message': err_body}
 
                 # add manifest back to be deleted after segments
                 seg_data['sub_slo'] = False
                 segments.append(seg_data)
             else:
-                seg_data['name'] = seg_data['name'].encode('utf-8')
+                if six.PY2:
+                    seg_data['name'] = seg_data['name'].encode('utf-8')
                 yield seg_data
 
     def get_slo_segments(self, obj_name, req):
@@ -1362,14 +1507,33 @@ class StaticLargeObject(object):
         new_env['REQUEST_METHOD'] = 'GET'
         del(new_env['wsgi.input'])
         new_env['QUERY_STRING'] = 'multipart-manifest=get'
+        if 'version-id' in req.params:
+            new_env['QUERY_STRING'] += \
+                '&version-id=' + req.params['version-id']
         new_env['CONTENT_LENGTH'] = 0
         new_env['HTTP_USER_AGENT'] = \
             '%s MultipartDELETE' % new_env.get('HTTP_USER_AGENT')
         new_env['swift.source'] = 'SLO'
-        new_env['PATH_INFO'] = (
-            '/%s/%s/%s' % (vrs, account, obj_name.lstrip('/').encode('utf-8'))
-        )
-        resp = Request.blank('', new_env).get_response(self.app)
+        if six.PY2:
+            new_env['PATH_INFO'] = (
+                '/%s/%s/%s' % (vrs, account,
+                               obj_name.lstrip('/').encode('utf-8'))
+            )
+        else:
+            new_env['PATH_INFO'] = (
+                '/%s/%s/%s' % (vrs, account, str_to_wsgi(obj_name.lstrip('/')))
+            )
+        # Just request the last byte of non-SLO objects so we don't waste
+        # a bunch of resources in drain_and_close() below
+        manifest_req = Request.blank('', new_env, range='bytes=-1')
+        update_ignore_range_header(manifest_req, 'X-Static-Large-Object')
+        resp = manifest_req.get_response(self.app)
+
+        if resp.is_success and config_true_value(resp.headers.get(
+                'X-Static-Large-Object')) and len(resp.body) == 1:
+            # pre-2.24.0 object-server
+            manifest_req = Request.blank('', new_env)
+            resp = manifest_req.get_response(self.app)
 
         if resp.is_success:
             if config_true_value(resp.headers.get('X-Static-Large-Object')):
@@ -1378,6 +1542,8 @@ class StaticLargeObject(object):
                 except ValueError:
                     raise HTTPServerError('Unable to load SLO manifest')
             else:
+                # Drain and close GET request (prevents socket leaks)
+                drain_and_close(resp)
                 raise HTTPBadRequest('Not an SLO manifest')
         elif resp.status_int == HTTP_NOT_FOUND:
             raise HTTPNotFound('SLO manifest not found')
@@ -1385,6 +1551,83 @@ class StaticLargeObject(object):
             raise HTTPUnauthorized('401 Unauthorized')
         else:
             raise HTTPServerError('Unable to load SLO manifest or segment.')
+
+    def handle_async_delete(self, req):
+        if not check_utf8(wsgi_to_str(req.path_info)):
+            raise HTTPPreconditionFailed(
+                request=req, body='Invalid UTF8 or contains NULL')
+        vrs, account, container, obj = req.split_path(4, 4, True)
+        if six.PY2:
+            obj_path = ('/%s/%s' % (container, obj)).decode('utf-8')
+        else:
+            obj_path = '/%s/%s' % (wsgi_to_str(container), wsgi_to_str(obj))
+        segments = [seg for seg in self.get_slo_segments(obj_path, req)
+                    if 'data' not in seg]
+        if not segments:
+            # Degenerate case: just delete the manifest
+            return self.app
+
+        segment_containers, segment_objects = zip(*(
+            split_path(seg['name'], 2, 2, True) for seg in segments))
+        segment_containers = set(segment_containers)
+        if len(segment_containers) > 1:
+            container_csv = ', '.join(
+                '"%s"' % quote(c) for c in segment_containers)
+            raise HTTPBadRequest('All segments must be in one container. '
+                                 'Found segments in %s' % container_csv)
+        if any(seg.get('sub_slo') for seg in segments):
+            raise HTTPBadRequest('No segments may be large objects.')
+
+        # Auth checks
+        segment_container = segment_containers.pop()
+        if 'swift.authorize' in req.environ:
+            container_info = get_container_info(
+                req.environ, self.app, swift_source='SLO')
+            req.acl = container_info.get('write_acl')
+            aresp = req.environ['swift.authorize'](req)
+            req.acl = None
+            if aresp:
+                return aresp
+
+            if bytes_to_wsgi(segment_container.encode('utf-8')) != container:
+                path = '/%s/%s/%s' % (vrs, account, bytes_to_wsgi(
+                    segment_container.encode('utf-8')))
+                seg_container_info = get_container_info(
+                    make_env(req.environ, path=path, swift_source='SLO'),
+                    self.app, swift_source='SLO')
+                req.acl = seg_container_info.get('write_acl')
+                aresp = req.environ['swift.authorize'](req)
+                req.acl = None
+                if aresp:
+                    return aresp
+
+        # Did our sanity checks; schedule segments to be deleted
+        ts = req.ensure_x_timestamp()
+        expirer_jobs = make_delete_jobs(
+            wsgi_to_str(account), segment_container, segment_objects, ts)
+        expirer_cont = get_expirer_container(
+            ts, self.expiring_objects_container_divisor,
+            wsgi_to_str(account), wsgi_to_str(container), wsgi_to_str(obj))
+        enqueue_req = make_pre_authed_request(
+            req.environ,
+            method='UPDATE',
+            path="/v1/%s/%s" % (self.expiring_objects_account, expirer_cont),
+            body=json.dumps(expirer_jobs),
+            headers={'Content-Type': 'application/json',
+                     'X-Backend-Storage-Policy-Index': '0',
+                     'X-Backend-Allow-Private-Methods': 'True'},
+        )
+        resp = enqueue_req.get_response(self.app)
+        if not resp.is_success:
+            self.logger.error(
+                'Failed to enqueue expiration entries: %s\n%s',
+                resp.status, resp.body)
+            return HTTPServiceUnavailable()
+        # consume the response (should be short)
+        drain_and_close(resp)
+
+        # Finally, delete the manifest
+        return self.app
 
     def handle_multipart_delete(self, req):
         """
@@ -1394,6 +1637,10 @@ class StaticLargeObject(object):
         :param req: a :class:`~swift.common.swob.Request` with an obj in path
         :returns: swob.Response whose app_iter set to Bulk.handle_delete_iter
         """
+        if self.allow_async_delete and config_true_value(
+                req.params.get('async')):
+            return self.handle_async_delete(req)
+
         req.headers['Content-Type'] = None  # Ignore content-type from client
         resp = HTTPOk(request=req)
         try:
@@ -1408,6 +1655,30 @@ class StaticLargeObject(object):
             out_content_type=out_content_type)
         return resp
 
+    def handle_container_listing(self, req, start_response):
+        resp = req.get_response(self.app)
+        if not resp.is_success or resp.content_type != 'application/json':
+            return resp(req.environ, start_response)
+        if resp.content_length is None or \
+                resp.content_length > MAX_CONTAINER_LISTING_CONTENT_LENGTH:
+            return resp(req.environ, start_response)
+        try:
+            listing = json.loads(resp.body)
+        except ValueError:
+            return resp(req.environ, start_response)
+
+        for item in listing:
+            if 'subdir' in item:
+                continue
+            etag, params = parse_header(item['hash'])
+            if 'slo_etag' in params:
+                item['slo_etag'] = '"%s"' % params.pop('slo_etag')
+                item['hash'] = etag + ''.join(
+                    '; %s=%s' % kv for kv in params.items())
+
+        resp.body = json.dumps(listing).encode('ascii')
+        return resp(req.environ, start_response)
+
     def __call__(self, env, start_response):
         """
         WSGI entry point
@@ -1417,8 +1688,16 @@ class StaticLargeObject(object):
 
         req = Request(env)
         try:
-            vrs, account, container, obj = req.split_path(4, 4, True)
+            vrs, account, container, obj = req.split_path(3, 4, True)
+            is_cont_or_obj_req = True
         except ValueError:
+            is_cont_or_obj_req = False
+        if not is_cont_or_obj_req:
+            return self.app(env, start_response)
+
+        if not obj:
+            if req.method == 'GET':
+                return self.handle_container_listing(req, start_response)
             return self.app(env, start_response)
 
         try:
@@ -1452,6 +1731,8 @@ def filter_factory(global_conf, **local_conf):
                                      DEFAULT_MAX_MANIFEST_SIZE))
     yield_frequency = int(conf.get('yield_frequency',
                                    DEFAULT_YIELD_FREQUENCY))
+    allow_async_delete = config_true_value(conf.get('allow_async_delete',
+                                                    'false'))
 
     register_swift_info('slo',
                         max_manifest_segments=max_manifest_segments,
@@ -1459,12 +1740,14 @@ def filter_factory(global_conf, **local_conf):
                         yield_frequency=yield_frequency,
                         # this used to be configurable; report it as 1 for
                         # clients that might still care
-                        min_segment_size=1)
+                        min_segment_size=1,
+                        allow_async_delete=allow_async_delete)
 
     def slo_filter(app):
         return StaticLargeObject(
             app, conf,
             max_manifest_segments=max_manifest_segments,
             max_manifest_size=max_manifest_size,
-            yield_frequency=yield_frequency)
+            yield_frequency=yield_frequency,
+            allow_async_delete=allow_async_delete)
     return slo_filter

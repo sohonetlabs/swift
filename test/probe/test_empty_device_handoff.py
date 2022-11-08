@@ -69,7 +69,7 @@ class TestEmptyDevice(ReplProbeTest):
         # Create container/obj (goes to two primary servers and one handoff)
         client.put_object(self.url, self.token, container, obj, 'VERIFY')
         odata = client.get_object(self.url, self.token, container, obj)[-1]
-        if odata != 'VERIFY':
+        if odata != b'VERIFY':
             raise Exception('Object GET did not return VERIFY, instead it '
                             'returned: %s' % repr(odata))
 
@@ -87,7 +87,7 @@ class TestEmptyDevice(ReplProbeTest):
 
         # Indirectly through proxy assert we can get container/obj
         odata = client.get_object(self.url, self.token, container, obj)[-1]
-        if odata != 'VERIFY':
+        if odata != b'VERIFY':
             raise Exception('Object GET did not return VERIFY, instead it '
                             'returned: %s' % repr(odata))
         # Restart those other two container/obj primary servers
@@ -171,6 +171,7 @@ class TestEmptyDevice(ReplProbeTest):
             self.assertEqual(err.http_status, 404)
         else:
             self.fail("Expected ClientException but didn't get it")
+
 
 if __name__ == '__main__':
     main()

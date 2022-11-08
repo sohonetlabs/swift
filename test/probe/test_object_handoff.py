@@ -19,7 +19,6 @@ from __future__ import print_function
 from unittest import main
 from uuid import uuid4
 import random
-from hashlib import md5
 from collections import defaultdict
 import os
 import socket
@@ -30,8 +29,10 @@ from swiftclient import client
 from swift.common import direct_client
 from swift.common.exceptions import ClientException
 from swift.common.manager import Manager
-from test.probe.common import (kill_server, start_server, ReplProbeTest,
-                               ECProbeTest, Body)
+from swift.common.utils import md5
+from test.probe.common import (
+    Body, get_server_number, kill_server, start_server,
+    ReplProbeTest, ECProbeTest)
 
 
 class TestObjectHandoff(ReplProbeTest):
@@ -53,9 +54,9 @@ class TestObjectHandoff(ReplProbeTest):
         kill_server((onode['ip'], onode['port']), self.ipport2server)
 
         # Create container/obj (goes to two primary servers and one handoff)
-        client.put_object(self.url, self.token, container, obj, 'VERIFY')
+        client.put_object(self.url, self.token, container, obj, b'VERIFY')
         odata = client.get_object(self.url, self.token, container, obj)[-1]
-        if odata != 'VERIFY':
+        if odata != b'VERIFY':
             raise Exception('Object GET did not return VERIFY, instead it '
                             'returned: %s' % repr(odata))
 
@@ -73,7 +74,7 @@ class TestObjectHandoff(ReplProbeTest):
 
         # Indirectly through proxy assert we can get container/obj
         odata = client.get_object(self.url, self.token, container, obj)[-1]
-        if odata != 'VERIFY':
+        if odata != b'VERIFY':
             raise Exception('Object GET did not return VERIFY, instead it '
                             'returned: %s' % repr(odata))
 
@@ -92,7 +93,7 @@ class TestObjectHandoff(ReplProbeTest):
         # drop a tempfile in the handoff's datadir, like it might have
         # had if there was an rsync failure while it was previously a
         # primary
-        handoff_device_path = self.device_dir('object', another_onode)
+        handoff_device_path = self.device_dir(another_onode)
         data_filename = None
         for root, dirs, files in os.walk(handoff_device_path):
             for filename in files:
@@ -135,17 +136,14 @@ class TestObjectHandoff(ReplProbeTest):
         # Run object replication, ensuring we run the handoff node last so it
         #   will remove its extra handoff partition
         for node in onodes:
-            try:
-                port_num = node['replication_port']
-            except KeyError:
-                port_num = node['port']
-            node_id = (port_num - 6000) / 10
+            _, node_id = get_server_number(
+                (node['ip'], node.get('replication_port', node['port'])),
+                self.ipport2server)
             Manager(['object-replicator']).once(number=node_id)
-        try:
-            another_port_num = another_onode['replication_port']
-        except KeyError:
-            another_port_num = another_onode['port']
-        another_num = (another_port_num - 6000) / 10
+        another_port_num = another_onode.get(
+            'replication_port', another_onode['port'])
+        _, another_num = get_server_number(
+            (another_onode['ip'], another_port_num), self.ipport2server)
         Manager(['object-replicator']).once(number=another_num)
 
         # Assert the first container/obj primary server now has container/obj
@@ -156,7 +154,7 @@ class TestObjectHandoff(ReplProbeTest):
 
         # and that it does *not* have a temporary rsync dropping!
         found_data_filename = False
-        primary_device_path = self.device_dir('object', onode)
+        primary_device_path = self.device_dir(onode)
         for root, dirs, files in os.walk(primary_device_path):
             for filename in files:
                 if filename.endswith('.6MbL6r'):
@@ -227,13 +225,12 @@ class TestObjectHandoff(ReplProbeTest):
         # Run object replication, ensuring we run the handoff node last so it
         #   will remove its extra handoff partition
         for node in onodes:
-            try:
-                port_num = node['replication_port']
-            except KeyError:
-                port_num = node['port']
-            node_id = (port_num - 6000) / 10
+            _, node_id = get_server_number(
+                (node['ip'], node.get('replication_port', node['port'])),
+                self.ipport2server)
             Manager(['object-replicator']).once(number=node_id)
-        another_node_id = (another_port_num - 6000) / 10
+        _, another_node_id = get_server_number(
+            (another_onode['ip'], another_port_num), self.ipport2server)
         Manager(['object-replicator']).once(number=another_node_id)
 
         # Assert primary node no longer has container/obj
@@ -261,9 +258,9 @@ class TestObjectHandoff(ReplProbeTest):
         kill_server((onode['ip'], onode['port']), self.ipport2server)
 
         # Create container/obj (goes to two primaries and one handoff)
-        client.put_object(self.url, self.token, container, obj, 'VERIFY')
+        client.put_object(self.url, self.token, container, obj, b'VERIFY')
         odata = client.get_object(self.url, self.token, container, obj)[-1]
-        if odata != 'VERIFY':
+        if odata != b'VERIFY':
             raise Exception('Object GET did not return VERIFY, instead it '
                             'returned: %s' % repr(odata))
 
@@ -309,6 +306,62 @@ class TestObjectHandoff(ReplProbeTest):
         else:
             self.fail("Expected ClientException but didn't get it")
 
+    def test_missing_primaries(self):
+        # Create container
+        container = 'container-%s' % uuid4()
+        client.put_container(self.url, self.token, container,
+                             headers={'X-Storage-Policy':
+                                      self.policy.name})
+
+        # Create container/obj (goes to all three primaries)
+        obj = 'object-%s' % uuid4()
+        client.put_object(self.url, self.token, container, obj, b'VERIFY')
+        odata = client.get_object(self.url, self.token, container, obj)[-1]
+        if odata != b'VERIFY':
+            raise Exception('Object GET did not return VERIFY, instead it '
+                            'returned: %s' % repr(odata))
+
+        # Kill all primaries obj server
+        obj = 'object-%s' % uuid4()
+        opart, onodes = self.object_ring.get_nodes(
+            self.account, container, obj)
+        for onode in onodes:
+            kill_server((onode['ip'], onode['port']), self.ipport2server)
+
+        # Indirectly (i.e., through proxy) try to GET object, it should return
+        # a 503, since all primaries will Timeout and handoffs return a 404.
+        try:
+            client.get_object(self.url, self.token, container, obj)
+        except client.ClientException as err:
+            self.assertEqual(err.http_status, 503)
+        else:
+            self.fail("Expected ClientException but didn't get it")
+
+        # Restart the first container/obj primary server again
+        onode = onodes[0]
+        start_server((onode['ip'], onode['port']), self.ipport2server)
+
+        # Send a delete that will reach first primary and handoff.
+        # Sure, the DELETE will return a 404 since the handoff doesn't
+        # have a .data file, but object server will still write a
+        # Tombstone in the handoff node!
+        try:
+            client.delete_object(self.url, self.token, container, obj)
+        except client.ClientException as err:
+            self.assertEqual(err.http_status, 404)
+
+        # kill the first container/obj primary server again
+        kill_server((onode['ip'], onode['port']), self.ipport2server)
+
+        # a new GET should return a 404, since all primaries will Timeout
+        # and the handoff will return a 404 but this time with a tombstone
+        try:
+            client.get_object(self.url, self.token, container, obj)
+        except client.ClientException as err:
+            self.assertEqual(err.http_status, 404)
+        else:
+            self.fail("Expected ClientException but didn't get it")
+
 
 class TestECObjectHandoff(ECProbeTest):
 
@@ -317,7 +370,7 @@ class TestECObjectHandoff(ECProbeTest):
                                           container_name,
                                           object_name,
                                           resp_chunk_size=64 * 2 ** 10)
-        resp_checksum = md5()
+        resp_checksum = md5(usedforsecurity=False)
         for chunk in body:
             resp_checksum.update(chunk)
         return resp_checksum.hexdigest()
@@ -342,7 +395,7 @@ class TestECObjectHandoff(ECProbeTest):
 
         # shutdown one of the primary data nodes
         failed_primary = random.choice(onodes)
-        failed_primary_device_path = self.device_dir('object', failed_primary)
+        failed_primary_device_path = self.device_dir(failed_primary)
         # first read its ec etag value for future reference - this may not
         # equal old_contents.etag if for example the proxy has crypto enabled
         req_headers = {'X-Backend-Storage-Policy-Index': int(self.policy)}
@@ -381,7 +434,7 @@ class TestECObjectHandoff(ECProbeTest):
             object_name, headers=req_headers)
         new_backend_etag = headers['X-Object-Sysmeta-EC-Etag']
         for node in other_nodes[:2]:
-            self.kill_drive(self.device_dir('object', node))
+            self.kill_drive(self.device_dir(node))
 
         # sanity, after taking out two primaries we should be down to
         # only four primaries, one of which has the old etag - but we
@@ -522,6 +575,54 @@ class TestECObjectHandoff(ECProbeTest):
         self.assertEqual(sum(frag2count.values()), 6)
         # ... all six unique
         self.assertEqual(len(frag2count), 6)
+
+    def test_ec_primary_timeout(self):
+        container_name = 'container-%s' % uuid4()
+        object_name = 'object-%s' % uuid4()
+
+        # create EC container
+        headers = {'X-Storage-Policy': self.policy.name}
+        client.put_container(self.url, self.token, container_name,
+                             headers=headers)
+
+        # PUT object, should go to primary nodes
+        old_contents = Body()
+        client.put_object(self.url, self.token, container_name,
+                          object_name, contents=old_contents)
+
+        # get our node lists
+        opart, onodes = self.object_ring.get_nodes(
+            self.account, container_name, object_name)
+
+        # shutdown three of the primary data nodes
+        for i in range(3):
+            failed_primary = onodes[i]
+            failed_primary_device_path = self.device_dir(failed_primary)
+            self.kill_drive(failed_primary_device_path)
+
+        # Indirectly (i.e., through proxy) try to GET object, it should return
+        # a 503, since all primaries will Timeout and handoffs return a 404.
+        try:
+            client.get_object(self.url, self.token, container_name,
+                              object_name)
+        except client.ClientException as err:
+            self.assertEqual(err.http_status, 503)
+        else:
+            self.fail("Expected ClientException but didn't get it")
+
+        # Send a delete to write down tombstones in the handoff nodes
+        client.delete_object(self.url, self.token, container_name, object_name)
+
+        # Now a new GET should return 404 because the handoff nodes
+        # return a 404 with a Tombstone.
+        try:
+            client.get_object(self.url, self.token, container_name,
+                              object_name)
+        except client.ClientException as err:
+            self.assertEqual(err.http_status, 404)
+        else:
+            self.fail("Expected ClientException but didn't get it")
+
 
 if __name__ == '__main__':
     main()

@@ -25,7 +25,6 @@ import errno
 import fcntl
 import grp
 import hashlib
-import hmac
 import json
 import math
 import operator
@@ -40,13 +39,13 @@ import uuid
 import functools
 import platform
 import email.parser
-from distutils.version import LooseVersion
-from hashlib import md5, sha1
 from random import random, shuffle
 from contextlib import contextmanager, closing
 import ctypes
 import ctypes.util
 from optparse import OptionParser
+import traceback
+import warnings
 
 from tempfile import gettempdir, mkstemp, NamedTemporaryFile
 import glob
@@ -59,32 +58,40 @@ import eventlet.debug
 import eventlet.greenthread
 import eventlet.patcher
 import eventlet.semaphore
+import pkg_resources
 from eventlet import GreenPool, sleep, Timeout
+from eventlet.event import Event
 from eventlet.green import socket, threading
-from eventlet.hubs import trampoline
+import eventlet.hubs
 import eventlet.queue
 import netifaces
 import codecs
 utf8_decoder = codecs.getdecoder('utf-8')
 utf8_encoder = codecs.getencoder('utf-8')
 import six
-if not six.PY2:
+if six.PY2:
+    from eventlet.green import httplib as green_http_client
+else:
+    from eventlet.green.http import client as green_http_client
     utf16_decoder = codecs.getdecoder('utf-16')
     utf16_encoder = codecs.getencoder('utf-16')
 from six.moves import cPickle as pickle
+from six.moves import configparser
 from six.moves.configparser import (ConfigParser, NoSectionError,
                                     NoOptionError, RawConfigParser)
 from six.moves import range, http_client
-from six.moves.urllib.parse import ParseResult
-from six.moves.urllib.parse import quote as _quote
-from six.moves.urllib.parse import urlparse as stdlib_urlparse
-from six import string_types
+from six.moves.urllib.parse import quote as _quote, unquote
+from six.moves.urllib.parse import urlparse
+from six.moves import UserList
 
 from swift import gettext_ as _
 import swift.common.exceptions
 from swift.common.http import is_server_error
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.linkat import linkat
+
+# For backwards compatability with 3rd party middlewares
+from swift.common.registry import register_swift_info, get_swift_info # noqa
 
 # logging doesn't import patched as cleanly as one would like
 from logging.handlers import SysLogHandler
@@ -115,6 +122,10 @@ FALLOCATE_RESERVE = 0
 # the number of bytes (False).
 FALLOCATE_IS_PERCENT = False
 
+# from /usr/include/linux/falloc.h
+FALLOC_FL_KEEP_SIZE = 1
+FALLOC_FL_PUNCH_HOLE = 2
+
 # from /usr/src/linux-headers-*/include/uapi/linux/resource.h
 PRIO_PROCESS = 0
 
@@ -132,6 +143,7 @@ def NR_ioprio_set():
         return 30
     raise OSError("Swift doesn't support ionice priority for %s %s" %
                   (architecture, arch_bits))
+
 
 # this syscall integer probably only works on x86_64 linux systems, you
 # can check if it's correct on yours with something like this:
@@ -164,6 +176,7 @@ IOPRIO_CLASS_SHIFT = 13
 def IOPRIO_PRIO_VALUE(class_, data):
     return (((class_) << IOPRIO_CLASS_SHIFT) | data)
 
+
 # Used by hash_path to offer a bit more security when generating hashes for
 # paths. It simply appends this value to all paths; guessing the hash a path
 # will end up with would also require knowing this suffix.
@@ -181,9 +194,21 @@ F_SETPIPE_SZ = getattr(fcntl, 'F_SETPIPE_SZ', 1031)
 O_TMPFILE = getattr(os, 'O_TMPFILE', 0o20000000 | os.O_DIRECTORY)
 
 # Used by the parse_socket_string() function to validate IPv6 addresses
-IPV6_RE = re.compile("^\[(?P<address>.*)\](:(?P<port>[0-9]+))?$")
+IPV6_RE = re.compile(r"^\[(?P<address>.*)\](:(?P<port>[0-9]+))?$")
 
 MD5_OF_EMPTY_STRING = 'd41d8cd98f00b204e9800998ecf8427e'
+RESERVED_BYTE = b'\x00'
+RESERVED_STR = u'\x00'
+RESERVED = '\x00'
+
+
+LOG_LINE_DEFAULT_FORMAT = '{remote_addr} - - [{time.d}/{time.b}/{time.Y}' \
+                          ':{time.H}:{time.M}:{time.S} +0000] ' \
+                          '"{method} {path}" {status} {content_length} ' \
+                          '"{referer}" "{txn_id}" "{user_agent}" ' \
+                          '{trans_time:.4f} "{additional_info}" {pid} ' \
+                          '{policy_index}'
+DEFAULT_LOCK_TIMEOUT = 10
 
 
 class InvalidHashPathConfigError(ValueError):
@@ -224,25 +249,26 @@ def validate_hash_conf():
 
         if six.PY3:
             # Use Latin1 to accept arbitrary bytes in the hash prefix/suffix
-            confs_read = hash_conf.read(SWIFT_CONF_FILE, encoding='latin1')
+            with open(SWIFT_CONF_FILE, encoding='latin1') as swift_conf_file:
+                hash_conf.readfp(swift_conf_file)
         else:
-            confs_read = hash_conf.read(SWIFT_CONF_FILE)
+            with open(SWIFT_CONF_FILE) as swift_conf_file:
+                hash_conf.readfp(swift_conf_file)
 
-        if confs_read:
-            try:
-                HASH_PATH_SUFFIX = hash_conf.get('swift-hash',
-                                                 'swift_hash_path_suffix')
-                if six.PY3:
-                    HASH_PATH_SUFFIX = HASH_PATH_SUFFIX.encode('latin1')
-            except (NoSectionError, NoOptionError):
-                pass
-            try:
-                HASH_PATH_PREFIX = hash_conf.get('swift-hash',
-                                                 'swift_hash_path_prefix')
-                if six.PY3:
-                    HASH_PATH_PREFIX = HASH_PATH_PREFIX.encode('latin1')
-            except (NoSectionError, NoOptionError):
-                pass
+        try:
+            HASH_PATH_SUFFIX = hash_conf.get('swift-hash',
+                                             'swift_hash_path_suffix')
+            if six.PY3:
+                HASH_PATH_SUFFIX = HASH_PATH_SUFFIX.encode('latin1')
+        except (NoSectionError, NoOptionError):
+            pass
+        try:
+            HASH_PATH_PREFIX = hash_conf.get('swift-hash',
+                                             'swift_hash_path_prefix')
+            if six.PY3:
+                HASH_PATH_PREFIX = HASH_PATH_PREFIX.encode('latin1')
+        except (NoSectionError, NoOptionError):
+            pass
 
         if not HASH_PATH_SUFFIX and not HASH_PATH_PREFIX:
             raise InvalidHashPathConfigError()
@@ -250,106 +276,9 @@ def validate_hash_conf():
 
 try:
     validate_hash_conf()
-except InvalidHashPathConfigError:
+except (InvalidHashPathConfigError, IOError):
     # could get monkey patched or lazy loaded
     pass
-
-
-def get_hmac(request_method, path, expires, key, digest=sha1):
-    """
-    Returns the hexdigest string of the HMAC (see RFC 2104) for
-    the request.
-
-    :param request_method: Request method to allow.
-    :param path: The path to the resource to allow access to.
-    :param expires: Unix timestamp as an int for when the URL
-                    expires.
-    :param key: HMAC shared secret.
-    :param digest: constructor for the digest to use in calculating the HMAC
-                   Defaults to SHA1
-
-    :returns: hexdigest str of the HMAC for the request using the specified
-              digest algorithm.
-    """
-    parts = (request_method, str(expires), path)
-    if not isinstance(key, six.binary_type):
-        key = key.encode('utf8')
-    return hmac.new(
-        key, b'\n'.join(
-            x if isinstance(x, six.binary_type) else x.encode('utf8')
-            for x in parts),
-        digest).hexdigest()
-
-
-# Used by get_swift_info and register_swift_info to store information about
-# the swift cluster.
-_swift_info = {}
-_swift_admin_info = {}
-
-
-def get_swift_info(admin=False, disallowed_sections=None):
-    """
-    Returns information about the swift cluster that has been previously
-    registered with the register_swift_info call.
-
-    :param admin: boolean value, if True will additionally return an 'admin'
-                  section with information previously registered as admin
-                  info.
-    :param disallowed_sections: list of section names to be withheld from the
-                                information returned.
-    :returns: dictionary of information about the swift cluster.
-    """
-    disallowed_sections = disallowed_sections or []
-    info = dict(_swift_info)
-    for section in disallowed_sections:
-        key_to_pop = None
-        sub_section_dict = info
-        for sub_section in section.split('.'):
-            if key_to_pop:
-                sub_section_dict = sub_section_dict.get(key_to_pop, {})
-                if not isinstance(sub_section_dict, dict):
-                    sub_section_dict = {}
-                    break
-            key_to_pop = sub_section
-        sub_section_dict.pop(key_to_pop, None)
-
-    if admin:
-        info['admin'] = dict(_swift_admin_info)
-        info['admin']['disallowed_sections'] = list(disallowed_sections)
-    return info
-
-
-def register_swift_info(name='swift', admin=False, **kwargs):
-    """
-    Registers information about the swift cluster to be retrieved with calls
-    to get_swift_info.
-
-    NOTE: Do not use "." in the param: name or any keys in kwargs. "." is used
-          in the disallowed_sections to remove unwanted keys from /info.
-
-    :param name: string, the section name to place the information under.
-    :param admin: boolean, if True, information will be registered to an
-                  admin section which can optionally be withheld when
-                  requesting the information.
-    :param kwargs: key value arguments representing the information to be
-                   added.
-    :raises ValueError: if name or any of the keys in kwargs has "." in it
-    """
-    if name == 'admin' or name == 'disallowed_sections':
-        raise ValueError('\'{0}\' is reserved name.'.format(name))
-
-    if admin:
-        dict_to_use = _swift_admin_info
-    else:
-        dict_to_use = _swift_info
-    if name not in dict_to_use:
-        if "." in name:
-            raise ValueError('Cannot use "." in a swift_info key: %s' % name)
-        dict_to_use[name] = {}
-    for key, val in kwargs.items():
-        if "." in key:
-            raise ValueError('Cannot use "." in a swift_info key: %s' % key)
-        dict_to_use[name][key] = val
 
 
 def backward(f, blocksize=4096):
@@ -386,6 +315,39 @@ def backward(f, blocksize=4096):
 
 # Used when reading config values
 TRUE_VALUES = set(('true', '1', 'yes', 'on', 't', 'y'))
+
+
+def non_negative_float(value):
+    """
+    Check that the value casts to a float and is non-negative.
+
+    :param value: value to check
+    :raises ValueError: if the value cannot be cast to a float or is negative.
+    :return: a float
+    """
+    try:
+        value = float(value)
+        if value < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError('Value must be a non-negative float number, not "%s".'
+                         % value)
+    return value
+
+
+def non_negative_int(value):
+    """
+    Check that the value casts to an int and is a whole number.
+
+    :param value: value to check
+    :raises ValueError: if the value cannot be cast to an int or does not
+        represent a whole number.
+    :return: an int
+    """
+    int_value = int(value)
+    if int_value != non_negative_float(value):
+        raise ValueError
+    return int_value
 
 
 def config_true_value(value):
@@ -441,6 +403,30 @@ def config_auto_int_value(value, default):
         raise ValueError('Config option must be an integer or the '
                          'string "auto", not "%s".' % value)
     return value
+
+
+def config_percent_value(value):
+    try:
+        return config_float_value(value, 0, 100) / 100.0
+    except ValueError as err:
+        raise ValueError("%s: %s" % (str(err), value))
+
+
+def config_request_node_count_value(value):
+    try:
+        value_parts = value.lower().split()
+        rnc_value = int(value_parts[0])
+    except (ValueError, AttributeError):
+        pass
+    else:
+        if len(value_parts) == 1:
+            return lambda replicas: rnc_value
+        elif (len(value_parts) == 3 and
+              value_parts[1] == '*' and
+              value_parts[2] == 'replicas'):
+            return lambda replicas: rnc_value * replicas
+    raise ValueError(
+        'Invalid request_node_count value: %r' % value)
 
 
 def append_underscore(prefix):
@@ -519,6 +505,9 @@ def eventlet_monkey_patch():
     #         if thread is monkey-patched.
     eventlet.patcher.monkey_patch(all=False, socket=True, select=True,
                                   thread=True)
+    # Trying to log threads while monkey-patched can lead to deadlocks; see
+    # https://bugs.launchpad.net/swift/+bug/1895739
+    logging.logThreads = 0
 
 
 def noop_libc_function(*args):
@@ -587,7 +576,121 @@ def get_policy_index(req_headers, res_headers):
     return str(policy_index) if policy_index is not None else None
 
 
-def get_log_line(req, res, trans_time, additional_info):
+class _UTC(datetime.tzinfo):
+    """
+    A tzinfo class for datetime objects that returns a 0 timedelta (UTC time)
+    """
+    def dst(self, dt):
+        return datetime.timedelta(0)
+    utcoffset = dst
+
+    def tzname(self, dt):
+        return 'UTC'
+
+
+UTC = _UTC()
+
+
+class LogStringFormatter(string.Formatter):
+    def __init__(self, default='', quote=False):
+        super(LogStringFormatter, self).__init__()
+        self.default = default
+        self.quote = quote
+
+    def format_field(self, value, spec):
+        if not value:
+            return self.default
+        else:
+            log = super(LogStringFormatter, self).format_field(value, spec)
+            if self.quote:
+                return quote(log, ':/{}')
+            else:
+                return log
+
+
+class StrAnonymizer(str):
+    """
+    Class that permits to get a string anonymized or simply quoted.
+    """
+
+    def __new__(cls, data, method, salt):
+        method = method.lower()
+        if method not in (hashlib.algorithms if six.PY2 else
+                          hashlib.algorithms_guaranteed):
+            raise ValueError('Unsupported hashing method: %r' % method)
+        s = str.__new__(cls, data or '')
+        s.method = method
+        s.salt = salt
+        return s
+
+    @property
+    def anonymized(self):
+        if not self:
+            return self
+        else:
+            if self.method == 'md5':
+                h = md5(usedforsecurity=False)
+            else:
+                h = getattr(hashlib, self.method)()
+            if self.salt:
+                h.update(six.b(self.salt))
+            h.update(six.b(self))
+            return '{%s%s}%s' % ('S' if self.salt else '', self.method.upper(),
+                                 h.hexdigest())
+
+
+class StrFormatTime(object):
+    """
+    Class that permits to get formats or parts of a time.
+    """
+
+    def __init__(self, ts):
+        self.time = ts
+        self.time_struct = time.gmtime(ts)
+
+    def __str__(self):
+        return "%.9f" % self.time
+
+    def __getattr__(self, attr):
+        if attr not in ['a', 'A', 'b', 'B', 'c', 'd', 'H',
+                        'I', 'j', 'm', 'M', 'p', 'S', 'U',
+                        'w', 'W', 'x', 'X', 'y', 'Y', 'Z']:
+            raise ValueError(("The attribute %s is not a correct directive "
+                              "for time.strftime formater.") % attr)
+        return datetime.datetime(*self.time_struct[:-2],
+                                 tzinfo=UTC).strftime('%' + attr)
+
+    @property
+    def asctime(self):
+        return time.asctime(self.time_struct)
+
+    @property
+    def datetime(self):
+        return time.strftime('%d/%b/%Y/%H/%M/%S', self.time_struct)
+
+    @property
+    def iso8601(self):
+        return time.strftime('%Y-%m-%dT%H:%M:%S', self.time_struct)
+
+    @property
+    def ms(self):
+        return self.__str__().split('.')[1][:3]
+
+    @property
+    def us(self):
+        return self.__str__().split('.')[1][:6]
+
+    @property
+    def ns(self):
+        return self.__str__().split('.')[1]
+
+    @property
+    def s(self):
+        return self.__str__().split('.')[0]
+
+
+def get_log_line(req, res, trans_time, additional_info, fmt,
+                 anonymization_method, anonymization_salt):
     """
     Make a line for logging that matches the documented log line format
     for backend servers.
@@ -601,14 +704,39 @@ def get_log_line(req, res, trans_time, additional_info):
     """
 
     policy_index = get_policy_index(req.headers, res.headers)
-    return '%s - - [%s] "%s %s" %s %s "%s" "%s" "%s" %.4f "%s" %d %s' % (
-        req.remote_addr,
-        time.strftime('%d/%b/%Y:%H:%M:%S +0000', time.gmtime()),
-        req.method, req.path, res.status.split()[0],
-        res.content_length or '-', req.referer or '-',
-        req.headers.get('x-trans-id', '-'),
-        req.user_agent or '-', trans_time, additional_info or '-',
-        os.getpid(), policy_index or '-')
+    if req.path.startswith('/'):
+        disk, partition, account, container, obj = split_path(req.path, 0, 5,
+                                                              True)
+    else:
+        disk, partition, account, container, obj = (None, ) * 5
+    replacements = {
+        'remote_addr': StrAnonymizer(req.remote_addr, anonymization_method,
+                                     anonymization_salt),
+        'time': StrFormatTime(time.time()),
+        'method': req.method,
+        'path': StrAnonymizer(req.path, anonymization_method,
+                              anonymization_salt),
+        'disk': disk,
+        'partition': partition,
+        'account': StrAnonymizer(account, anonymization_method,
+                                 anonymization_salt),
+        'container': StrAnonymizer(container, anonymization_method,
+                                   anonymization_salt),
+        'object': StrAnonymizer(obj, anonymization_method,
+                                anonymization_salt),
+        'status': res.status.split()[0],
+        'content_length': res.content_length,
+        'referer': StrAnonymizer(req.referer, anonymization_method,
+                                 anonymization_salt),
+        'txn_id': req.headers.get('x-trans-id'),
+        'user_agent': StrAnonymizer(req.user_agent, anonymization_method,
+                                    anonymization_salt),
+        'trans_time': trans_time,
+        'additional_info': additional_info,
+        'pid': os.getpid(),
+        'policy_index': policy_index,
+    }
+    return LogStringFormatter(default='-').format(fmt, **replacements)
 
 
 def get_trans_id_time(trans_id):
@@ -646,8 +774,10 @@ class FileLikeIter(object):
         """
         Wraps an iterable to behave as a file-like object.
 
-        The iterable must yield bytes strings.
+        The iterable must be a byte string or yield byte strings.
         """
+        if isinstance(iterable, bytes):
+            iterable = (iterable, )
         self.iterator = iter(iterable)
         self.buf = None
         self.closed = False
@@ -759,70 +889,190 @@ class FileLikeIter(object):
         self.closed = True
 
 
-class FallocateWrapper(object):
+def fs_has_free_space(fs_path, space_needed, is_percent):
+    """
+    Check to see whether or not a filesystem has the given amount of space
+    free. Unlike fallocate(), this does not reserve any space.
 
-    def __init__(self, noop=False):
-        self.noop = noop
-        if self.noop:
-            self.func_name = 'posix_fallocate'
-            self.fallocate = noop_libc_function
-            return
-        # fallocate is preferred because we need the on-disk size to match
-        # the allocated size. Older versions of sqlite require that the
-        # two sizes match. However, fallocate is Linux only.
-        for func in ('fallocate', 'posix_fallocate'):
-            self.func_name = func
-            self.fallocate = load_libc_function(func, log_error=False)
-            if self.fallocate is not noop_libc_function:
-                break
-        if self.fallocate is noop_libc_function:
-            logging.warning(_("Unable to locate fallocate, posix_fallocate in "
-                            "libc.  Leaving as a no-op."))
+    :param fs_path: path to a file or directory on the filesystem; typically
+        the path to the filesystem's mount point
 
-    def __call__(self, fd, mode, offset, length):
-        """The length parameter must be a ctypes.c_uint64."""
-        if not self.noop:
-            if FALLOCATE_RESERVE > 0:
-                st = os.fstatvfs(fd)
-                free = st.f_frsize * st.f_bavail - length.value
-                if FALLOCATE_IS_PERCENT:
-                    free = \
-                        (float(free) / float(st.f_frsize * st.f_blocks)) * 100
-                if float(free) <= float(FALLOCATE_RESERVE):
-                    raise OSError(
-                        errno.ENOSPC,
-                        'FALLOCATE_RESERVE fail %g <= %g' %
-                        (free, FALLOCATE_RESERVE))
-        args = {
-            'fallocate': (fd, mode, offset, length),
-            'posix_fallocate': (fd, offset, length)
-        }
-        return self.fallocate(*args[self.func_name])
+    :param space_needed: minimum bytes or percentage of free space
+
+    :param is_percent: if True, then space_needed is treated as a percentage
+        of the filesystem's capacity; if False, space_needed is a number of
+        free bytes.
+
+    :returns: True if the filesystem has at least that much free space,
+        False otherwise
+
+    :raises OSError: if fs_path does not exist
+    """
+    st = os.statvfs(fs_path)
+    free_bytes = st.f_frsize * st.f_bavail
+    if is_percent:
+        size_bytes = st.f_frsize * st.f_blocks
+        free_percent = float(free_bytes) / float(size_bytes) * 100
+        return free_percent >= space_needed
+    else:
+        return free_bytes >= space_needed
+
+
+class _LibcWrapper(object):
+    """
+    A callable object that forwards its calls to a C function from libc.
+
+    These objects are lazy. libc will not be checked until someone tries to
+    either call the function or check its availability.
+
+    _LibcWrapper objects have an "available" property; if true, then libc
+    has the function of that name. If false, then calls will fail with a
+    NotImplementedError.
+    """
+    def __init__(self, func_name):
+        self._func_name = func_name
+        self._func_handle = None
+        self._loaded = False
+
+    def _ensure_loaded(self):
+        if not self._loaded:
+            func_name = self._func_name
+            try:
+                # Keep everything in this try-block in local variables so
+                # that a typo in self.some_attribute_name doesn't raise a
+                # spurious AttributeError.
+                func_handle = load_libc_function(
+                    func_name, fail_if_missing=True)
+                self._func_handle = func_handle
+            except AttributeError:
+                # We pass fail_if_missing=True to load_libc_function and
+                # then ignore the error. It's weird, but otherwise we have
+                # to check if self._func_handle is noop_libc_function, and
+                # that's even weirder.
+                pass
+            self._loaded = True
+
+    @property
+    def available(self):
+        self._ensure_loaded()
+        return bool(self._func_handle)
+
+    def __call__(self, *args):
+        if self.available:
+            return self._func_handle(*args)
+        else:
+            raise NotImplementedError(
+                "No function %r found in libc" % self._func_name)
+
+
+_fallocate_enabled = True
+_fallocate_warned_about_missing = False
+_sys_fallocate = _LibcWrapper('fallocate')
+_sys_posix_fallocate = _LibcWrapper('posix_fallocate')
 
 
 def disable_fallocate():
-    global _sys_fallocate
-    _sys_fallocate = FallocateWrapper(noop=True)
+    global _fallocate_enabled
+    _fallocate_enabled = False
 
 
-def fallocate(fd, size):
+def fallocate(fd, size, offset=0):
     """
     Pre-allocate disk space for a file.
+
+    This function can be disabled by calling disable_fallocate(). If no
+    suitable C function is available in libc, this function is a no-op.
 
     :param fd: file descriptor
     :param size: size to allocate (in bytes)
     """
-    global _sys_fallocate
-    if _sys_fallocate is None:
-        _sys_fallocate = FallocateWrapper()
+    global _fallocate_enabled
+    if not _fallocate_enabled:
+        return
+
     if size < 0:
-        size = 0
-    # 1 means "FALLOC_FL_KEEP_SIZE", which means it pre-allocates invisibly
-    ret = _sys_fallocate(fd, 1, 0, ctypes.c_uint64(size))
-    err = ctypes.get_errno()
+        size = 0  # Done historically; not really sure why
+    if size >= (1 << 63):
+        raise ValueError('size must be less than 2 ** 63')
+    if offset < 0:
+        raise ValueError('offset must be non-negative')
+    if offset >= (1 << 63):
+        raise ValueError('offset must be less than 2 ** 63')
+
+    # Make sure there's some (configurable) amount of free space in
+    # addition to the number of bytes we're allocating.
+    if FALLOCATE_RESERVE:
+        st = os.fstatvfs(fd)
+        free = st.f_frsize * st.f_bavail - size
+        if FALLOCATE_IS_PERCENT:
+            free = (float(free) / float(st.f_frsize * st.f_blocks)) * 100
+        if float(free) <= float(FALLOCATE_RESERVE):
+            raise OSError(
+                errno.ENOSPC,
+                'FALLOCATE_RESERVE fail %g <= %g' %
+                (free, FALLOCATE_RESERVE))
+
+    if _sys_fallocate.available:
+        # Parameters are (fd, mode, offset, length).
+        #
+        # mode=FALLOC_FL_KEEP_SIZE pre-allocates invisibly (without
+        # affecting the reported file size).
+        ret = _sys_fallocate(
+            fd, FALLOC_FL_KEEP_SIZE, ctypes.c_uint64(offset),
+            ctypes.c_uint64(size))
+        err = ctypes.get_errno()
+    elif _sys_posix_fallocate.available:
+        # Parameters are (fd, offset, length).
+        ret = _sys_posix_fallocate(fd, ctypes.c_uint64(offset),
+                                   ctypes.c_uint64(size))
+        err = ctypes.get_errno()
+    else:
+        # No suitable fallocate-like function is in our libc. Warn about it,
+        # but just once per process, and then do nothing.
+        global _fallocate_warned_about_missing
+        if not _fallocate_warned_about_missing:
+            logging.warning(_("Unable to locate fallocate, posix_fallocate in "
+                              "libc.  Leaving as a no-op."))
+            _fallocate_warned_about_missing = True
+        return
+
     if ret and err not in (0, errno.ENOSYS, errno.EOPNOTSUPP,
                            errno.EINVAL):
         raise OSError(err, 'Unable to fallocate(%s)' % size)
+
+
+def punch_hole(fd, offset, length):
+    """
+    De-allocate disk space in the middle of a file.
+
+    :param fd: file descriptor
+    :param offset: index of first byte to de-allocate
+    :param length: number of bytes to de-allocate
+    """
+    if offset < 0:
+        raise ValueError('offset must be non-negative')
+    if offset >= (1 << 63):
+        raise ValueError('offset must be less than 2 ** 63')
+    if length <= 0:
+        raise ValueError('length must be positive')
+    if length >= (1 << 63):
+        raise ValueError('length must be less than 2 ** 63')
+
+    if _sys_fallocate.available:
+        # Parameters are (fd, mode, offset, length).
+        ret = _sys_fallocate(
+            fd,
+            FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE,
+            ctypes.c_uint64(offset),
+            ctypes.c_uint64(length))
+        err = ctypes.get_errno()
+        if ret and err:
+            mode_str = "FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE"
+            raise OSError(err, "Unable to fallocate(%d, %s, %d, %d)" % (
+                fd, mode_str, offset, length))
+    else:
+        raise OSError(errno.ENOTSUP,
+                      'No suitable C function found for hole punching')
 
 
 def fsync(fd):
@@ -944,7 +1194,7 @@ class Timestamp(object):
     compatible for normalized timestamps which do not include an offset.
     """
 
-    def __init__(self, timestamp, offset=0, delta=0):
+    def __init__(self, timestamp, offset=0, delta=0, check_bounds=True):
         """
         Create a new Timestamp.
 
@@ -988,10 +1238,11 @@ class Timestamp(object):
                 raise ValueError(
                     'delta must be greater than %d' % (-1 * self.raw))
             self.timestamp = float(self.raw * PRECISION)
-        if self.timestamp < 0:
-            raise ValueError('timestamp cannot be negative')
-        if self.timestamp >= 10000000000:
-            raise ValueError('timestamp too large')
+        if check_bounds:
+            if self.timestamp < 0:
+                raise ValueError('timestamp cannot be negative')
+            if self.timestamp >= 10000000000:
+                raise ValueError('timestamp too large')
 
     @classmethod
     def now(cls, offset=0, delta=0):
@@ -1035,6 +1286,15 @@ class Timestamp(object):
 
     @property
     def isoformat(self):
+        """
+        Get an isoformat string representation of the 'normal' part of the
+        Timestamp with microsecond precision and no trailing timezone, for
+        example::
+
+            1970-01-01T00:00:00.000000
+
+        :return: an isoformat string
+        """
         t = float(self.normal)
         if six.PY3:
             # On Python 3, round manually using ROUND_HALF_EVEN rounding
@@ -1061,29 +1321,64 @@ class Timestamp(object):
             isoformat += ".000000"
         return isoformat
 
+    @classmethod
+    def from_isoformat(cls, date_string):
+        """
+        Parse an isoformat string representation of time to a Timestamp object.
+
+        :param date_string: a string formatted as per an Timestamp.isoformat
+            property.
+        :return: an instance of  this class.
+        """
+        start = datetime.datetime.strptime(date_string, "%Y-%m-%dT%H:%M:%S.%f")
+        delta = start - EPOCH
+        # This calculation is based on Python 2.7's Modules/datetimemodule.c,
+        # function delta_to_microseconds(), but written in Python.
+        return cls(delta.total_seconds())
+
+    def ceil(self):
+        """
+        Return the 'normal' part of the timestamp rounded up to the nearest
+        integer number of seconds.
+
+        This value should be used whenever the second-precision Last-Modified
+        time of a resource is required.
+
+        :return: a float value with second precision.
+        """
+        return math.ceil(float(self))
+
     def __eq__(self, other):
         if other is None:
             return False
         if not isinstance(other, Timestamp):
-            other = Timestamp(other)
+            try:
+                other = Timestamp(other, check_bounds=False)
+            except ValueError:
+                return False
         return self.internal == other.internal
 
     def __ne__(self, other):
-        if other is None:
-            return True
-        if not isinstance(other, Timestamp):
-            other = Timestamp(other)
-        return self.internal != other.internal
+        return not (self == other)
 
     def __lt__(self, other):
         if other is None:
             return False
         if not isinstance(other, Timestamp):
-            other = Timestamp(other)
+            other = Timestamp(other, check_bounds=False)
+        if other.timestamp < 0:
+            return False
+        if other.timestamp >= 10000000000:
+            return True
         return self.internal < other.internal
 
     def __hash__(self):
         return hash(self.internal)
+
+    def __invert__(self):
+        if self.offset:
+            raise ValueError('Cannot invert timestamps with offsets')
+        return Timestamp((999999999999999 - self.raw) * PRECISION)
 
 
 def encode_timestamps(t1, t2=None, t3=None, explicit=False):
@@ -1197,24 +1492,19 @@ def last_modified_date_to_timestamp(last_modified_date_str):
     Convert a last modified date (like you'd get from a container listing,
     e.g. 2014-02-28T23:22:36.698390) to a float.
     """
-    start = datetime.datetime.strptime(last_modified_date_str,
-                                       '%Y-%m-%dT%H:%M:%S.%f')
-    delta = start - EPOCH
-
-    # This calculation is based on Python 2.7's Modules/datetimemodule.c,
-    # function delta_to_microseconds(), but written in Python.
-    return Timestamp(delta.total_seconds())
+    return Timestamp.from_isoformat(last_modified_date_str)
 
 
-def normalize_delete_at_timestamp(timestamp):
+def normalize_delete_at_timestamp(timestamp, high_precision=False):
     """
     Format a timestamp (string or numeric) into a standardized
-    xxxxxxxxxx (10) format.
+    xxxxxxxxxx (10) or xxxxxxxxxx.xxxxx (10.5) format.
 
     Note that timestamps less than 0000000000 are raised to
     0000000000 and values greater than November 20th, 2286 at
     17:46:39 UTC will be capped at that date and time, resulting in
-    no return value exceeding 9999999999.
+    no return value exceeding 9999999999.99999 (or 9999999999 if
+    using low-precision).
 
     This cap is because the expirer is already working through a
     sorted list of strings that were all a length of 10. Adding
@@ -1226,7 +1516,8 @@ def normalize_delete_at_timestamp(timestamp):
     :param timestamp: unix timestamp
     :returns: normalized timestamp as a string
     """
-    return '%010d' % min(max(0, float(timestamp)), 9999999999)
+    fmt = '%016.5f' if high_precision else '%010d'
+    return fmt % min(max(0, float(timestamp)), 9999999999.99999)
 
 
 def mkdirs(path):
@@ -1424,7 +1715,7 @@ class RateLimitedIterator(object):
         self.iterator = iter(iterable)
         self.elements_per_second = elements_per_second
         self.limit_after = limit_after
-        self.running_time = 0
+        self.rate_limiter = EventletRateLimiter(elements_per_second)
         self.ratelimit_if = ratelimit_if
 
     def __iter__(self):
@@ -1437,8 +1728,7 @@ class RateLimitedIterator(object):
             if self.limit_after > 0:
                 self.limit_after -= 1
             else:
-                self.running_time = ratelimit_sleep(self.running_time,
-                                                    self.elements_per_second)
+                self.rate_limiter.wait()
         return next_value
     __next__ = next
 
@@ -1584,7 +1874,7 @@ class StatsdClient(object):
         self._host = host
         self._port = port
         self._base_prefix = base_prefix
-        self.set_prefix(tail_prefix)
+        self._set_prefix(tail_prefix)
         self._default_sample_rate = default_sample_rate
         self._sample_rate_factor = sample_rate_factor
         self.random = random
@@ -1625,15 +1915,44 @@ class StatsdClient(object):
         else:
             self._target = (host, port)
 
-    def set_prefix(self, new_prefix):
-        if new_prefix and self._base_prefix:
-            self._prefix = '.'.join([self._base_prefix, new_prefix, ''])
-        elif new_prefix:
-            self._prefix = new_prefix + '.'
+    def _set_prefix(self, tail_prefix):
+        """
+        Modifies the prefix that is added to metric names. The resulting prefix
+        is the concatenation of the component parts `base_prefix` and
+        `tail_prefix`. Only truthy components are included. Each included
+        component is followed by a period, e.g.::
+
+            <base_prefix>.<tail_prefix>.
+            <tail_prefix>.
+            <base_prefix>.
+            <the empty string>
+
+        Note: this method is expected to be called from the constructor only,
+        but exists to provide backwards compatible functionality for the
+        deprecated set_prefix() method.
+
+        :param tail_prefix: The new value of tail_prefix
+        """
+        if tail_prefix and self._base_prefix:
+            self._prefix = '.'.join([self._base_prefix, tail_prefix, ''])
+        elif tail_prefix:
+            self._prefix = tail_prefix + '.'
         elif self._base_prefix:
             self._prefix = self._base_prefix + '.'
         else:
             self._prefix = ''
+
+    def set_prefix(self, tail_prefix):
+        """
+        This method is deprecated; use the ``tail_prefix`` argument of the
+        constructor when instantiating the class instead.
+        """
+        warnings.warn(
+            'set_prefix() is deprecated; use the ``tail_prefix`` argument of '
+            'the constructor when instantiating the class instead.',
+            DeprecationWarning
+        )
+        self._set_prefix(tail_prefix)
 
     def _send(self, m_name, m_value, m_type, sample_rate):
         if sample_rate is None:
@@ -1724,23 +2043,41 @@ class SwiftLoggerAdapter(logging.LoggerAdapter):
     Like logging.LoggerAdapter, you have to subclass this and override the
     process() method to accomplish anything useful.
     """
-    def update_stats(self, *a, **kw):
-        return self.logger.update_stats(*a, **kw)
+    def get_metric_name(self, metric):
+        # subclasses may override this method to annotate the metric name
+        return metric
 
-    def increment(self, *a, **kw):
-        return self.logger.increment(*a, **kw)
+    def update_stats(self, metric, *a, **kw):
+        return self.logger.update_stats(self.get_metric_name(metric), *a, **kw)
 
-    def decrement(self, *a, **kw):
-        return self.logger.decrement(*a, **kw)
+    def increment(self, metric, *a, **kw):
+        return self.logger.increment(self.get_metric_name(metric), *a, **kw)
 
-    def timing(self, *a, **kw):
-        return self.logger.timing(*a, **kw)
+    def decrement(self, metric, *a, **kw):
+        return self.logger.decrement(self.get_metric_name(metric), *a, **kw)
 
-    def timing_since(self, *a, **kw):
-        return self.logger.timing_since(*a, **kw)
+    def timing(self, metric, *a, **kw):
+        return self.logger.timing(self.get_metric_name(metric), *a, **kw)
 
-    def transfer_rate(self, *a, **kw):
-        return self.logger.transfer_rate(*a, **kw)
+    def timing_since(self, metric, *a, **kw):
+        return self.logger.timing_since(self.get_metric_name(metric), *a, **kw)
+
+    def transfer_rate(self, metric, *a, **kw):
+        return self.logger.transfer_rate(
+            self.get_metric_name(metric), *a, **kw)
+
+    @property
+    def thread_locals(self):
+        return self.logger.thread_locals
+
+    @thread_locals.setter
+    def thread_locals(self, thread_locals):
+        self.logger.thread_locals = thread_locals
+
+    def exception(self, msg, *a, **kw):
+        # We up-call to exception() where stdlib uses error() so we can get
+        # some of the traceback suppression from LogAdapter, below
+        self.logger.exception(msg, *a, **kw)
 
 
 class PrefixLoggerAdapter(SwiftLoggerAdapter):
@@ -1751,14 +2088,36 @@ class PrefixLoggerAdapter(SwiftLoggerAdapter):
     def set_prefix(self, prefix):
         self.extra['prefix'] = prefix
 
-    def exception(self, *a, **kw):
-        self.logger.exception(*a, **kw)
+    def exception(self, msg, *a, **kw):
+        if 'prefix' in self.extra:
+            msg = self.extra['prefix'] + msg
+        super(PrefixLoggerAdapter, self).exception(msg, *a, **kw)
 
     def process(self, msg, kwargs):
         msg, kwargs = super(PrefixLoggerAdapter, self).process(msg, kwargs)
         if 'prefix' in self.extra:
             msg = self.extra['prefix'] + msg
         return (msg, kwargs)
+
+
+class MetricsPrefixLoggerAdapter(SwiftLoggerAdapter):
+    """
+    Adds a prefix to all Statsd metrics' names.
+    """
+    def __init__(self, logger, extra, metric_prefix):
+        """
+        :param logger: an instance of logging.Logger
+        :param extra: a dict-like object
+        :param metric_prefix: A prefix that will be added to the start of each
+            metric name such that the metric name is transformed to:
+            ``<metric_prefix>.<metric name>``. Note that the logger's
+            StatsdClient also adds its configured prefix to metric names.
+        """
+        super(MetricsPrefixLoggerAdapter, self).__init__(logger, extra)
+        self.metric_prefix = metric_prefix
+
+    def get_metric_name(self, metric):
+        return '%s.%s' % (self.metric_prefix, metric)
 
 
 # double inheritance to support property with setter
@@ -1775,6 +2134,37 @@ class LogAdapter(logging.LoggerAdapter, object):
         logging.LoggerAdapter.__init__(self, logger, {})
         self.server = server
         self.warn = self.warning
+
+    # There are a few properties needed for py35; see
+    # - https://bugs.python.org/issue31457
+    # - https://github.com/python/cpython/commit/1bbd482
+    # - https://github.com/python/cpython/commit/0b6a118
+    # - https://github.com/python/cpython/commit/ce9e625
+    def _log(self, level, msg, args, exc_info=None, extra=None,
+             stack_info=False):
+        """
+        Low-level log implementation, proxied to allow nested logger adapters.
+        """
+        return self.logger._log(
+            level,
+            msg,
+            args,
+            exc_info=exc_info,
+            extra=extra,
+            stack_info=stack_info,
+        )
+
+    @property
+    def manager(self):
+        return self.logger.manager
+
+    @manager.setter
+    def manager(self, value):
+        self.logger.manager = value
+
+    @property
+    def name(self):
+        return self.logger.name
 
     @property
     def txn_id(self):
@@ -1842,9 +2232,12 @@ class LogAdapter(logging.LoggerAdapter, object):
                 emsg = _('Network unreachable')
             elif exc.errno == errno.ETIMEDOUT:
                 emsg = _('Connection timeout')
+            elif exc.errno == errno.EPIPE:
+                emsg = _('Broken pipe')
             else:
                 call = self._exception
-        elif isinstance(exc, http_client.BadStatusLine):
+        elif isinstance(exc, (http_client.BadStatusLine,
+                              green_http_client.BadStatusLine)):
             # Use error(); not really exceptional
             emsg = '%s: %s' % (exc.__class__.__name__, exc.line)
         elif isinstance(exc, eventlet.Timeout):
@@ -1860,6 +2253,10 @@ class LogAdapter(logging.LoggerAdapter, object):
 
     def set_statsd_prefix(self, prefix):
         """
+        This method is deprecated. Callers should use the
+        ``statsd_tail_prefix`` argument of ``get_logger`` when instantiating a
+        logger.
+
         The StatsD client prefix defaults to the "name" of the logger.  This
         method may override that default with a specific value.  Currently used
         in the proxy-server to differentiate the Account, Container, and Object
@@ -1945,8 +2342,27 @@ class SwiftLogFormatter(logging.Formatter):
         return msg
 
 
+class LogLevelFilter(object):
+    """
+    Drop messages for the logger based on level.
+
+    This is useful when dependencies log too much information.
+
+    :param level: All messages at or below this level are dropped
+                  (DEBUG < INFO < WARN < ERROR < CRITICAL|FATAL)
+                  Default: DEBUG
+    """
+    def __init__(self, level=logging.DEBUG):
+        self.level = level
+
+    def filter(self, record):
+        if record.levelno <= self.level:
+            return 0
+        return 1
+
+
 def get_logger(conf, name=None, log_to_console=False, log_route=None,
-               fmt="%(server)s: %(message)s"):
+               fmt="%(server)s: %(message)s", statsd_tail_prefix=None):
     """
     Get the current system logger using config settings.
 
@@ -1966,12 +2382,24 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
         log_statsd_metric_prefix = (empty-string)
 
     :param conf: Configuration dict to read settings from
-    :param name: Name of the logger
+    :param name: This value is used to populate the ``server`` field in the log
+                 format, as the prefix for statsd messages, and as the default
+                 value for ``log_route``; defaults to the ``log_name`` value in
+                 ``conf``, if it exists, or to 'swift'.
     :param log_to_console: Add handler which writes to console on stderr
     :param log_route: Route for the logging, not emitted to the log, just used
-                      to separate logging configurations
+                      to separate logging configurations; defaults to the value
+                      of ``name`` or whatever ``name`` defaults to. This value
+                      is used as the name attribute of the
+                      ``logging.LogAdapter`` that is returned.
     :param fmt: Override log format
+    :param statsd_tail_prefix: tail prefix to pass to statsd client; if None
+        then the tail prefix defaults to the value of ``name``.
+    :return: an instance of ``LogAdapter``
     """
+    # note: log_name is typically specified in conf (i.e. defined by
+    # operators), whereas log_route is typically hard-coded in callers of
+    # get_logger (i.e. defined by developers)
     if not conf:
         conf = {}
     if name is None:
@@ -2001,13 +2429,19 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
                                           facility=facility)
     else:
         log_address = conf.get('log_address', '/dev/log')
+        handler = None
         try:
-            handler = ThreadSafeSysLogHandler(address=log_address,
-                                              facility=facility)
-        except socket.error as e:
-            # Either /dev/log isn't a UNIX socket or it does not exist at all
+            mode = os.stat(log_address).st_mode
+            if stat.S_ISSOCK(mode):
+                handler = ThreadSafeSysLogHandler(address=log_address,
+                                                  facility=facility)
+        except (OSError, socket.error) as e:
+            # If either /dev/log isn't a UNIX socket or it does not exist at
+            # all then py2 would raise an error
             if e.errno not in [errno.ENOTSOCK, errno.ENOENT]:
                 raise
+        if handler is None:
+            # fallback to default UDP
             handler = ThreadSafeSysLogHandler(facility=facility)
     handler.setFormatter(formatter)
     logger.addHandler(handler)
@@ -2039,8 +2473,10 @@ def get_logger(conf, name=None, log_to_console=False, log_route=None,
             'log_statsd_default_sample_rate', 1))
         sample_rate_factor = float(conf.get(
             'log_statsd_sample_rate_factor', 1))
+        if statsd_tail_prefix is None:
+            statsd_tail_prefix = name
         statsd_client = StatsdClient(statsd_host, statsd_port, base_prefix,
-                                     name, default_sample_rate,
+                                     statsd_tail_prefix, default_sample_rate,
                                      sample_rate_factor, logger=logger)
         logger.statsd_client = statsd_client
     else:
@@ -2074,7 +2510,7 @@ def get_hub():
 
     Note about epoll:
 
-    Review: https://review.openstack.org/#/c/18806/
+    Review: https://review.opendev.org/#/c/18806/
 
     There was a problem where once out of every 30 quadrillion
     connections, a coroutine wouldn't wake up when the client
@@ -2086,12 +2522,12 @@ def get_hub():
     Another note about epoll: it's hard to use when forking. epoll works
     like so:
 
-       * create an epoll instance: efd = epoll_create(...)
+    * create an epoll instance: ``efd = epoll_create(...)``
 
-       * register file descriptors of interest with epoll_ctl(efd,
-             EPOLL_CTL_ADD, fd, ...)
+    * register file descriptors of interest with
+      ``epoll_ctl(efd, EPOLL_CTL_ADD, fd, ...)``
 
-       * wait for events with epoll_wait(efd, ...)
+    * wait for events with ``epoll_wait(efd, ...)``
 
     If you fork, you and all your child processes end up using the same
     epoll instance, and everyone becomes confused. It is possible to use
@@ -2101,9 +2537,18 @@ def get_hub():
 
     In contrast, both poll() and select() specify the set of interesting
     file descriptors with each call, so there's no problem with forking.
+
+    As eventlet monkey patching is now done before call get_hub() in wsgi.py
+    if we use 'import select' we get the eventlet version, but since version
+    0.20.0 eventlet removed select.poll() function in patched select (see:
+    http://eventlet.net/doc/changelog.html and
+    https://github.com/eventlet/eventlet/commit/614a20462).
+
+    We use eventlet.patcher.original function to get python select module
+    to test if poll() is available on platform.
     """
     try:
-        import select
+        select = eventlet.patcher.original('select')
         if hasattr(select, "poll"):
             return "poll"
         return "selects"
@@ -2111,7 +2556,7 @@ def get_hub():
         return None
 
 
-def drop_privileges(user, call_setsid=True):
+def drop_privileges(user):
     """
     Sets the userid/groupid of the current process, get session leader, etc.
 
@@ -2124,11 +2569,13 @@ def drop_privileges(user, call_setsid=True):
     os.setgid(user[3])
     os.setuid(user[2])
     os.environ['HOME'] = user[5]
-    if call_setsid:
-        try:
-            os.setsid()
-        except OSError:
-            pass
+
+
+def clean_up_daemon_hygiene():
+    try:
+        os.setsid()
+    except OSError:
+        pass
     os.chdir('/')   # in case you need to rmdir on where you started the daemon
     os.umask(0o22)  # ensure files are created with the correct privileges
 
@@ -2257,25 +2704,25 @@ def expand_ipv6(address):
     return socket.inet_ntop(socket.AF_INET6, packed_ip)
 
 
-def whataremyips(bind_ip=None):
+def whataremyips(ring_ip=None):
     """
     Get "our" IP addresses ("us" being the set of services configured by
     one `*.conf` file). If our REST listens on a specific address, return it.
     Otherwise, if listen on '0.0.0.0' or '::' return all addresses, including
     the loopback.
 
-    :param str bind_ip: Optional bind_ip from a config file; may be IP address
-                        or hostname.
+    :param str ring_ip: Optional ring_ip/bind_ip from a config file; may be
+                        IP address or hostname.
     :returns: list of Strings of ip addresses
     """
-    if bind_ip:
+    if ring_ip:
         # See if bind_ip is '0.0.0.0'/'::'
         try:
             _, _, _, _, sockaddr = socket.getaddrinfo(
-                bind_ip, None, 0, socket.SOCK_STREAM, 0,
+                ring_ip, None, 0, socket.SOCK_STREAM, 0,
                 socket.AI_NUMERICHOST)[0]
             if sockaddr[0] not in ('0.0.0.0', '::'):
-                return [bind_ip]
+                return [ring_ip]
         except socket.gaierror:
             pass
 
@@ -2336,6 +2783,19 @@ def parse_socket_string(socket_string, default_port):
     return (host, port)
 
 
+def node_to_string(node_dict, replication=False):
+    if replication:
+        ip = node_dict['replication_ip']
+        port = node_dict['replication_port']
+    else:
+        ip = node_dict['ip']
+        port = node_dict['port']
+    if ':' in ip:
+        # IPv6
+        ip = '[%s]' % ip
+    return '{}:{}/{}'.format(ip, port, node_dict['device'])
+
+
 def storage_directory(datadir, partition, name_hash):
     """
     Get the storage directory
@@ -2370,10 +2830,10 @@ def hash_path(account, container=None, object=None, raw_digest=False):
                      else object.encode('utf8'))
     if raw_digest:
         return md5(HASH_PATH_PREFIX + b'/' + b'/'.join(paths)
-                   + HASH_PATH_SUFFIX).digest()
+                   + HASH_PATH_SUFFIX, usedforsecurity=False).digest()
     else:
         return md5(HASH_PATH_PREFIX + b'/' + b'/'.join(paths)
-                   + HASH_PATH_SUFFIX).hexdigest()
+                   + HASH_PATH_SUFFIX, usedforsecurity=False).hexdigest()
 
 
 def get_zero_indexed_base_string(base, index):
@@ -2414,7 +2874,8 @@ def _get_any_lock(fds):
 
 
 @contextmanager
-def lock_path(directory, timeout=10, timeout_class=None, limit=1):
+def lock_path(directory, timeout=None, timeout_class=None,
+              limit=1, name=None):
     """
     Context manager that acquires a lock on a directory.  This will block until
     the lock can be acquired, or the timeout time has expired (whichever occurs
@@ -2425,7 +2886,8 @@ def lock_path(directory, timeout=10, timeout_class=None, limit=1):
     workaround by locking a hidden file in the directory.
 
     :param directory: directory to be locked
-    :param timeout: timeout (in seconds)
+    :param timeout: timeout (in seconds). If None, defaults to
+        DEFAULT_LOCK_TIMEOUT
     :param timeout_class: The class of the exception to raise if the
         lock cannot be granted within the timeout. Will be
         constructed as timeout_class(timeout, lockpath). Default:
@@ -2434,15 +2896,21 @@ def lock_path(directory, timeout=10, timeout_class=None, limit=1):
         the same directory at the time this method is called. Note that this
         limit is only applied during the current call to this method and does
         not prevent subsequent calls giving a larger limit. Defaults to 1.
+    :param name: A string to distinguishes different type of locks in a
+        directory
     :raises TypeError: if limit is not an int.
     :raises ValueError: if limit is less than 1.
     """
-    if limit < 1:
-        raise ValueError('limit must be greater than or equal to 1')
+    if timeout is None:
+        timeout = DEFAULT_LOCK_TIMEOUT
     if timeout_class is None:
         timeout_class = swift.common.exceptions.LockTimeout
+    if limit < 1:
+        raise ValueError('limit must be greater than or equal to 1')
     mkdirs(directory)
     lockpath = '%s/.lock' % directory
+    if name:
+        lockpath += '-%s' % str(name)
     fds = [os.open(get_zero_indexed_base_string(lockpath, i),
                    os.O_WRONLY | os.O_CREAT)
            for i in range(limit)]
@@ -2466,17 +2934,20 @@ def lock_path(directory, timeout=10, timeout_class=None, limit=1):
 
 
 @contextmanager
-def lock_file(filename, timeout=10, append=False, unlink=True):
+def lock_file(filename, timeout=None, append=False, unlink=True):
     """
     Context manager that acquires a lock on a file.  This will block until
     the lock can be acquired, or the timeout time has expired (whichever occurs
     first).
 
     :param filename: file to be locked
-    :param timeout: timeout (in seconds)
+    :param timeout: timeout (in seconds). If None, defaults to
+        DEFAULT_LOCK_TIMEOUT
     :param append: True if file should be opened in append mode
     :param unlink: True if the file should be unlinked at the end
     """
+    if timeout is None:
+        timeout = DEFAULT_LOCK_TIMEOUT
     flags = os.O_CREAT | os.O_RDWR
     if append:
         flags |= os.O_APPEND
@@ -2511,14 +2982,15 @@ def lock_file(filename, timeout=10, append=False, unlink=True):
             file_obj.close()
 
 
-def lock_parent_directory(filename, timeout=10):
+def lock_parent_directory(filename, timeout=None):
     """
     Context manager that acquires a lock on the parent directory of the given
     file path.  This will block until the lock can be acquired, or the timeout
     time has expired (whichever occurs first).
 
     :param filename: file path of the parent directory to be locked
-    :param timeout: timeout (in seconds)
+    :param timeout: timeout (in seconds). If None, defaults to
+        DEFAULT_LOCK_TIMEOUT
     """
     return lock_path(os.path.dirname(filename), timeout=timeout)
 
@@ -2619,6 +3091,17 @@ def read_conf_dir(parser, conf_dir):
     return parser.read(sorted(conf_files))
 
 
+if six.PY2:
+    NicerInterpolation = None  # just don't cause ImportErrors over in wsgi.py
+else:
+    class NicerInterpolation(configparser.BasicInterpolation):
+        def before_get(self, parser, section, option, value, defaults):
+            if '%(' not in value:
+                return value
+            return super(NicerInterpolation, self).before_get(
+                parser, section, option, value, defaults)
+
+
 def readconf(conf_path, section_name=None, log_name=None, defaults=None,
              raw=False):
     """
@@ -2640,7 +3123,19 @@ def readconf(conf_path, section_name=None, log_name=None, defaults=None,
     if raw:
         c = RawConfigParser(defaults)
     else:
-        c = ConfigParser(defaults)
+        if six.PY2:
+            c = ConfigParser(defaults)
+        else:
+            # In general, we haven't really thought much about interpolation
+            # in configs. Python's default ConfigParser has always supported
+            # it, though, so *we* got it "for free". Unfortunatley, since we
+            # "supported" interpolation, we have to assume there are
+            # deployments in the wild that use it, and try not to break them.
+            # So, do what we can to mimic the py2 behavior of passing through
+            # values like "1%" (which we want to support for
+            # fallocate_reserve).
+            c = ConfigParser(defaults, interpolation=NicerInterpolation())
+
     if hasattr(conf_path, 'readline'):
         if hasattr(conf_path, 'seek'):
             conf_path.seek(0)
@@ -2674,6 +3169,27 @@ def readconf(conf_path, section_name=None, log_name=None, defaults=None,
             conf['log_name'] = log_name
     conf['__file__'] = conf_path
     return conf
+
+
+def parse_prefixed_conf(conf_file, prefix):
+    """
+    Search the config file for any common-prefix sections and load those
+    sections to a dict mapping the after-prefix reference to options.
+
+    :param conf_file: the file name of the config to parse
+    :param prefix: the common prefix of the sections
+    :return: a dict mapping policy reference -> dict of policy options
+    :raises ValueError: if a policy config section has an invalid name
+    """
+
+    ret_config = {}
+    all_conf = readconf(conf_file)
+    for section, options in all_conf.items():
+        if not section.startswith(prefix):
+            continue
+        target_ref = section[len(prefix):]
+        ret_config[target_ref] = options
+    return ret_config
 
 
 def write_pickle(obj, dest, tmp=None, pickle_protocol=0):
@@ -2773,67 +3289,269 @@ def remove_file(path):
         pass
 
 
+def remove_directory(path):
+    """Wrapper for os.rmdir, ENOENT and ENOTEMPTY are ignored
+
+    :param path: first and only argument passed to os.rmdir
+    """
+    try:
+        os.rmdir(path)
+    except OSError as e:
+        if e.errno not in (errno.ENOENT, errno.ENOTEMPTY):
+            raise
+
+
+def is_file_older(path, age):
+    """
+    Test if a file mtime is older than the given age, suppressing any OSErrors.
+
+    :param path: first and only argument passed to os.stat
+    :param age: age in seconds
+    :return: True if age is less than or equal to zero or if the file mtime is
+        more than ``age`` in the past; False if age is greater than zero and
+        the file mtime is less than or equal to ``age`` in the past or if there
+        is an OSError while stat'ing the file.
+    """
+    if age <= 0:
+        return True
+    try:
+        return time.time() - os.stat(path).st_mtime > age
+    except OSError:
+        return False
+
+
 def audit_location_generator(devices, datadir, suffix='',
-                             mount_check=True, logger=None):
+                             mount_check=True, logger=None,
+                             devices_filter=None, partitions_filter=None,
+                             suffixes_filter=None, hashes_filter=None,
+                             hook_pre_device=None, hook_post_device=None,
+                             hook_pre_partition=None, hook_post_partition=None,
+                             hook_pre_suffix=None, hook_post_suffix=None,
+                             hook_pre_hash=None, hook_post_hash=None,
+                             error_counter=None, yield_hash_dirs=False):
     """
     Given a devices path and a data directory, yield (path, device,
     partition) for all files in that directory
+
+    (devices|partitions|suffixes|hashes)_filter are meant to modify the list of
+    elements that will be iterated. eg: they can be used to exclude some
+    elements based on a custom condition defined by the caller.
+
+    hook_pre_(device|partition|suffix|hash) are called before yielding the
+    element, hook_pos_(device|partition|suffix|hash) are called after the
+    element was yielded. They are meant to do some pre/post processing.
+    eg: saving a progress status.
 
     :param devices: parent directory of the devices to be audited
     :param datadir: a directory located under self.devices. This should be
                     one of the DATADIR constants defined in the account,
                     container, and object servers.
     :param suffix: path name suffix required for all names returned
+                   (ignored if yield_hash_dirs is True)
     :param mount_check: Flag to check if a mount check should be performed
                     on devices
     :param logger: a logger object
+    :param devices_filter: a callable taking (devices, [list of devices]) as
+                           parameters and returning a [list of devices]
+    :param partitions_filter: a callable taking (datadir_path, [list of parts])
+                              as parameters and returning a [list of parts]
+    :param suffixes_filter: a callable taking (part_path, [list of suffixes])
+                            as parameters and returning a [list of suffixes]
+    :param hashes_filter: a callable taking (suff_path, [list of hashes]) as
+                          parameters and returning a [list of hashes]
+    :param hook_pre_device: a callable taking device_path as parameter
+    :param hook_post_device: a callable taking device_path as parameter
+    :param hook_pre_partition: a callable taking part_path as parameter
+    :param hook_post_partition: a callable taking part_path as parameter
+    :param hook_pre_suffix: a callable taking suff_path as parameter
+    :param hook_post_suffix: a callable taking suff_path as parameter
+    :param hook_pre_hash: a callable taking hash_path as parameter
+    :param hook_post_hash: a callable taking hash_path as parameter
+    :param error_counter: a dictionary used to accumulate error counts; may
+                          add keys 'unmounted' and 'unlistable_partitions'
+    :param yield_hash_dirs: if True, yield hash dirs instead of individual
+                            files
     """
     device_dir = listdir(devices)
     # randomize devices in case of process restart before sweep completed
     shuffle(device_dir)
+    if devices_filter:
+        device_dir = devices_filter(devices, device_dir)
     for device in device_dir:
         if mount_check and not ismount(os.path.join(devices, device)):
+            if error_counter is not None:
+                error_counter.setdefault('unmounted', [])
+                error_counter['unmounted'].append(device)
             if logger:
                 logger.warning(
                     _('Skipping %s as it is not mounted'), device)
             continue
+        if hook_pre_device:
+            hook_pre_device(os.path.join(devices, device))
         datadir_path = os.path.join(devices, device, datadir)
         try:
             partitions = listdir(datadir_path)
         except OSError as e:
+            # NB: listdir ignores non-existent datadir_path
+            if error_counter is not None:
+                error_counter.setdefault('unlistable_partitions', [])
+                error_counter['unlistable_partitions'].append(datadir_path)
             if logger:
                 logger.warning(_('Skipping %(datadir)s because %(err)s'),
                                {'datadir': datadir_path, 'err': e})
             continue
+        if partitions_filter:
+            partitions = partitions_filter(datadir_path, partitions)
         for partition in partitions:
             part_path = os.path.join(datadir_path, partition)
+            if hook_pre_partition:
+                hook_pre_partition(part_path)
             try:
                 suffixes = listdir(part_path)
             except OSError as e:
                 if e.errno != errno.ENOTDIR:
                     raise
                 continue
+            if suffixes_filter:
+                suffixes = suffixes_filter(part_path, suffixes)
             for asuffix in suffixes:
                 suff_path = os.path.join(part_path, asuffix)
+                if hook_pre_suffix:
+                    hook_pre_suffix(suff_path)
                 try:
                     hashes = listdir(suff_path)
                 except OSError as e:
                     if e.errno != errno.ENOTDIR:
                         raise
                     continue
+                if hashes_filter:
+                    hashes = hashes_filter(suff_path, hashes)
                 for hsh in hashes:
                     hash_path = os.path.join(suff_path, hsh)
-                    try:
-                        files = sorted(listdir(hash_path), reverse=True)
-                    except OSError as e:
-                        if e.errno != errno.ENOTDIR:
-                            raise
-                        continue
-                    for fname in files:
-                        if suffix and not fname.endswith(suffix):
+                    if hook_pre_hash:
+                        hook_pre_hash(hash_path)
+                    if yield_hash_dirs:
+                        if os.path.isdir(hash_path):
+                            yield hash_path, device, partition
+                    else:
+                        try:
+                            files = sorted(listdir(hash_path), reverse=True)
+                        except OSError as e:
+                            if e.errno != errno.ENOTDIR:
+                                raise
                             continue
-                        path = os.path.join(hash_path, fname)
-                        yield path, device, partition
+                        for fname in files:
+                            if suffix and not fname.endswith(suffix):
+                                continue
+                            path = os.path.join(hash_path, fname)
+                            yield path, device, partition
+                    if hook_post_hash:
+                        hook_post_hash(hash_path)
+                if hook_post_suffix:
+                    hook_post_suffix(suff_path)
+            if hook_post_partition:
+                hook_post_partition(part_path)
+        if hook_post_device:
+            hook_post_device(os.path.join(devices, device))
+
+
+class AbstractRateLimiter(object):
+    # 1,000 milliseconds = 1 second
+    clock_accuracy = 1000.0
+
+    def __init__(self, max_rate, rate_buffer=5, burst_after_idle=False,
+                 running_time=0):
+        """
+        :param max_rate: The maximum rate per second allowed for the process.
+            Must be > 0 to engage rate-limiting behavior.
+        :param rate_buffer: Number of seconds the rate counter can drop and be
+            allowed to catch up (at a faster than listed rate). A larger number
+            will result in larger spikes in rate but better average accuracy.
+        :param burst_after_idle: If False (the default) then the rate_buffer
+            allowance is lost after the rate limiter has not been called for
+            more than rate_buffer seconds. If True then the rate_buffer
+            allowance is preserved during idle periods which means that a burst
+            of requests may be granted immediately after the idle period.
+        :param running_time: The running time in milliseconds of the next
+            allowable request. Setting this to any time in the past will cause
+            the rate limiter to immediately allow requests; setting this to a
+            future time will cause the rate limiter to deny requests until that
+            time. If ``burst_after_idle`` is True then this can
+            be set to current time (ms) to avoid an initial burst, or set to
+            running_time < (current time - rate_buffer ms) to allow an initial
+            burst.
+        """
+        self.max_rate = max_rate
+        self.rate_buffer_ms = rate_buffer * self.clock_accuracy
+        self.burst_after_idle = burst_after_idle
+        self.running_time = running_time
+        self.time_per_incr = (self.clock_accuracy / self.max_rate
+                              if self.max_rate else 0)
+
+    def _sleep(self, seconds):
+        # subclasses should override to implement a sleep
+        raise NotImplementedError
+
+    def is_allowed(self, incr_by=1, now=None, block=False):
+        """
+        Check if the calling process is allowed to proceed according to the
+        rate limit.
+
+        :param incr_by: How much to increment the counter.  Useful if you want
+                        to ratelimit 1024 bytes/sec and have differing sizes
+                        of requests. Must be > 0 to engage rate-limiting
+                        behavior.
+        :param now: The time in seconds; defaults to time.time()
+        :param block: if True, the call will sleep until the calling process
+            is allowed to proceed; otherwise the call returns immediately.
+        :return: True if the the calling process is allowed to proceed, False
+            otherwise.
+        """
+        if self.max_rate <= 0 or incr_by <= 0:
+            return True
+
+        now = now or time.time()
+        # Convert seconds to milliseconds
+        now = now * self.clock_accuracy
+
+        # Calculate time per request in milliseconds
+        time_per_request = self.time_per_incr * float(incr_by)
+
+        # Convert rate_buffer to milliseconds and compare
+        if now - self.running_time > self.rate_buffer_ms:
+            self.running_time = now
+            if self.burst_after_idle:
+                self.running_time -= self.rate_buffer_ms
+
+        if now >= self.running_time:
+            self.running_time += time_per_request
+            allowed = True
+        elif block:
+            sleep_time = (self.running_time - now) / self.clock_accuracy
+            # increment running time before sleeping in case the sleep allows
+            # another thread to inspect the rate limiter state
+            self.running_time += time_per_request
+            # Convert diff to a floating point number of seconds and sleep
+            self._sleep(sleep_time)
+            allowed = True
+        else:
+            allowed = False
+
+        return allowed
+
+    def wait(self, incr_by=1, now=None):
+        self.is_allowed(incr_by=incr_by, now=now, block=True)
+
+
+class EventletRateLimiter(AbstractRateLimiter):
+    def __init__(self, max_rate, rate_buffer=5, running_time=0,
+                 burst_after_idle=False):
+        super(EventletRateLimiter, self).__init__(
+            max_rate, rate_buffer=rate_buffer, running_time=running_time,
+            burst_after_idle=burst_after_idle)
+
+    def _sleep(self, seconds):
+        eventlet.sleep(seconds)
 
 
 def ratelimit_sleep(running_time, max_rate, incr_by=1, rate_buffer=5):
@@ -2856,30 +3574,18 @@ def ratelimit_sleep(running_time, max_rate, incr_by=1, rate_buffer=5):
                         A larger number will result in larger spikes in rate
                         but better average accuracy. Must be > 0 to engage
                         rate-limiting behavior.
+    :return: The absolute time for the next interval in milliseconds; note
+        that time could have passed well beyond that point, but the next call
+        will catch that and skip the sleep.
     """
-    if max_rate <= 0 or incr_by <= 0:
-        return running_time
-
-    # 1,000 milliseconds = 1 second
-    clock_accuracy = 1000.0
-
-    # Convert seconds to milliseconds
-    now = time.time() * clock_accuracy
-
-    # Calculate time per request in milliseconds
-    time_per_request = clock_accuracy * (float(incr_by) / max_rate)
-
-    # Convert rate_buffer to milliseconds and compare
-    if now - running_time > rate_buffer * clock_accuracy:
-        running_time = now
-    elif running_time - now > time_per_request:
-        # Convert diff back to a floating point number of seconds and sleep
-        eventlet.sleep((running_time - now) / clock_accuracy)
-
-    # Return the absolute time for the next interval in milliseconds; note
-    # that time could have passed well beyond that point, but the next call
-    # will catch that and skip the sleep.
-    return running_time + time_per_request
+    warnings.warn(
+        'ratelimit_sleep() is deprecated; use the ``EventletRateLimiter`` '
+        'class instead.', DeprecationWarning
+    )
+    rate_limit = EventletRateLimiter(max_rate, rate_buffer=rate_buffer,
+                                     running_time=running_time)
+    rate_limit.wait(incr_by=incr_by)
+    return rate_limit.running_time
 
 
 class ContextPool(GreenPool):
@@ -2895,6 +3601,9 @@ class ContextPool(GreenPool):
 
 class GreenAsyncPileWaitallTimeout(Timeout):
     pass
+
+
+DEAD = object()
 
 
 class GreenAsyncPile(object):
@@ -2925,6 +3634,10 @@ class GreenAsyncPile(object):
     def _run_func(self, func, args, kwargs):
         try:
             self._responses.put(func(*args, **kwargs))
+        except Exception:
+            if eventlet.hubs.get_hub().debug_exceptions:
+                traceback.print_exception(*sys.exc_info())
+            self._responses.put(DEAD)
         finally:
             self._inflight -= 1
 
@@ -2975,14 +3688,17 @@ class GreenAsyncPile(object):
         return self
 
     def next(self):
-        try:
-            rv = self._responses.get_nowait()
-        except eventlet.queue.Empty:
-            if self._inflight == 0:
-                raise StopIteration()
-            rv = self._responses.get()
-        self._pending -= 1
-        return rv
+        while True:
+            try:
+                rv = self._responses.get_nowait()
+            except eventlet.queue.Empty:
+                if self._inflight == 0:
+                    raise StopIteration()
+                rv = self._responses.get()
+            self._pending -= 1
+            if rv is DEAD:
+                continue
+            return rv
     __next__ = next
 
 
@@ -3013,7 +3729,11 @@ class StreamingPile(GreenAsyncPile):
 
         # Keep populating the pile as greenthreads become available
         for args in args_iter:
-            yield next(self)
+            try:
+                to_yield = next(self)
+            except StopIteration:
+                break
+            yield to_yield
             self.spawn(func, *args)
 
         # Drain the pile
@@ -3026,38 +3746,6 @@ class StreamingPile(GreenAsyncPile):
 
     def __exit__(self, type, value, traceback):
         self.pool.__exit__(type, value, traceback)
-
-
-class ModifiedParseResult(ParseResult):
-    """Parse results class for urlparse."""
-
-    @property
-    def hostname(self):
-        netloc = self.netloc.split('@', 1)[-1]
-        if netloc.startswith('['):
-            return netloc[1:].split(']')[0]
-        elif ':' in netloc:
-            return netloc.rsplit(':')[0]
-        return netloc
-
-    @property
-    def port(self):
-        netloc = self.netloc.split('@', 1)[-1]
-        if netloc.startswith('['):
-            netloc = netloc.rsplit(']')[1]
-        if ':' in netloc:
-            return int(netloc.rsplit(':')[1])
-        return None
-
-
-def urlparse(url):
-    """
-    urlparse augmentation.
-    This is necessary because urlparse can't handle RFC 2732 URLs.
-
-    :param url: URL to parse.
-    """
-    return ModifiedParseResult(*stdlib_urlparse(url))
 
 
 def validate_sync_to(value, allowed_sync_hosts, realms_conf):
@@ -3153,7 +3841,7 @@ def affinity_key_function(affinity_str):
     pieces = [s.strip() for s in affinity_str.split(',')]
     for piece in pieces:
         # matches r<number>=<number> or r<number>z<number>=<number>
-        match = re.match("r(\d+)(?:z(\d+))?=(\d+)$", piece)
+        match = re.match(r"r(\d+)(?:z(\d+))?=(\d+)$", piece)
         if match:
             region, zone, priority = match.groups()
             region = int(region)
@@ -3206,7 +3894,7 @@ def affinity_locality_predicate(write_affinity_str):
     pieces = [s.strip() for s in affinity_str.split(',')]
     for piece in pieces:
         # matches r<number> or r<number>z<number>
-        match = re.match("r(\d+)(?:z(\d+))?$", piece)
+        match = re.match(r"r(\d+)(?:z(\d+))?$", piece)
         if match:
             region, zone = match.groups()
             region = int(region)
@@ -3303,7 +3991,7 @@ def dump_recon_cache(cache_dict, cache_file, logger, lock_timeout=2,
             try:
                 existing_entry = cf.readline()
                 if existing_entry:
-                    cache_entry = json.loads(existing_entry.decode('utf8'))
+                    cache_entry = json.loads(existing_entry)
             except ValueError:
                 # file doesn't have a valid entry, we'll recreate it
                 pass
@@ -3413,6 +4101,17 @@ def public(func):
     :param func: function to make public
     """
     func.publicly_accessible = True
+    return func
+
+
+def private(func):
+    """
+    Decorator to declare which methods are privately accessible as HTTP
+    requests with an ``X-Backend-Allow-Private-Methods: True`` override
+
+    :param func: function to make private
+    """
+    func.privately_accessible = True
     return func
 
 
@@ -3535,23 +4234,26 @@ class CloseableChain(object):
     """
     def __init__(self, *iterables):
         self.iterables = iterables
+        self.chained_iter = itertools.chain(*self.iterables)
 
     def __iter__(self):
-        return iter(itertools.chain(*(self.iterables)))
+        return self
+
+    def __next__(self):
+        return next(self.chained_iter)
+
+    next = __next__  # py2
 
     def close(self):
         for it in self.iterables:
-            close_method = getattr(it, 'close', None)
-            if close_method:
-                close_method()
+            close_if_possible(it)
 
 
 def reiterate(iterable):
     """
-    Consume the first item from an iterator, then re-chain it to the rest of
-    the iterator.  This is useful when you want to make sure the prologue to
-    downstream generators have been executed before continuing.
-
+    Consume the first truthy item from an iterator, then re-chain it to the
+    rest of the iterator.  This is useful when you want to make sure the
+    prologue to downstream generators have been executed before continuing.
     :param iterable: an iterable object
     """
     if isinstance(iterable, (list, tuple)):
@@ -3559,12 +4261,13 @@ def reiterate(iterable):
     else:
         iterator = iter(iterable)
         try:
-            chunk = ''
+            chunk = next(iterator)
             while not chunk:
                 chunk = next(iterator)
             return CloseableChain([chunk], iterator)
         except StopIteration:
-            return []
+            close_if_possible(iterable)
+            return iter([])
 
 
 class InputProxy(object):
@@ -3757,7 +4460,10 @@ class Spliterator(object):
                     yield to_yield
 
             while n > 0:
-                chunk = next(self.input_iterator)
+                try:
+                    chunk = next(self.input_iterator)
+                except StopIteration:
+                    return
                 cl = len(chunk)
                 if cl <= n:
                     n -= cl
@@ -3801,7 +4507,13 @@ def ismount_raw(path):
         raise
 
     if stat.S_ISLNK(s1.st_mode):
-        # A symlink can never be a mount point
+        # Some environments (like vagrant-swift-all-in-one) use a symlink at
+        # the device level but could still provide a stubfile in the target
+        # to indicate that it should be treated as a mount point for swift's
+        # purposes.
+        if os.path.isfile(os.path.join(path, ".ismount")):
+            return True
+        # Otherwise, a symlink can never be a mount point
         return False
 
     s2 = os.lstat(os.path.join(path, '..'))
@@ -3846,6 +4558,21 @@ def closing_if_possible(maybe_closable):
         yield maybe_closable
     finally:
         close_if_possible(maybe_closable)
+
+
+def drain_and_close(response_or_app_iter):
+    """
+    Drain and close a swob or WSGI response.
+
+    This ensures we don't log a 499 in the proxy just because we realized we
+    don't care about the body of an error.
+    """
+    app_iter = getattr(response_or_app_iter, 'app_iter', response_or_app_iter)
+    if app_iter is None:  # for example, if we used the Response.body property
+        return
+    for _chunk in app_iter:
+        pass
+    close_if_possible(app_iter)
 
 
 _rfc_token = r'[^()<>@,;:\"/\[\]?={}\x00-\x20\x7f]+'
@@ -3954,11 +4681,11 @@ def quote(value, safe='/'):
 def get_expirer_container(x_delete_at, expirer_divisor, acc, cont, obj):
     """
     Returns an expiring object container name for given X-Delete-At and
-    a/c/o.
+    (native string) a/c/o.
     """
     shard_int = int(hash_path(acc, cont, obj), 16) % 100
     return normalize_delete_at_timestamp(
-        int(x_delete_at) / expirer_divisor * expirer_divisor - shard_int)
+        int(x_delete_at) // expirer_divisor * expirer_divisor - shard_int)
 
 
 class _MultipartMimeFileLikeObject(object):
@@ -4048,8 +4775,7 @@ def iter_multipart_mime_documents(wsgi_input, boundary, read_chunk_size=4096):
     for doing that if necessary.
 
     :param wsgi_input: The file-like object to read from.
-    :param boundary: The mime boundary to separate new file-like
-                     objects on.
+    :param boundary: The mime boundary to separate new file-like objects on.
     :returns: A generator of file-like objects for each part.
     :raises MimeInvalid: if the document is malformed
     """
@@ -4064,7 +4790,7 @@ def iter_multipart_mime_documents(wsgi_input, boundary, read_chunk_size=4096):
 
     if got.strip() != boundary:
         raise swift.common.exceptions.MimeInvalid(
-            'invalid starting boundary: wanted %r, got %r', (boundary, got))
+            'invalid starting boundary: wanted %r, got %r' % (boundary, got))
     boundary = b'\r\n' + boundary
     input_buffer = b''
     done = False
@@ -4118,6 +4844,10 @@ def mime_to_document_iters(input_file, boundary, read_chunk_size=4096):
         (e.g. "divider", not "--divider")
     :param read_chunk_size: size of strings read via input_file.read()
     """
+    if six.PY3 and isinstance(boundary, str):
+        # Since the boundary is in client-supplied headers, it can contain
+        # garbage that trips us and we don't like client-induced 500.
+        boundary = boundary.encode('latin-1', errors='replace')
     doc_files = iter_multipart_mime_documents(input_file, boundary,
                                               read_chunk_size)
     for i, doc_file in enumerate(doc_files):
@@ -4144,7 +4874,7 @@ def maybe_multipart_byteranges_to_document_iters(app_iter, content_type):
     body_file = FileLikeIter(app_iter)
     boundary = dict(params_list)['boundary']
     for _headers, body in mime_to_document_iters(body_file, boundary):
-        yield (chunk for chunk in iter(lambda: body.read(65536), ''))
+        yield (chunk for chunk in iter(lambda: body.read(65536), b''))
 
 
 def document_iters_to_multipart_byteranges(ranges_iter, boundary):
@@ -4154,9 +4884,11 @@ def document_iters_to_multipart_byteranges(ranges_iter, boundary):
 
     See document_iters_to_http_response_body for parameter descriptions.
     """
+    if not isinstance(boundary, bytes):
+        boundary = boundary.encode('ascii')
 
-    divider = "--" + boundary + "\r\n"
-    terminator = "--" + boundary + "--"
+    divider = b"--" + boundary + b"\r\n"
+    terminator = b"--" + boundary + b"--"
 
     for range_spec in ranges_iter:
         start_byte = range_spec["start_byte"]
@@ -4164,19 +4896,23 @@ def document_iters_to_multipart_byteranges(ranges_iter, boundary):
         entity_length = range_spec.get("entity_length", "*")
         content_type = range_spec["content_type"]
         part_iter = range_spec["part_iter"]
+        if not isinstance(content_type, bytes):
+            content_type = str(content_type).encode('utf-8')
+        if not isinstance(entity_length, bytes):
+            entity_length = str(entity_length).encode('utf-8')
 
-        part_header = ''.join((
+        part_header = b''.join((
             divider,
-            "Content-Type: ", str(content_type), "\r\n",
-            "Content-Range: ", "bytes %d-%d/%s\r\n" % (
+            b"Content-Type: ", content_type, b"\r\n",
+            b"Content-Range: ", b"bytes %d-%d/%s\r\n" % (
                 start_byte, end_byte, entity_length),
-            "\r\n"
+            b"\r\n"
         ))
         yield part_header
 
         for chunk in part_iter:
             yield chunk
-        yield "\r\n"
+        yield b"\r\n"
     yield terminator
 
 
@@ -4373,6 +5109,161 @@ def get_md5_socket():
     return md5_sockfd
 
 
+try:
+    _test_md5 = hashlib.md5(usedforsecurity=False)  # nosec
+
+    def md5(string=b'', usedforsecurity=True):
+        """Return an md5 hashlib object using usedforsecurity parameter
+
+        For python distributions that support the usedforsecurity keyword
+        parameter, this passes the parameter through as expected.
+        See https://bugs.python.org/issue9216
+        """
+        return hashlib.md5(string, usedforsecurity=usedforsecurity)  # nosec
+except TypeError:
+    def md5(string=b'', usedforsecurity=True):
+        """Return an md5 hashlib object without usedforsecurity parameter
+
+        For python distributions that do not yet support this keyword
+        parameter, we drop the parameter
+        """
+        return hashlib.md5(string)  # nosec
+
+
+class ShardRangeOuterBound(object):
+    """
+    A custom singleton type to be subclassed for the outer bounds of
+    ShardRanges.
+    """
+    _singleton = None
+
+    def __new__(cls):
+        if cls is ShardRangeOuterBound:
+            raise TypeError('ShardRangeOuterBound is an abstract class; '
+                            'only subclasses should be instantiated')
+        if cls._singleton is None:
+            cls._singleton = super(ShardRangeOuterBound, cls).__new__(cls)
+        return cls._singleton
+
+    def __str__(self):
+        return ''
+
+    def __repr__(self):
+        return type(self).__name__
+
+    def __bool__(self):
+        return False
+
+    __nonzero__ = __bool__
+
+
+class ShardName(object):
+    """
+    Encapsulates the components of a shard name.
+
+    Instances of this class would typically be constructed via the create() or
+    parse() class methods.
+
+    Shard names have the form:
+
+        <account>/<root_container>-<parent_container_hash>-<timestamp>-<index>
+
+    Note: some instances of :class:`~swift.common.utils.ShardRange` have names
+    that will NOT parse as a :class:`~swift.common.utils.ShardName`; e.g. a
+    root container's own shard range will have a name format of
+    <account>/<root_container> which will raise ValueError if passed to parse.
+    """
+    def __init__(self, account, root_container,
+                 parent_container_hash,
+                 timestamp,
+                 index):
+        self.account = self._validate(account)
+        self.root_container = self._validate(root_container)
+        self.parent_container_hash = self._validate(parent_container_hash)
+        self.timestamp = Timestamp(timestamp)
+        self.index = int(index)
+
+    @classmethod
+    def _validate(cls, arg):
+        if arg is None:
+            raise ValueError('arg must not be None')
+        return arg
+
+    def __str__(self):
+        return '%s/%s-%s-%s-%s' % (self.account,
+                                   self.root_container,
+                                   self.parent_container_hash,
+                                   self.timestamp.internal,
+                                   self.index)
+
+    @classmethod
+    def hash_container_name(cls, container_name):
+        """
+        Calculates the hash of a container name.
+
+        :param container_name: name to be hashed.
+        :return: the hexdigest of the md5 hash of ``container_name``.
+        :raises ValueError: if ``container_name`` is None.
+        """
+        cls._validate(container_name)
+        if not isinstance(container_name, bytes):
+            container_name = container_name.encode('utf-8')
+        hash = md5(container_name, usedforsecurity=False).hexdigest()
+        return hash
+
+    @classmethod
+    def create(cls, account, root_container, parent_container,
+               timestamp, index):
+        """
+        Create an instance of :class:`~swift.common.utils.ShardName`.
+
+        :param account: the hidden internal account to which the shard
+            container belongs.
+        :param root_container: the name of the root container for the shard.
+        :param parent_container: the name of the parent container for the
+            shard; for initial first generation shards this should be the same
+            as ``root_container``; for shards of shards this should be the name
+            of the sharding shard container.
+        :param timestamp: an instance of :class:`~swift.common.utils.Timestamp`
+        :param index: a unique index that will distinguish the path from any
+            other path generated using the same combination of
+            ``account``, ``root_container``, ``parent_container`` and
+            ``timestamp``.
+
+        :return: an instance of :class:`~swift.common.utils.ShardName`.
+        :raises ValueError: if any argument is None
+        """
+        # we make the shard name unique with respect to other shards names by
+        # embedding a hash of the parent container name; we use a hash (rather
+        # than the actual parent container name) to prevent shard names become
+        # longer with every generation.
+        parent_container_hash = cls.hash_container_name(parent_container)
+        return cls(account, root_container, parent_container_hash, timestamp,
+                   index)
+
+    @classmethod
+    def parse(cls, name):
+        """
+        Parse ``name`` to an instance of
+        :class:`~swift.common.utils.ShardName`.
+
+        :param name: a shard name which should have the form:
+            <account>/
+            <root_container>-<parent_container_hash>-<timestamp>-<index>
+
+        :return: an instance of :class:`~swift.common.utils.ShardName`.
+        :raises ValueError: if ``name`` is not a valid shard name.
+        """
+        try:
+            account, container = name.split('/', 1)
+            root_container, parent_container_hash, timestamp, index = \
+                container.rsplit('-', 3)
+            return cls(account, root_container, parent_container_hash,
+                       timestamp, index)
+        except ValueError:
+            raise ValueError('invalid name: %s' % name)
+
+
 class ShardRange(object):
     """
     A ShardRange encapsulates sharding state related to a container including
@@ -4416,6 +5307,10 @@ class ShardRange(object):
         value.
     :param epoch: optional epoch timestamp which represents the time at which
         sharding was enabled for a container.
+    :param reported: optional indicator that this shard and its stats have
+        been reported to the root container.
+    :param tombstones: the number of tombstones in the shard range; defaults to
+        -1 to indicate that the value is unknown.
     """
     FOUND = 10
     CREATED = 20
@@ -4424,49 +5319,42 @@ class ShardRange(object):
     SHRINKING = 50
     SHARDING = 60
     SHARDED = 70
+    SHRUNK = 80
     STATES = {FOUND: 'found',
               CREATED: 'created',
               CLEAVED: 'cleaved',
               ACTIVE: 'active',
               SHRINKING: 'shrinking',
               SHARDING: 'sharding',
-              SHARDED: 'sharded'}
+              SHARDED: 'sharded',
+              SHRUNK: 'shrunk'}
     STATES_BY_NAME = dict((v, k) for k, v in STATES.items())
-
-    class OuterBound(object):
-        def __eq__(self, other):
-            return isinstance(other, type(self))
-
-        def __ne__(self, other):
-            return not self.__eq__(other)
-
-        def __str__(self):
-            return ''
-
-        def __repr__(self):
-            return type(self).__name__
-
-        def __bool__(self):
-            return False
-
-        __nonzero__ = __bool__
+    SHRINKING_STATES = (SHRINKING, SHRUNK)
 
     @functools.total_ordering
-    class MaxBound(OuterBound):
+    class MaxBound(ShardRangeOuterBound):
+        # singleton for maximum bound
         def __ge__(self, other):
             return True
 
     @functools.total_ordering
-    class MinBound(OuterBound):
+    class MinBound(ShardRangeOuterBound):
+        # singleton for minimum bound
         def __le__(self, other):
             return True
 
     MIN = MinBound()
     MAX = MaxBound()
+    __slots__ = (
+        'account', 'container',
+        '_timestamp', '_meta_timestamp', '_state_timestamp', '_epoch',
+        '_lower', '_upper', '_deleted', '_state', '_count', '_bytes',
+        '_tombstones', '_reported')
 
     def __init__(self, name, timestamp, lower=MIN, upper=MAX,
                  object_count=0, bytes_used=0, meta_timestamp=None,
-                 deleted=False, state=None, state_timestamp=None, epoch=None):
+                 deleted=False, state=None, state_timestamp=None, epoch=None,
+                 reported=False, tombstones=-1):
         self.account = self.container = self._timestamp = \
             self._meta_timestamp = self._state_timestamp = self._epoch = None
         self._lower = ShardRange.MIN
@@ -4485,29 +5373,66 @@ class ShardRange(object):
         self.state = self.FOUND if state is None else state
         self.state_timestamp = state_timestamp
         self.epoch = epoch
+        self.reported = reported
+        self.tombstones = tombstones
+
+    @classmethod
+    def sort_key(cls, sr):
+        # defines the sort order for shard ranges
+        # note if this ever changes to *not* sort by upper first then it breaks
+        # a key assumption for bisect, which is used by utils.find_shard_range
+        return sr.upper, sr.state, sr.lower, sr.name
 
     @classmethod
     def _encode(cls, value):
         if six.PY2 and isinstance(value, six.text_type):
             return value.encode('utf-8')
+        if six.PY3 and isinstance(value, six.binary_type):
+            # This should never fail -- the value should always be coming from
+            # valid swift paths, which means UTF-8
+            return value.decode('utf-8')
         return value
 
     def _encode_bound(self, bound):
-        if isinstance(bound, ShardRange.OuterBound):
+        if isinstance(bound, ShardRangeOuterBound):
             return bound
-        if not isinstance(bound, string_types):
+        if not (isinstance(bound, six.text_type) or
+                isinstance(bound, six.binary_type)):
             raise TypeError('must be a string type')
         return self._encode(bound)
 
-    @classmethod
-    def _make_container_name(cls, root_container, parent_container, timestamp,
-                             index):
-        if not isinstance(parent_container, bytes):
-            parent_container = parent_container.encode('utf-8')
-        return "%s-%s-%s-%s" % (root_container,
-                                hashlib.md5(parent_container).hexdigest(),
-                                cls._to_timestamp(timestamp).internal,
-                                index)
+    def is_child_of(self, parent):
+        """
+        Test if this shard range is a child of another shard range. The
+        parent-child relationship is inferred from the names of the shard
+        ranges. This method is limited to work only within the scope of the
+        same user-facing account (with and without shard prefix).
+
+        :param parent: an instance of ``ShardRange``.
+        :return: True if ``parent`` is the parent of this shard range, False
+            otherwise, assuming that they are within the same account.
+        """
+        # note: We limit the usages of this method to be within the same
+        # account, because account shard prefix is configurable and it's hard
+        # to perform checking without breaking backward-compatibility.
+        try:
+            self_parsed_name = ShardName.parse(self.name)
+        except ValueError:
+            # self is not a shard and therefore not a child.
+            return False
+
+        try:
+            parsed_parent_name = ShardName.parse(parent.name)
+            parent_root_container = parsed_parent_name.root_container
+        except ValueError:
+            # parent is a root container.
+            parent_root_container = parent.container
+
+        return (
+            self_parsed_name.root_container == parent_root_container
+            and self_parsed_name.parent_container_hash
+            == ShardName.hash_container_name(parent.container)
+        )
 
     @classmethod
     def make_path(cls, shards_account, root_container, parent_container,
@@ -4530,9 +5455,12 @@ class ShardRange(object):
             ``timestamp``.
         :return: a string of the form <account_name>/<container_name>
         """
-        shard_container = cls._make_container_name(
-            root_container, parent_container, timestamp, index)
-        return '%s/%s' % (shards_account, shard_container)
+        timestamp = cls._to_timestamp(timestamp)
+        return str(ShardName.create(shards_account,
+                                    root_container,
+                                    parent_container,
+                                    timestamp,
+                                    index))
 
     @classmethod
     def _to_timestamp(cls, timestamp):
@@ -4583,7 +5511,8 @@ class ShardRange(object):
 
     @lower.setter
     def lower(self, value):
-        if value in (None, ''):
+        if value is None or (value == b"" if isinstance(value, bytes) else
+                             value == u""):
             value = ShardRange.MIN
         try:
             value = self._encode_bound(value)
@@ -4609,7 +5538,8 @@ class ShardRange(object):
 
     @upper.setter
     def upper(self, value):
-        if value in (None, ''):
+        if value is None or (value == b"" if isinstance(value, bytes) else
+                             value == u""):
             value = ShardRange.MAX
         try:
             value = self._encode_bound(value)
@@ -4643,6 +5573,24 @@ class ShardRange(object):
             raise ValueError('bytes_used cannot be < 0')
         self._bytes = bytes_used
 
+    @property
+    def tombstones(self):
+        return self._tombstones
+
+    @tombstones.setter
+    def tombstones(self, tombstones):
+        self._tombstones = int(tombstones)
+
+    @property
+    def row_count(self):
+        """
+        Returns the total number of rows in the shard range i.e. the sum of
+        objects and tombstones.
+
+        :return: the row count
+        """
+        return self.object_count + max(self.tombstones, 0)
+
     def update_meta(self, object_count, bytes_used, meta_timestamp=None):
         """
         Set the object stats metadata to the given values and update the
@@ -4656,8 +5604,35 @@ class ShardRange(object):
             cast to an int, or if meta_timestamp is neither None nor can be
             cast to a :class:`~swift.common.utils.Timestamp`.
         """
-        self.object_count = int(object_count)
-        self.bytes_used = int(bytes_used)
+        if self.object_count != int(object_count):
+            self.object_count = int(object_count)
+            self.reported = False
+
+        if self.bytes_used != int(bytes_used):
+            self.bytes_used = int(bytes_used)
+            self.reported = False
+
+        if meta_timestamp is None:
+            self.meta_timestamp = Timestamp.now()
+        else:
+            self.meta_timestamp = meta_timestamp
+
+    def update_tombstones(self, tombstones, meta_timestamp=None):
+        """
+        Set the tombstones metadata to the given values and update the
+        meta_timestamp to the current time.
+
+        :param tombstones: should be an integer
+        :param meta_timestamp: timestamp for metadata; if not given the
+            current time will be set.
+        :raises ValueError: if ``tombstones`` cannot be cast to an int, or
+            if meta_timestamp is neither None nor can be cast to a
+            :class:`~swift.common.utils.Timestamp`.
+        """
+        tombstones = int(tombstones)
+        if 0 <= tombstones != self.tombstones:
+            self.tombstones = tombstones
+            self.reported = False
         if meta_timestamp is None:
             self.meta_timestamp = Timestamp.now()
         else:
@@ -4688,17 +5663,19 @@ class ShardRange(object):
             valid state number.
         """
         try:
-            state = state.lower()
-            state_num = cls.STATES_BY_NAME[state]
-        except (KeyError, AttributeError):
             try:
-                state_name = cls.STATES[state]
-            except KeyError:
-                raise ValueError('Invalid state %r' % state)
-            else:
-                state_num = state
-        else:
-            state_name = state
+                # maybe it's a number
+                float_state = float(state)
+                state_num = int(float_state)
+                if state_num != float_state:
+                    raise ValueError('Invalid state %r' % state)
+                state_name = cls.STATES[state_num]
+            except (ValueError, TypeError):
+                # maybe it's a state name
+                state_name = state.lower()
+                state_num = cls.STATES_BY_NAME[state_name]
+        except (KeyError, AttributeError):
+            raise ValueError('Invalid state %r' % state)
         return state_num, state_name
 
     @property
@@ -4707,14 +5684,7 @@ class ShardRange(object):
 
     @state.setter
     def state(self, state):
-        try:
-            float_state = float(state)
-            int_state = int(float_state)
-        except (ValueError, TypeError):
-            raise ValueError('Invalid state %r' % state)
-        if int_state != float_state or int_state not in self.STATES:
-            raise ValueError('Invalid state %r' % state)
-        self._state = int_state
+        self._state = self.resolve_state(state)[0]
 
     @property
     def state_text(self):
@@ -4738,6 +5708,14 @@ class ShardRange(object):
     def epoch(self, epoch):
         self._epoch = self._to_timestamp(epoch)
 
+    @property
+    def reported(self):
+        return self._reported
+
+    @reported.setter
+    def reported(self, value):
+        self._reported = bool(value)
+
     def update_state(self, state, state_timestamp=None):
         """
         Set state to the given value and optionally update the state_timestamp
@@ -4754,6 +5732,7 @@ class ShardRange(object):
         self.state = state
         if state_timestamp is not None:
             self.state_timestamp = state_timestamp
+        self.reported = False
         return True
 
     @property
@@ -4798,7 +5777,7 @@ class ShardRange(object):
         elif other is None:
             return True
         else:
-            return self.upper < other
+            return self.upper < self._encode(other)
 
     def __gt__(self, other):
         # a ShardRange is greater than other if its entire namespace is greater
@@ -4812,13 +5791,19 @@ class ShardRange(object):
         elif other is None:
             return False
         else:
-            return self.lower >= other
+            return self.lower >= self._encode(other)
 
     def __eq__(self, other):
         # test for equality of range bounds only
         if not isinstance(other, ShardRange):
             return False
         return self.lower == other.lower and self.upper == other.upper
+
+    # A by-the-book implementation should probably hash the value, which
+    # in our case would be account+container+lower+upper (+timestamp ?).
+    # But we seem to be okay with just the identity.
+    def __hash__(self):
+        return id(self)
 
     def __ne__(self, other):
         return not (self == other)
@@ -4870,6 +5855,8 @@ class ShardRange(object):
         yield 'state', self.state
         yield 'state_timestamp', self.state_timestamp.internal
         yield 'epoch', self.epoch.internal if self.epoch is not None else None
+        yield 'reported', 1 if self.reported else 0
+        yield 'tombstones', self.tombstones
 
     def copy(self, timestamp=None, **kwargs):
         """
@@ -4901,7 +5888,162 @@ class ShardRange(object):
             params['name'], params['timestamp'], params['lower'],
             params['upper'], params['object_count'], params['bytes_used'],
             params['meta_timestamp'], params['deleted'], params['state'],
-            params['state_timestamp'], params['epoch'])
+            params['state_timestamp'], params['epoch'],
+            params.get('reported', 0), params.get('tombstones', -1))
+
+    def expand(self, donors):
+        """
+        Expands the bounds as necessary to match the minimum and maximum bounds
+        of the given donors.
+
+        :param donors: A list of :class:`~swift.common.utils.ShardRange`
+        :return: True if the bounds have been modified, False otherwise.
+        """
+        modified = False
+        new_lower = self.lower
+        new_upper = self.upper
+        for donor in donors:
+            new_lower = min(new_lower, donor.lower)
+            new_upper = max(new_upper, donor.upper)
+        if self.lower > new_lower or self.upper < new_upper:
+            self.lower = new_lower
+            self.upper = new_upper
+            modified = True
+        return modified
+
+
+class ShardRangeList(UserList):
+    """
+    This class provides some convenience functions for working with lists of
+    :class:`~swift.common.utils.ShardRange`.
+
+    This class does not enforce ordering or continuity of the list items:
+    callers should ensure that items are added in order as appropriate.
+    """
+    def __getitem__(self, index):
+        # workaround for py3 - not needed for py2.7,py3.8
+        result = self.data[index]
+        return ShardRangeList(result) if type(result) == list else result
+
+    @property
+    def lower(self):
+        """
+        Returns the lower bound of the first item in the list. Note: this will
+        only be equal to the lowest bound of all items in the list if the list
+        contents has been sorted.
+
+        :return: lower bound of first item in the list, or ShardRange.MIN
+                 if the list is empty.
+        """
+        if not self:
+            # empty list has range MIN->MIN
+            return ShardRange.MIN
+        return self[0].lower
+
+    @property
+    def upper(self):
+        """
+        Returns the upper bound of the first item in the list. Note: this will
+        only be equal to the uppermost bound of all items in the list if the
+        list has previously been sorted.
+
+        :return: upper bound of first item in the list, or ShardRange.MIN
+                 if the list is empty.
+        """
+        if not self:
+            # empty list has range MIN->MIN
+            return ShardRange.MIN
+        return self[-1].upper
+
+    @property
+    def object_count(self):
+        """
+        Returns the total number of objects of all items in the list.
+
+        :return: total object count
+        """
+        return sum(sr.object_count for sr in self)
+
+    @property
+    def row_count(self):
+        """
+        Returns the total number of rows of all items in the list.
+
+        :return: total row count
+        """
+        return sum(sr.row_count for sr in self)
+
+    @property
+    def bytes_used(self):
+        """
+        Returns the total number of bytes in all items in the list.
+
+        :return: total bytes used
+        """
+        return sum(sr.bytes_used for sr in self)
+
+    @property
+    def timestamps(self):
+        return set(sr.timestamp for sr in self)
+
+    @property
+    def states(self):
+        return set(sr.state for sr in self)
+
+    def includes(self, other):
+        """
+        Check if another ShardRange namespace is enclosed between the list's
+        ``lower`` and ``upper`` properties. Note: the list's ``lower`` and
+        ``upper`` properties will only equal the outermost bounds of all items
+        in the list if the list has previously been sorted.
+
+        Note: the list does not need to contain an item matching ``other`` for
+        this method to return True, although if the list has been sorted and
+        does contain an item matching ``other`` then the method will return
+        True.
+
+        :param other: an instance of :class:`~swift.common.utils.ShardRange`
+        :return: True if other's namespace is enclosed, False otherwise.
+        """
+        return self.lower <= other.lower and self.upper >= other.upper
+
+    def filter(self, includes=None, marker=None, end_marker=None):
+        """
+        Filter the list for those shard ranges whose namespace includes the
+        ``includes`` name or any part of the namespace between ``marker`` and
+        ``end_marker``. If none of ``includes``, ``marker`` or ``end_marker``
+        are specified then all shard ranges will be returned.
+
+        :param includes: a string; if not empty then only the shard range, if
+            any, whose namespace includes this string will be returned, and
+            ``marker`` and ``end_marker`` will be ignored.
+        :param marker: if specified then only shard ranges whose upper bound is
+            greater than this value will be returned.
+        :param end_marker: if specified then only shard ranges whose lower
+            bound is less than this value will be returned.
+        :return: A new instance of :class:`~swift.common.utils.ShardRangeList`
+            containing the filtered shard ranges.
+        """
+        return ShardRangeList(
+            filter_shard_ranges(self, includes, marker, end_marker))
+
+    def find_lower(self, condition):
+        """
+        Finds the first shard range satisfies the given condition and returns
+        its lower bound.
+
+        :param condition: A function that must accept a single argument of type
+            :class:`~swift.common.utils.ShardRange` and return True if the
+            shard range satisfies the condition or False otherwise.
+        :return: The lower bound of the first shard range to satisfy the
+            condition, or the ``upper`` value of this list if no such shard
+            range is found.
+
+        """
+        for sr in self:
+            if condition(sr):
+                return sr.lower
+        return self.upper
 
 
 def find_shard_range(item, ranges):
@@ -4918,6 +6060,45 @@ def find_shard_range(item, ranges):
     if index != len(ranges) and item in ranges[index]:
         return ranges[index]
     return None
+
+
+def filter_shard_ranges(shard_ranges, includes, marker, end_marker):
+    """
+    Filter the given shard ranges to those whose namespace includes the
+    ``includes`` name or any part of the namespace between ``marker`` and
+    ``end_marker``. If none of ``includes``, ``marker`` or ``end_marker`` are
+    specified then all shard ranges will be returned.
+
+    :param shard_ranges: A list of :class:`~swift.common.utils.ShardRange`.
+    :param includes: a string; if not empty then only the shard range, if any,
+        whose namespace includes this string will be returned, and ``marker``
+        and ``end_marker`` will be ignored.
+    :param marker: if specified then only shard ranges whose upper bound is
+        greater than this value will be returned.
+    :param end_marker: if specified then only shard ranges whose lower bound is
+        less than this value will be returned.
+    :return: A filtered list of :class:`~swift.common.utils.ShardRange`.
+    """
+    if includes:
+        shard_range = find_shard_range(includes, shard_ranges)
+        return [shard_range] if shard_range else []
+
+    def shard_range_filter(sr):
+        end = start = True
+        if end_marker:
+            end = end_marker > sr.lower
+        if marker:
+            start = marker < sr.upper
+        return start and end
+
+    if marker or end_marker:
+        return list(filter(shard_range_filter, shard_ranges))
+
+    if marker == ShardRange.MAX or end_marker == ShardRange.MIN:
+        # MIN and MAX are both Falsy so not handled by shard_range_filter
+        return []
+
+    return shard_ranges
 
 
 def modify_priority(conf, logger):
@@ -4996,7 +6177,7 @@ def o_tmpfile_in_path_supported(dirpath):
             return False
         else:
             raise Exception("Error on '%(path)s' while checking "
-                            "O_TMPFILE: '%(ex)s'",
+                            "O_TMPFILE: '%(ex)s'" %
                             {'path': dirpath, 'ex': e})
     finally:
         if fd is not None:
@@ -5005,22 +6186,6 @@ def o_tmpfile_in_path_supported(dirpath):
 
 def o_tmpfile_in_tmpdir_supported():
     return o_tmpfile_in_path_supported(gettempdir())
-
-
-def o_tmpfile_supported():
-    """
-    Returns True if O_TMPFILE flag is supported.
-
-    O_TMPFILE was introduced in Linux 3.11 but it also requires support from
-    underlying filesystem being used. Some common filesystems and linux
-    versions in which those filesystems added support for O_TMPFILE:
-    xfs (3.15)
-    ext4 (3.11)
-    btrfs (3.16)
-    """
-    return all([linkat.available,
-                platform.system() == 'Linux',
-                LooseVersion(platform.release()) >= LooseVersion('3.16')])
 
 
 def safe_json_loads(value):
@@ -5078,32 +6243,79 @@ def md5_hash_for_file(fname):
     :returns: MD5 checksum, hex encoded
     """
     with open(fname, 'rb') as f:
-        md5sum = md5()
+        md5sum = md5(usedforsecurity=False)
         for block in iter(lambda: f.read(MD5_BLOCK_READ_BYTES), b''):
             md5sum.update(block)
     return md5sum.hexdigest()
 
 
-def replace_partition_in_path(path, part_power):
+def get_partition_for_hash(hex_hash, part_power):
     """
-    Takes a full path to a file and a partition power and returns
-    the same path, but with the correct partition number. Most useful when
-    increasing the partition power.
+    Return partition number for given hex hash and partition power.
+    :param hex_hash: A hash string
+    :param part_power: partition power
+    :returns: partition number
+    """
+    raw_hash = binascii.unhexlify(hex_hash)
+    part_shift = 32 - int(part_power)
+    return struct.unpack_from('>I', raw_hash)[0] >> part_shift
 
-    :param path: full path to a file, for example object .data file
+
+def get_partition_from_path(devices, path):
+    """
+    :param devices: directory where devices are mounted (e.g. /srv/node)
+    :param path: full path to a object file or hashdir
+    :returns: the (integer) partition from the path
+    """
+    offset_parts = devices.rstrip(os.sep).split(os.sep)
+    path_components = path.split(os.sep)
+    if offset_parts == path_components[:len(offset_parts)]:
+        offset = len(offset_parts)
+    else:
+        raise ValueError('Path %r is not under device dir %r' % (
+            path, devices))
+    return int(path_components[offset + 2])
+
+
+def replace_partition_in_path(devices, path, part_power):
+    """
+    Takes a path and a partition power and returns the same path, but with the
+    correct partition number. Most useful when increasing the partition power.
+
+    :param devices: directory where devices are mounted (e.g. /srv/node)
+    :param path: full path to a object file or hashdir
     :param part_power: partition power to compute correct partition number
     :returns: Path with re-computed partition power
     """
-
+    offset_parts = devices.rstrip(os.sep).split(os.sep)
     path_components = path.split(os.sep)
-    digest = binascii.unhexlify(path_components[-2])
-
-    part_shift = 32 - int(part_power)
-    part = struct.unpack_from('>I', digest)[0] >> part_shift
-
-    path_components[-4] = "%d" % part
-
+    if offset_parts == path_components[:len(offset_parts)]:
+        offset = len(offset_parts)
+    else:
+        raise ValueError('Path %r is not under device dir %r' % (
+            path, devices))
+    part = get_partition_for_hash(path_components[offset + 4], part_power)
+    path_components[offset + 2] = "%d" % part
     return os.sep.join(path_components)
+
+
+def load_pkg_resource(group, uri):
+    if '#' in uri:
+        uri, name = uri.split('#', 1)
+    else:
+        name = uri
+        uri = 'egg:swift'
+
+    if ':' in uri:
+        scheme, dist = uri.split(':', 1)
+        scheme = scheme.lower()
+    else:
+        scheme = 'egg'
+        dist = uri
+
+    if scheme != 'egg':
+        raise TypeError('Unhandled URI scheme: %r' % scheme)
+    return pkg_resources.load_entry_point(dist, group, name)
 
 
 class PipeMutex(object):
@@ -5175,7 +6387,7 @@ class PipeMutex(object):
                 # Tell eventlet to suspend the current greenthread until
                 # self.rfd becomes readable. This will happen when someone
                 # else writes to self.wfd.
-                trampoline(self.rfd, read=True)
+                eventlet.hubs.trampoline(self.rfd, read=True)
 
     def release(self):
         """
@@ -5221,9 +6433,44 @@ class PipeMutex(object):
         self.close()
 
 
+class NoopMutex(object):
+    """
+    "Mutex" that doesn't lock anything.
+
+    We only allow our syslog logging to be configured via UDS or UDP, neither
+    of which have the message-interleaving trouble you'd expect from TCP or
+    file handlers.
+    """
+    def __init__(self):
+        # Usually, it's an error to have multiple greenthreads all waiting
+        # to write to the same file descriptor. It's often a sign of inadequate
+        # concurrency control; for example, if you have two greenthreads
+        # trying to use the same memcache connection, they'll end up writing
+        # interleaved garbage to the socket or stealing part of each others'
+        # responses.
+        #
+        # In this case, we have multiple greenthreads waiting on the same
+        # (logging) file descriptor by design. So, similar to the PipeMutex,
+        # we must turn off eventlet's multiple-waiter detection.
+        #
+        # It would be better to turn off multiple-reader detection for only
+        # the logging socket fd, but eventlet does not support that.
+        eventlet.debug.hub_prevent_multiple_readers(False)
+
+    def acquire(self, blocking=True):
+        pass
+
+    def release(self):
+        pass
+
+
 class ThreadSafeSysLogHandler(SysLogHandler):
     def createLock(self):
-        self.lock = PipeMutex()
+        if config_true_value(os.environ.get(
+                'SWIFT_NOOP_LOGGING_MUTEX') or 'true'):
+            self.lock = NoopMutex()
+        else:
+            self.lock = PipeMutex()
 
 
 def round_robin_iter(its):
@@ -5317,6 +6564,9 @@ def get_redirect_data(response):
     if 'Location' not in headers:
         return None
     location = urlparse(headers['Location']).path
+    if config_true_value(headers.get('X-Backend-Location-Is-Quoted',
+                                     'false')):
+        location = unquote(location)
     account, container, _junk = split_path(location, 2, 3, True)
     timestamp_val = headers.get('X-Backend-Redirect-Timestamp')
     try:
@@ -5379,7 +6629,7 @@ def make_db_file_path(db_path, epoch):
 def get_db_files(db_path):
     """
     Given the path to a db file, return a sorted list of all valid db files
-    that actually exist in that path's dir. A valid db filename has the form:
+    that actually exist in that path's dir. A valid db filename has the form::
 
         <hash>[_<epoch>].db
 
@@ -5409,3 +6659,159 @@ def get_db_files(db_path):
             continue
         results.append(os.path.join(db_dir, f))
     return sorted(results)
+
+
+def systemd_notify(logger=None):
+    """
+    Notify the service manager that started this process, if it is
+    systemd-compatible, that this process correctly started. To do so,
+    it communicates through a Unix socket stored in environment variable
+    NOTIFY_SOCKET. More information can be found in systemd documentation:
+    https://www.freedesktop.org/software/systemd/man/sd_notify.html
+
+    :param logger: a logger object
+    """
+    msg = b'READY=1'
+    notify_socket = os.getenv('NOTIFY_SOCKET')
+    if notify_socket:
+        if notify_socket.startswith('@'):
+            # abstract namespace socket
+            notify_socket = '\0%s' % notify_socket[1:]
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        with closing(sock):
+            try:
+                sock.connect(notify_socket)
+                sock.sendall(msg)
+                del os.environ['NOTIFY_SOCKET']
+            except EnvironmentError:
+                if logger:
+                    logger.debug("Systemd notification failed", exc_info=True)
+
+
+class Watchdog(object):
+    """
+    Implements a watchdog to efficiently manage concurrent timeouts.
+
+    Compared to eventlet.timeouts.Timeout, it reduces the number of context
+    switching in eventlet by avoiding to schedule actions (throw an Exception),
+    then unschedule them if the timeouts are cancelled.
+
+    1. at T+0, request timeout(10)
+        => wathdog greenlet sleeps 10 seconds
+    2. at T+1, request timeout(15)
+        => the timeout will expire after the current, no need to wake up the
+           watchdog greenlet
+    3. at T+2, request timeout(5)
+        => the timeout will expire before the first timeout, wake up the
+           watchdog greenlet to calculate a new sleep period
+    4. at T+7, the 3rd timeout expires
+        => the exception is raised, then the greenlet watchdog sleep(3) to
+           wake up for the 1st timeout expiration
+    """
+    def __init__(self):
+        # key => (timeout, timeout_at, caller_greenthread, exception)
+        self._timeouts = dict()
+        self._evt = Event()
+        self._next_expiration = None
+        self._run_gth = None
+
+    def start(self, timeout, exc, timeout_at=None):
+        """
+        Schedule a timeout action
+
+        :param timeout: duration before the timeout expires
+        :param exc: exception to throw when the timeout expire, must inherit
+                    from eventlet.timeouts.Timeout
+        :param timeout_at: allow to force the expiration timestamp
+        :return: id of the scheduled timeout, needed to cancel it
+        """
+        if not timeout_at:
+            timeout_at = time.time() + timeout
+        gth = eventlet.greenthread.getcurrent()
+        timeout_definition = (timeout, timeout_at, gth, exc)
+        key = id(timeout_definition)
+        self._timeouts[key] = timeout_definition
+
+        # Wake up the watchdog loop only when there is a new shorter timeout
+        if (self._next_expiration is None
+                or self._next_expiration > timeout_at):
+            # There could be concurrency on .send(), so wrap it in a try
+            try:
+                if not self._evt.ready():
+                    self._evt.send()
+            except AssertionError:
+                pass
+
+        return key
+
+    def stop(self, key):
+        """
+        Cancel a scheduled timeout
+
+        :param key: timeout id, as returned by start()
+        """
+        try:
+            if key in self._timeouts:
+                del(self._timeouts[key])
+        except KeyError:
+            pass
+
+    def spawn(self):
+        """
+        Start the watchdog greenthread.
+        """
+        if self._run_gth is None:
+            self._run_gth = eventlet.spawn(self.run)
+
+    def run(self):
+        while True:
+            self._run()
+
+    def _run(self):
+        now = time.time()
+        self._next_expiration = None
+        if self._evt.ready():
+            self._evt.reset()
+        for k, (timeout, timeout_at, gth, exc) in list(self._timeouts.items()):
+            if timeout_at <= now:
+                try:
+                    if k in self._timeouts:
+                        del(self._timeouts[k])
+                except KeyError:
+                    pass
+                e = exc()
+                e.seconds = timeout
+                eventlet.hubs.get_hub().schedule_call_global(0, gth.throw, e)
+            else:
+                if (self._next_expiration is None
+                        or self._next_expiration > timeout_at):
+                    self._next_expiration = timeout_at
+        if self._next_expiration is None:
+            sleep_duration = self._next_expiration
+        else:
+            sleep_duration = self._next_expiration - now
+        self._evt.wait(sleep_duration)
+
+
+class WatchdogTimeout(object):
+    """
+    Context manager to schedule a timeout in a Watchdog instance
+    """
+    def __init__(self, watchdog, timeout, exc, timeout_at=None):
+        """
+        Schedule a timeout in a Watchdog instance
+
+        :param watchdog: Watchdog instance
+        :param timeout: duration before the timeout expires
+        :param exc: exception to throw when the timeout expire, must inherit
+                    from eventlet.timeouts.Timeout
+        :param timeout_at: allow to force the expiration timestamp
+        """
+        self.watchdog = watchdog
+        self.key = watchdog.start(timeout, exc, timeout_at=timeout_at)
+
+    def __enter__(self):
+        pass
+
+    def __exit__(self, type, value, traceback):
+        self.watchdog.stop(self.key)

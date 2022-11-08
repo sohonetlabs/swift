@@ -13,26 +13,21 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import errno
-import json
+import itertools
 from contextlib import contextmanager
-from hashlib import md5
 import unittest
 import uuid
-import shutil
 import random
-from collections import defaultdict
-import os
 import time
+import six
 
 from swift.common.direct_client import DirectClientException
+from swift.common.manager import Manager
+from swift.common.utils import md5
+from swift.obj.reconstructor import ObjectReconstructor
 from test.probe.common import ECProbeTest
 
 from swift.common import direct_client
-from swift.common.storage_policy import EC_POLICY
-from swift.common.manager import Manager
-from swift.obj.reconstructor import _get_partners
 
 from swiftclient import client, ClientException
 
@@ -40,10 +35,10 @@ from swiftclient import client, ClientException
 class Body(object):
 
     def __init__(self, total=3.5 * 2 ** 20):
-        self.total = total
-        self.hasher = md5()
+        self.total = int(total)
+        self.hasher = md5(usedforsecurity=False)
         self.size = 0
-        self.chunk = 'test' * 16 * 2 ** 10
+        self.chunk = b'test' * 16 * 2 ** 10
 
     @property
     def etag(self):
@@ -52,30 +47,21 @@ class Body(object):
     def __iter__(self):
         return self
 
-    def next(self):
+    def __next__(self):
         if self.size > self.total:
             raise StopIteration()
         self.size += len(self.chunk)
         self.hasher.update(self.chunk)
         return self.chunk
 
-    def __next__(self):
-        return next(self)
+    # for py2 compat
+    next = __next__
 
 
 class TestReconstructorRebuild(ECProbeTest):
 
-    def _make_name(self, prefix):
-        return '%s%s' % (prefix, uuid.uuid4())
-
     def setUp(self):
         super(TestReconstructorRebuild, self).setUp()
-        self.container_name = self._make_name('container-')
-        self.object_name = self._make_name('object-')
-        # sanity
-        self.assertEqual(self.policy.policy_type, EC_POLICY)
-        self.reconstructor = Manager(["object-reconstructor"])
-
         # create EC container
         headers = {'X-Storage-Policy': self.policy.name}
         client.put_container(self.url, self.token, self.container_name,
@@ -99,77 +85,6 @@ class TestReconstructorRebuild(ECProbeTest):
             self.assertIn(
                 'X-Backend-Durable-Timestamp', hdrs,
                 'Missing durable timestamp in %r' % self.frag_headers)
-
-    def proxy_put(self, extra_headers=None):
-        contents = Body()
-        headers = {
-            self._make_name('x-object-meta-').decode('utf8'):
-                self._make_name('meta-foo-').decode('utf8'),
-        }
-        if extra_headers:
-            headers.update(extra_headers)
-        self.etag = client.put_object(self.url, self.token,
-                                      self.container_name,
-                                      self.object_name,
-                                      contents=contents, headers=headers)
-
-    def proxy_get(self):
-        # GET object
-        headers, body = client.get_object(self.url, self.token,
-                                          self.container_name,
-                                          self.object_name,
-                                          resp_chunk_size=64 * 2 ** 10)
-        resp_checksum = md5()
-        for chunk in body:
-            resp_checksum.update(chunk)
-        return headers, resp_checksum.hexdigest()
-
-    def direct_get(self, node, part, require_durable=True, extra_headers=None):
-        req_headers = {'X-Backend-Storage-Policy-Index': int(self.policy)}
-        if extra_headers:
-            req_headers.update(extra_headers)
-        if not require_durable:
-            req_headers.update(
-                {'X-Backend-Fragment-Preferences': json.dumps([])})
-        # node dict has unicode values so utf8 decode our path parts too in
-        # case they have non-ascii characters
-        headers, data = direct_client.direct_get_object(
-            node, part, self.account.decode('utf8'),
-            self.container_name.decode('utf8'),
-            self.object_name.decode('utf8'), headers=req_headers,
-            resp_chunk_size=64 * 2 ** 20)
-        hasher = md5()
-        for chunk in data:
-            hasher.update(chunk)
-        return headers, hasher.hexdigest()
-
-    def _break_nodes(self, failed, non_durable):
-        # delete partitions on the failed nodes and remove durable marker from
-        # non-durable nodes
-        for i, node in enumerate(self.onodes):
-            part_dir = self.storage_dir('object', node, part=self.opart)
-            if i in failed:
-                shutil.rmtree(part_dir, True)
-                try:
-                    self.direct_get(node, self.opart)
-                except direct_client.DirectClientException as err:
-                    self.assertEqual(err.http_status, 404)
-            elif i in non_durable:
-                for dirs, subdirs, files in os.walk(part_dir):
-                    for fname in files:
-                        if fname.endswith('.data'):
-                            non_durable_fname = fname.replace('#d', '')
-                            os.rename(os.path.join(dirs, fname),
-                                      os.path.join(dirs, non_durable_fname))
-                            break
-                headers, etag = self.direct_get(node, self.opart,
-                                                require_durable=False)
-                self.assertNotIn('X-Backend-Durable-Timestamp', headers)
-            try:
-                os.remove(os.path.join(part_dir, 'hashes.pkl'))
-            except OSError as e:
-                if e.errno != errno.ENOENT:
-                    raise
 
     def _format_node(self, node):
         return '%s#%s' % (node['device'], node['index'])
@@ -211,7 +126,7 @@ class TestReconstructorRebuild(ECProbeTest):
         # helper method to test a scenario with some nodes missing their
         # fragment and some nodes having non-durable fragments
         with self._annotate_failure_with_scenario(failed, non_durable):
-            self._break_nodes(failed, non_durable)
+            self.break_nodes(self.onodes, self.opart, failed, non_durable)
 
         # make sure we can still GET the object and it is correct; the
         # proxy is doing decode on remaining fragments to get the obj
@@ -300,46 +215,46 @@ class TestReconstructorRebuild(ECProbeTest):
             self._test_rebuild_scenario(failed, non_durable, 3)
 
     def test_rebuild_partner_down(self):
-        # find a primary server that only has one of it's devices in the
-        # primary node list
-        group_nodes_by_config = defaultdict(list)
-        for n in self.onodes:
-            group_nodes_by_config[self.config_number(n)].append(n)
-        for config_number, node_list in group_nodes_by_config.items():
-            if len(node_list) == 1:
-                break
-        else:
-            self.fail('ring balancing did not use all available nodes')
-        primary_node = node_list[0]
+        # we have to pick a lower index because we have few handoffs
+        nodes = self.onodes[:2]
+        random.shuffle(nodes)  # left or right is fine
+        primary_node, partner_node = nodes
 
-        # pick one it's partners to fail randomly
-        partner_node = random.choice(_get_partners(
-            primary_node['index'], self.onodes))
+        # capture fragment etag from partner
+        failed_partner_meta, failed_partner_etag = self.direct_get(
+            partner_node, self.opart)
 
-        # 507 the partner device
-        device_path = self.device_dir('object', partner_node)
+        # and 507 the failed partner device
+        device_path = self.device_dir(partner_node)
         self.kill_drive(device_path)
-
-        # select another primary sync_to node to fail
-        failed_primary = [n for n in self.onodes if n['id'] not in
-                          (primary_node['id'], partner_node['id'])][0]
-        # ... capture it's fragment etag
-        failed_primary_meta, failed_primary_etag = self.direct_get(
-            failed_primary, self.opart)
-        # ... and delete it
-        part_dir = self.storage_dir('object', failed_primary, part=self.opart)
-        shutil.rmtree(part_dir, True)
 
         # reconstruct from the primary, while one of it's partners is 507'd
         self.reconstructor.once(number=self.config_number(primary_node))
 
-        # the other failed primary will get it's fragment rebuilt instead
-        failed_primary_meta_new, failed_primary_etag_new = self.direct_get(
-            failed_primary, self.opart)
-        del failed_primary_meta['Date']
-        del failed_primary_meta_new['Date']
-        self.assertEqual(failed_primary_etag, failed_primary_etag_new)
-        self.assertEqual(failed_primary_meta, failed_primary_meta_new)
+        # a handoff will pickup the rebuild
+        hnodes = list(self.object_ring.get_more_nodes(self.opart))
+        for node in hnodes:
+            try:
+                found_meta, found_etag = self.direct_get(
+                    node, self.opart)
+            except DirectClientException as e:
+                if e.http_status != 404:
+                    raise
+            else:
+                break
+        else:
+            self.fail('Unable to fetch rebuilt frag from handoffs %r '
+                      'given primary nodes %r with %s unmounted '
+                      'trying to rebuild from %s' % (
+                          [h['device'] for h in hnodes],
+                          [n['device'] for n in self.onodes],
+                          partner_node['device'],
+                          primary_node['device'],
+                      ))
+        self.assertEqual(failed_partner_etag, found_etag)
+        del failed_partner_meta['Date']
+        del found_meta['Date']
+        self.assertEqual(failed_partner_meta, found_meta)
 
         # just to be nice
         self.revive_drive(device_path)
@@ -368,10 +283,12 @@ class TestReconstructorRebuild(ECProbeTest):
 
         # sanity check - X-Backend-Replication let's us get expired frag...
         fail_node = random.choice(self.onodes)
-        self.direct_get(fail_node, self.opart,
-                        extra_headers={'X-Backend-Replication': 'True'})
+        self.assert_direct_get_succeeds(
+            fail_node, self.opart,
+            extra_headers={'X-Backend-Replication': 'True'})
         # ...until we remove the frag from fail_node
-        self._break_nodes([self.onodes.index(fail_node)], [])
+        self.break_nodes(
+            self.onodes, self.opart, [self.onodes.index(fail_node)], [])
         # ...now it's really gone
         with self.assertRaises(DirectClientException) as cm:
             self.direct_get(fail_node, self.opart,
@@ -404,13 +321,13 @@ class TestReconstructorRebuild(ECProbeTest):
         opart, onodes = self.object_ring.get_nodes(
             self.account, self.container_name, self.object_name)
         delete_at = int(time.time() + 3)
-        contents = 'body-%s' % uuid.uuid4()
+        contents = ('body-%s' % uuid.uuid4()).encode()
         headers = {'x-delete-at': delete_at}
         client.put_object(self.url, self.token, self.container_name,
                           self.object_name, headers=headers, contents=contents)
         # fail a primary
         post_fail_node = random.choice(onodes)
-        post_fail_path = self.device_dir('object', post_fail_node)
+        post_fail_path = self.device_dir(post_fail_node)
         self.kill_drive(post_fail_path)
         # post over w/o x-delete-at
         client.post_object(self.url, self.token, self.container_name,
@@ -420,15 +337,17 @@ class TestReconstructorRebuild(ECProbeTest):
         # wait for the delete_at to pass, and check that it thinks the object
         # is expired
         timeout = time.time() + 5
+        err = None
         while time.time() < timeout:
             try:
                 direct_client.direct_head_object(
                     post_fail_node, opart, self.account, self.container_name,
                     self.object_name, headers={
                         'X-Backend-Storage-Policy-Index': int(self.policy)})
-            except direct_client.ClientException as err:
-                if err.http_status != 404:
+            except direct_client.ClientException as client_err:
+                if client_err.http_status != 404:
                     raise
+                err = client_err
                 break
             else:
                 time.sleep(0.1)
@@ -452,11 +371,170 @@ class TestReconstructorRebuild(ECProbeTest):
                     'X-Backend-Storage-Policy-Index': int(self.policy)})
             self.assertNotIn('X-Delete-At', headers)
 
+    def test_rebuild_quarantines_lonely_frag(self):
+        # fail one device while the object is deleted so we are left with one
+        # fragment and some tombstones
+        failed_node = self.onodes[0]
+        device_path = self.device_dir(failed_node)
+        self.kill_drive(device_path)
+        self.assert_direct_get_fails(failed_node, self.opart, 507)  # sanity
 
-class TestReconstructorRebuildUTF8(TestReconstructorRebuild):
+        # delete object
+        client.delete_object(self.url, self.token, self.container_name,
+                             self.object_name)
 
-    def _make_name(self, prefix):
-        return '%s\xc3\xa8-%s' % (prefix, uuid.uuid4())
+        # check we have tombstones
+        for node in self.onodes[1:]:
+            err = self.assert_direct_get_fails(node, self.opart, 404)
+            self.assertIn('X-Backend-Timestamp', err.http_headers)
+
+        # run the reconstructor with zero reclaim age to clean up tombstones
+        for conf_index in self.configs['object-reconstructor'].keys():
+            self.run_custom_daemon(
+                ObjectReconstructor, 'object-reconstructor', conf_index,
+                {'reclaim_age': '0'})
+
+        # check we no longer have tombstones
+        for node in self.onodes[1:]:
+            err = self.assert_direct_get_fails(node, self.opart, 404)
+            self.assertNotIn('X-Timestamp', err.http_headers)
+
+        # revive the failed device and check it has a fragment
+        self.revive_drive(device_path)
+        self.assert_direct_get_succeeds(failed_node, self.opart)
+
+        # restart proxy to clear error-limiting so that the revived drive
+        # participates again
+        Manager(['proxy-server']).restart()
+
+        # client GET will fail with 503 ...
+        with self.assertRaises(ClientException) as cm:
+            client.get_object(self.url, self.token, self.container_name,
+                              self.object_name)
+        self.assertEqual(503, cm.exception.http_status)
+        # ... but client GET succeeds
+        headers = client.head_object(self.url, self.token, self.container_name,
+                                     self.object_name)
+        for key in self.headers_post:
+            self.assertIn(key, headers)
+            self.assertEqual(self.headers_post[key], headers[key])
+
+        # run the reconstructor without quarantine_threshold set
+        error_lines = []
+        warning_lines = []
+        for conf_index in self.configs['object-reconstructor'].keys():
+            reconstructor = self.run_custom_daemon(
+                ObjectReconstructor, 'object-reconstructor', conf_index,
+                {'quarantine_age': '0'})
+            logger = reconstructor.logger.logger
+            error_lines.append(logger.get_lines_for_level('error'))
+            warning_lines.append(logger.get_lines_for_level('warning'))
+
+        # check logs for errors
+        found_lines = False
+        for lines in error_lines:
+            if not lines:
+                continue
+            self.assertFalse(found_lines, error_lines)
+            found_lines = True
+            for line in itertools.islice(lines, 0, 6, 2):
+                self.assertIn(
+                    'Unable to get enough responses (1/4 from 1 ok '
+                    'responses)', line, lines)
+            for line in itertools.islice(lines, 1, 7, 2):
+                self.assertIn(
+                    'Unable to get enough responses (4 x 404 error '
+                    'responses)', line, lines)
+        self.assertTrue(found_lines, 'error lines not found')
+
+        for lines in warning_lines:
+            self.assertEqual([], lines)
+
+        # check we have still have a single fragment and no tombstones
+        self.assert_direct_get_succeeds(failed_node, self.opart)
+        for node in self.onodes[1:]:
+            err = self.assert_direct_get_fails(node, self.opart, 404)
+            self.assertNotIn('X-Timestamp', err.http_headers)
+
+        # run the reconstructor to quarantine the lonely frag
+        error_lines = []
+        warning_lines = []
+        for conf_index in self.configs['object-reconstructor'].keys():
+            reconstructor = self.run_custom_daemon(
+                ObjectReconstructor, 'object-reconstructor', conf_index,
+                {'quarantine_age': '0', 'quarantine_threshold': '1'})
+            logger = reconstructor.logger.logger
+            error_lines.append(logger.get_lines_for_level('error'))
+            warning_lines.append(logger.get_lines_for_level('warning'))
+
+        # check logs for errors
+        found_lines = False
+        for index, lines in enumerate(error_lines):
+            if not lines:
+                continue
+            self.assertFalse(found_lines, error_lines)
+            found_lines = True
+            for line in itertools.islice(lines, 0, 6, 2):
+                self.assertIn(
+                    'Unable to get enough responses (1/4 from 1 ok '
+                    'responses)', line, lines)
+            for line in itertools.islice(lines, 1, 7, 2):
+                self.assertIn(
+                    'Unable to get enough responses (6 x 404 error '
+                    'responses)', line, lines)
+        self.assertTrue(found_lines, 'error lines not found')
+
+        # check logs for quarantine warning
+        found_lines = False
+        for lines in warning_lines:
+            if not lines:
+                continue
+            self.assertFalse(found_lines, warning_lines)
+            found_lines = True
+            self.assertEqual(1, len(lines), lines)
+            self.assertIn('Quarantined object', lines[0])
+        self.assertTrue(found_lines, 'warning lines not found')
+
+        # check we have nothing
+        for node in self.onodes:
+            err = self.assert_direct_get_fails(node, self.opart, 404)
+            self.assertNotIn('X-Backend-Timestamp', err.http_headers)
+        # client HEAD and GET now both 404
+        with self.assertRaises(ClientException) as cm:
+            client.get_object(self.url, self.token, self.container_name,
+                              self.object_name)
+        self.assertEqual(404, cm.exception.http_status)
+        with self.assertRaises(ClientException) as cm:
+            client.head_object(self.url, self.token, self.container_name,
+                               self.object_name)
+        self.assertEqual(404, cm.exception.http_status)
+
+        # run the reconstructor once more - should see no errors in logs!
+        error_lines = []
+        warning_lines = []
+        for conf_index in self.configs['object-reconstructor'].keys():
+            reconstructor = self.run_custom_daemon(
+                ObjectReconstructor, 'object-reconstructor', conf_index,
+                {'quarantine_age': '0', 'quarantine_threshold': '1'})
+            logger = reconstructor.logger.logger
+            error_lines.append(logger.get_lines_for_level('error'))
+            warning_lines.append(logger.get_lines_for_level('warning'))
+
+        for lines in error_lines:
+            self.assertEqual([], lines)
+        for lines in warning_lines:
+            self.assertEqual([], lines)
+
+
+if six.PY2:
+    # The non-ASCII chars in metadata cause test hangs in
+    # _assert_all_nodes_have_frag because of https://bugs.python.org/issue37093
+
+    class TestReconstructorRebuildUTF8(TestReconstructorRebuild):
+
+        def _make_name(self, prefix):
+            return b'%s\xc3\xa8-%s' % (
+                prefix.encode(), str(uuid.uuid4()).encode())
 
 
 if __name__ == "__main__":

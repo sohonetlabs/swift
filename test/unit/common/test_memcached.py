@@ -15,10 +15,10 @@
 # limitations under the License.
 
 """Tests for swift.common.utils"""
-
 from collections import defaultdict
 import errno
-from hashlib import md5
+import io
+import logging
 import six
 import socket
 import time
@@ -27,13 +27,17 @@ from uuid import uuid4
 import os
 
 import mock
+from six.moves.configparser import NoSectionError, NoOptionError
 
 from eventlet import GreenPool, sleep, Queue
 from eventlet.pools import Pool
+from eventlet.green import ssl
 
 from swift.common import memcached
+from swift.common.memcached import MemcacheConnectionError
+from swift.common.utils import md5, human_readable
 from mock import patch, MagicMock
-from test.unit import debug_logger
+from test.debug_logger import debug_logger
 
 
 class MockedMemcachePool(memcached.MemcacheConnPool):
@@ -48,22 +52,31 @@ class MockedMemcachePool(memcached.MemcacheConnPool):
 
 
 class ExplodingMockMemcached(object):
+    should_explode = True
     exploded = False
 
     def sendall(self, string):
-        self.exploded = True
-        raise socket.error(errno.EPIPE, os.strerror(errno.EPIPE))
+        if self.should_explode:
+            self.exploded = True
+            raise socket.error(errno.EPIPE, os.strerror(errno.EPIPE))
 
     def readline(self):
-        self.exploded = True
-        raise socket.error(errno.EPIPE, os.strerror(errno.EPIPE))
+        if self.should_explode:
+            self.exploded = True
+            raise socket.error(errno.EPIPE, os.strerror(errno.EPIPE))
+        return b'STORED\r\n'
 
     def read(self, size):
-        self.exploded = True
-        raise socket.error(errno.EPIPE, os.strerror(errno.EPIPE))
+        if self.should_explode:
+            self.exploded = True
+            raise socket.error(errno.EPIPE, os.strerror(errno.EPIPE))
 
     def close(self):
         pass
+
+
+TOO_BIG_KEY = md5(
+    b'too-big', usedforsecurity=False).hexdigest().encode('ascii')
 
 
 class MockMemcached(object):
@@ -98,7 +111,10 @@ class MockMemcached(object):
         self.cache[key] = flags, exptime, self.inbuf[:int(num_bytes)]
         self.inbuf = self.inbuf[int(num_bytes) + 2:]
         if noreply != b'noreply':
-            self.outbuf += b'STORED\r\n'
+            if key == TOO_BIG_KEY:
+                self.outbuf += b'SERVER_ERROR object too large for cache\r\n'
+            else:
+                self.outbuf += b'STORED\r\n'
 
     def handle_add(self, key, flags, exptime, num_bytes, noreply=b''):
         value = self.inbuf[:int(num_bytes)]
@@ -183,9 +199,28 @@ class TestMemcached(unittest.TestCase):
 
     def setUp(self):
         self.logger = debug_logger()
-        patcher = mock.patch('swift.common.memcached.logging', self.logger)
-        self.addCleanup(patcher.stop)
-        patcher.start()
+
+    def test_logger_kwarg(self):
+        server_socket = '%s:%s' % ('[::1]', 11211)
+        client = memcached.MemcacheRing([server_socket])
+        self.assertIs(client.logger, logging.getLogger())
+
+        client = memcached.MemcacheRing([server_socket], logger=self.logger)
+        self.assertIs(client.logger, self.logger)
+
+    def test_tls_context_kwarg(self):
+        with patch('swift.common.memcached.socket.socket'):
+            server = '%s:%s' % ('[::1]', 11211)
+            client = memcached.MemcacheRing([server])
+            self.assertIsNone(client._client_cache[server]._tls_context)
+
+            context = mock.Mock()
+            client = memcached.MemcacheRing([server], tls_context=context)
+            self.assertIs(client._client_cache[server]._tls_context, context)
+
+            key = uuid4().hex.encode('ascii')
+            list(client._get_conns(key))
+            context.wrap_socket.assert_called_once()
 
     def test_get_conns(self):
         sock1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -201,11 +236,15 @@ class TestMemcached(unittest.TestCase):
             sock2ipport = '%s:%s' % (sock2ip, memcached.DEFAULT_MEMCACHED_PORT)
             # We're deliberately using sock2ip (no port) here to test that the
             # default port is used.
-            memcache_client = memcached.MemcacheRing([sock1ipport, sock2ip])
+            memcache_client = memcached.MemcacheRing([sock1ipport, sock2ip],
+                                                     logger=self.logger)
             one = two = True
             while one or two:  # Run until we match hosts one and two
                 key = uuid4().hex.encode('ascii')
                 for conn in memcache_client._get_conns(key):
+                    if 'b' not in getattr(conn[1], 'mode', ''):
+                        self.assertIsInstance(conn[1], (
+                            io.RawIOBase, io.BufferedIOBase))
                     peeripport = '%s:%s' % conn[2].getpeername()
                     self.assertTrue(peeripport in (sock1ipport, sock2ipport))
                     if peeripport == sock1ipport:
@@ -226,7 +265,8 @@ class TestMemcached(unittest.TestCase):
             sock.listen(1)
             sock_addr = sock.getsockname()
             server_socket = '[%s]:%s' % (sock_addr[0], sock_addr[1])
-            memcache_client = memcached.MemcacheRing([server_socket])
+            memcache_client = memcached.MemcacheRing([server_socket],
+                                                     logger=self.logger)
             key = uuid4().hex.encode('ascii')
             for conn in memcache_client._get_conns(key):
                 peer_sockaddr = conn[2].getpeername()
@@ -247,7 +287,8 @@ class TestMemcached(unittest.TestCase):
             server_socket = '[%s]:%s' % (sock_addr[0], sock_addr[1])
             server_host = '[%s]' % sock_addr[0]
             memcached.DEFAULT_MEMCACHED_PORT = sock_addr[1]
-            memcache_client = memcached.MemcacheRing([server_host])
+            memcache_client = memcached.MemcacheRing([server_host],
+                                                     logger=self.logger)
             key = uuid4().hex.encode('ascii')
             for conn in memcache_client._get_conns(key):
                 peer_sockaddr = conn[2].getpeername()
@@ -261,7 +302,7 @@ class TestMemcached(unittest.TestCase):
         with self.assertRaises(ValueError):
             # IPv6 address with missing [] is invalid
             server_socket = '%s:%s' % ('::1', 11211)
-            memcached.MemcacheRing([server_socket])
+            memcached.MemcacheRing([server_socket], logger=self.logger)
 
     def test_get_conns_hostname(self):
         with patch('swift.common.memcached.socket.getaddrinfo') as addrinfo:
@@ -275,7 +316,8 @@ class TestMemcached(unittest.TestCase):
                 addrinfo.return_value = [(socket.AF_INET,
                                           socket.SOCK_STREAM, 0, '',
                                           ('127.0.0.1', sock_addr[1]))]
-                memcache_client = memcached.MemcacheRing([server_socket])
+                memcache_client = memcached.MemcacheRing([server_socket],
+                                                         logger=self.logger)
                 key = uuid4().hex.encode('ascii')
                 for conn in memcache_client._get_conns(key):
                     peer_sockaddr = conn[2].getpeername()
@@ -300,7 +342,8 @@ class TestMemcached(unittest.TestCase):
                 addrinfo.return_value = [(socket.AF_INET6,
                                           socket.SOCK_STREAM, 0, '',
                                           ('::1', sock_addr[1]))]
-                memcache_client = memcached.MemcacheRing([server_socket])
+                memcache_client = memcached.MemcacheRing([server_socket],
+                                                         logger=self.logger)
                 key = uuid4().hex.encode('ascii')
                 for conn in memcache_client._get_conns(key):
                     peer_sockaddr = conn[2].getpeername()
@@ -313,11 +356,13 @@ class TestMemcached(unittest.TestCase):
                 sock.close()
 
     def test_set_get_json(self):
-        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'])
+        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'],
+                                                 logger=self.logger)
         mock = MockMemcached()
         memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
             [(mock, mock)] * 2)
-        cache_key = md5(b'some_key').hexdigest().encode('ascii')
+        cache_key = md5(b'some_key',
+                        usedforsecurity=False).hexdigest().encode('ascii')
 
         memcache_client.set('some_key', [1, 2, 3])
         self.assertEqual(memcache_client.get('some_key'), [1, 2, 3])
@@ -345,8 +390,21 @@ class TestMemcached(unittest.TestCase):
         _junk, cache_timeout, _junk = mock.cache[cache_key]
         self.assertAlmostEqual(float(cache_timeout), esttimeout, delta=1)
 
+    def test_set_error(self):
+        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'],
+                                                 logger=self.logger)
+        mock = MockMemcached()
+        memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock, mock)] * 2)
+        memcache_client.set('too-big', [1, 2, 3])
+        self.assertEqual(
+            self.logger.get_lines_for_level('error'),
+            ['Error setting value in memcached: 1.2.3.4:11211: '
+             'SERVER_ERROR object too large for cache'])
+
     def test_get_failed_connection_mid_request(self):
-        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'])
+        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'],
+                                                 logger=self.logger)
         mock = MockMemcached()
         memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
             [(mock, mock)] * 2)
@@ -361,18 +419,17 @@ class TestMemcached(unittest.TestCase):
         # force the logging through the DebugLogger instead of the nose
         # handler. This will use stdout, so we can assert that no stack trace
         # is logged.
-        logger = debug_logger()
-        with patch("sys.stdout", fake_stdout),\
-                patch('swift.common.memcached.logging', logger):
+        with patch("sys.stdout", fake_stdout):
             mock.read_return_empty_str = True
             self.assertIsNone(memcache_client.get('some_key'))
-        log_lines = logger.get_lines_for_level('error')
+        log_lines = self.logger.get_lines_for_level('error')
         self.assertIn('Error talking to memcached', log_lines[0])
         self.assertFalse(log_lines[1:])
         self.assertNotIn("Traceback", fake_stdout.getvalue())
 
     def test_incr(self):
-        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'])
+        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'],
+                                                 logger=self.logger)
         mock = MockMemcached()
         memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
             [(mock, mock)] * 2)
@@ -392,7 +449,8 @@ class TestMemcached(unittest.TestCase):
         self.assertTrue(mock.close_called)
 
     def test_incr_failed_connection_mid_request(self):
-        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'])
+        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'],
+                                                 logger=self.logger)
         mock = MockMemcached()
         memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
             [(mock, mock)] * 2)
@@ -407,23 +465,23 @@ class TestMemcached(unittest.TestCase):
         # force the logging through the DebugLogger instead of the nose
         # handler. This will use stdout, so we can assert that no stack trace
         # is logged.
-        logger = debug_logger()
-        with patch("sys.stdout", fake_stdout), \
-                patch('swift.common.memcached.logging', logger):
+        with patch("sys.stdout", fake_stdout):
             mock.read_return_empty_str = True
             self.assertRaises(memcached.MemcacheConnectionError,
                               memcache_client.incr, 'some_key', delta=1)
-        log_lines = logger.get_lines_for_level('error')
+        log_lines = self.logger.get_lines_for_level('error')
         self.assertIn('Error talking to memcached', log_lines[0])
         self.assertFalse(log_lines[1:])
         self.assertNotIn('Traceback', fake_stdout.getvalue())
 
     def test_incr_w_timeout(self):
-        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'])
+        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'],
+                                                 logger=self.logger)
         mock = MockMemcached()
         memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
             [(mock, mock)] * 2)
-        cache_key = md5(b'some_key').hexdigest().encode('ascii')
+        cache_key = md5(b'some_key',
+                        usedforsecurity=False).hexdigest().encode('ascii')
 
         memcache_client.incr('some_key', delta=5, time=55)
         self.assertEqual(memcache_client.get('some_key'), b'5')
@@ -451,7 +509,8 @@ class TestMemcached(unittest.TestCase):
         self.assertEqual(mock.cache, {cache_key: (b'0', b'0', b'10')})
 
     def test_decr(self):
-        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'])
+        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'],
+                                                 logger=self.logger)
         mock = MockMemcached()
         memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
             [(mock, mock)] * 2)
@@ -469,7 +528,7 @@ class TestMemcached(unittest.TestCase):
 
     def test_retry(self):
         memcache_client = memcached.MemcacheRing(
-            ['1.2.3.4:11211', '1.2.3.5:11211'])
+            ['1.2.3.4:11211', '1.2.3.5:11211'], logger=self.logger)
         mock1 = ExplodingMockMemcached()
         mock2 = MockMemcached()
         memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
@@ -495,8 +554,177 @@ class TestMemcached(unittest.TestCase):
         self.assertEqual(memcache_client._client_cache['1.2.3.5:11211'].mocks,
                          [])
 
+    def test_error_limiting(self):
+        memcache_client = memcached.MemcacheRing(
+            ['1.2.3.4:11211', '1.2.3.5:11211'], logger=self.logger)
+        mock1 = ExplodingMockMemcached()
+        mock2 = ExplodingMockMemcached()
+        mock2.should_explode = False
+        memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock2, mock2)] * 12)
+        memcache_client._client_cache['1.2.3.5:11211'] = MockedMemcachePool(
+            [(mock1, mock1)] * 12)
+
+        for _ in range(12):
+            memcache_client.set('some_key', [1, 2, 3])
+        # twelfth one skips .5 because of error limiting and goes straight
+        # to .4
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'Error talking to memcached: 1.2.3.5:11211: '
+            '[Errno 32] Broken pipe',
+        ] * 11 + [
+            'Error limiting server 1.2.3.5:11211'
+        ])
+        self.logger.clear()
+
+        mock2.should_explode = True
+        for _ in range(12):
+            memcache_client.set('some_key', [1, 2, 3])
+        # as we keep going, eventually .4 gets error limited, too
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'Error talking to memcached: 1.2.3.4:11211: '
+            '[Errno 32] Broken pipe',
+        ] * 10 + [
+            'Error talking to memcached: 1.2.3.4:11211: '
+            '[Errno 32] Broken pipe',
+            'Error limiting server 1.2.3.4:11211',
+            'All memcached servers error-limited',
+        ])
+        self.logger.clear()
+
+        # continued requests just keep bypassing memcache
+        for _ in range(12):
+            memcache_client.set('some_key', [1, 2, 3])
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'All memcached servers error-limited',
+        ] * 12)
+        self.logger.clear()
+
+        # and get()s are all a "cache miss"
+        self.assertIsNone(memcache_client.get('some_key'))
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'All memcached servers error-limited',
+        ])
+
+    def test_error_disabled(self):
+        memcache_client = memcached.MemcacheRing(
+            ['1.2.3.4:11211'], logger=self.logger, error_limit_time=0)
+        mock1 = ExplodingMockMemcached()
+        memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock1, mock1)] * 20)
+
+        for _ in range(20):
+            memcache_client.set('some_key', [1, 2, 3])
+        # twelfth one skips .5 because of error limiting and goes straight
+        # to .4
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'Error talking to memcached: 1.2.3.4:11211: '
+            '[Errno 32] Broken pipe',
+        ] * 20)
+
+    def test_error_raising(self):
+        memcache_client = memcached.MemcacheRing(
+            ['1.2.3.4:11211'], logger=self.logger, error_limit_time=0)
+        mock1 = ExplodingMockMemcached()
+        memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock1, mock1)] * 20)
+
+        # expect exception when requested...
+        with self.assertRaises(MemcacheConnectionError):
+            memcache_client.set('some_key', [1, 2, 3], raise_on_error=True)
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'Error talking to memcached: 1.2.3.4:11211: '
+            '[Errno 32] Broken pipe',
+        ])
+        self.logger.clear()
+
+        with self.assertRaises(MemcacheConnectionError):
+            memcache_client.get('some_key', raise_on_error=True)
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'Error talking to memcached: 1.2.3.4:11211: '
+            '[Errno 32] Broken pipe',
+        ])
+        self.logger.clear()
+
+        # ...but default is no exception
+        memcache_client.set('some_key', [1, 2, 3])
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'Error talking to memcached: 1.2.3.4:11211: '
+            '[Errno 32] Broken pipe',
+        ])
+        self.logger.clear()
+
+        memcache_client.get('some_key')
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'Error talking to memcached: 1.2.3.4:11211: '
+            '[Errno 32] Broken pipe',
+        ])
+
+    def test_error_limiting_custom_config(self):
+        def do_calls(time_step, num_calls, **memcache_kwargs):
+            self.logger.clear()
+            memcache_client = memcached.MemcacheRing(
+                ['1.2.3.5:11211'], logger=self.logger,
+                **memcache_kwargs)
+            mock1 = ExplodingMockMemcached()
+            memcache_client._client_cache['1.2.3.5:11211'] = \
+                MockedMemcachePool([(mock1, mock1)] * num_calls)
+
+            for n in range(num_calls):
+                with mock.patch.object(memcached.time, 'time',
+                                       return_value=time_step * n):
+                    memcache_client.set('some_key', [1, 2, 3])
+
+        # with default error_limit_time of 60, one call per 5 secs, twelfth one
+        # triggers error limit
+        do_calls(5, 12)
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'Error talking to memcached: 1.2.3.5:11211: '
+            '[Errno 32] Broken pipe',
+        ] * 10 + [
+            'Error talking to memcached: 1.2.3.5:11211: '
+            '[Errno 32] Broken pipe',
+            'Error limiting server 1.2.3.5:11211',
+            'All memcached servers error-limited',
+        ])
+
+        # with default error_limit_time of 60, one call per 6 secs, error limit
+        # is not triggered
+        do_calls(6, 20)
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'Error talking to memcached: 1.2.3.5:11211: '
+            '[Errno 32] Broken pipe',
+        ] * 20)
+
+        # with error_limit_time of 66, one call per 6 secs, twelfth one
+        # triggers error limit
+        do_calls(6, 12, error_limit_time=66)
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'Error talking to memcached: 1.2.3.5:11211: '
+            '[Errno 32] Broken pipe',
+        ] * 10 + [
+            'Error talking to memcached: 1.2.3.5:11211: '
+            '[Errno 32] Broken pipe',
+            'Error limiting server 1.2.3.5:11211',
+            'All memcached servers error-limited',
+        ])
+
+        # with error_limit_time of 70, one call per 6 secs, error_limit_count
+        # of 11, 13th call triggers error limit
+        do_calls(6, 13, error_limit_time=70, error_limit_count=11)
+        self.assertEqual(self.logger.get_lines_for_level('error'), [
+            'Error talking to memcached: 1.2.3.5:11211: '
+            '[Errno 32] Broken pipe',
+        ] * 11 + [
+            'Error talking to memcached: 1.2.3.5:11211: '
+            '[Errno 32] Broken pipe',
+            'Error limiting server 1.2.3.5:11211',
+            'All memcached servers error-limited',
+        ])
+
     def test_delete(self):
-        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'])
+        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'],
+                                                 logger=self.logger)
         mock = MockMemcached()
         memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
             [(mock, mock)] * 2)
@@ -506,7 +734,8 @@ class TestMemcached(unittest.TestCase):
         self.assertIsNone(memcache_client.get('some_key'))
 
     def test_multi(self):
-        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'])
+        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'],
+                                                 logger=self.logger)
         mock = MockMemcached()
         memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
             [(mock, mock)] * 2)
@@ -517,7 +746,7 @@ class TestMemcached(unittest.TestCase):
             memcache_client.get_multi(('some_key2', 'some_key1'), 'multi_key'),
             [[4, 5, 6], [1, 2, 3]])
         for key in (b'some_key1', b'some_key2'):
-            key = md5(key).hexdigest().encode('ascii')
+            key = md5(key, usedforsecurity=False).hexdigest().encode('ascii')
             self.assertIn(key, mock.cache)
             _junk, cache_timeout, _junk = mock.cache[key]
             self.assertEqual(cache_timeout, b'0')
@@ -526,7 +755,7 @@ class TestMemcached(unittest.TestCase):
             {'some_key1': [1, 2, 3], 'some_key2': [4, 5, 6]}, 'multi_key',
             time=20)
         for key in (b'some_key1', b'some_key2'):
-            key = md5(key).hexdigest().encode('ascii')
+            key = md5(key, usedforsecurity=False).hexdigest().encode('ascii')
             _junk, cache_timeout, _junk = mock.cache[key]
             self.assertEqual(cache_timeout, b'20')
 
@@ -536,7 +765,7 @@ class TestMemcached(unittest.TestCase):
             {'some_key1': [1, 2, 3], 'some_key2': [4, 5, 6]}, 'multi_key',
             time=fortydays)
         for key in (b'some_key1', b'some_key2'):
-            key = md5(key).hexdigest().encode('ascii')
+            key = md5(key, usedforsecurity=False).hexdigest().encode('ascii')
             _junk, cache_timeout, _junk = mock.cache[key]
             self.assertAlmostEqual(float(cache_timeout), esttimeout, delta=1)
         self.assertEqual(memcache_client.get_multi(
@@ -554,25 +783,60 @@ class TestMemcached(unittest.TestCase):
                 None)
             self.assertFalse(not_expected in mock_stderr.getvalue())
 
+    def test_multi_delete(self):
+        memcache_client = memcached.MemcacheRing(['1.2.3.4:11211',
+                                                  '1.2.3.5:11211'],
+                                                 logger=self.logger)
+        mock1 = MockMemcached()
+        mock2 = MockMemcached()
+        memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
+            [(mock1, mock1)] * 2)
+        memcache_client._client_cache['1.2.3.5:11211'] = MockedMemcachePool(
+            [(mock2, mock2)] * 2)
+
+        # MemcacheRing will put 'some_key0' on server 1.2.3.5:11211 and
+        # 'some_key1' and 'multi_key' on '1.2.3.4:11211'
+        memcache_client.set_multi(
+            {'some_key0': [1, 2, 3], 'some_key1': [4, 5, 6]}, 'multi_key')
+        self.assertEqual(
+            memcache_client.get_multi(('some_key1', 'some_key0'), 'multi_key'),
+            [[4, 5, 6], [1, 2, 3]])
+        for key in (b'some_key0', b'some_key1'):
+            key = md5(key, usedforsecurity=False).hexdigest().encode('ascii')
+            self.assertIn(key, mock1.cache)
+            _junk, cache_timeout, _junk = mock1.cache[key]
+            self.assertEqual(cache_timeout, b'0')
+
+        memcache_client.set('some_key0', [7, 8, 9])
+        self.assertEqual(memcache_client.get('some_key0'), [7, 8, 9])
+        key = md5(b'some_key0',
+                  usedforsecurity=False).hexdigest().encode('ascii')
+        self.assertIn(key, mock2.cache)
+
+        # Delete 'some_key0' with server_key='multi_key'
+        memcache_client.delete('some_key0', server_key='multi_key')
+        self.assertEqual(memcache_client.get_multi(
+            ('some_key0', 'some_key1'), 'multi_key'),
+            [None, [4, 5, 6]])
+
+        # 'some_key0' have to be available on 1.2.3.5:11211
+        self.assertEqual(memcache_client.get('some_key0'), [7, 8, 9])
+        self.assertIn(key, mock2.cache)
+
     def test_serialization(self):
         memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'],
-                                                 allow_pickle=True)
+                                                 logger=self.logger)
         mock = MockMemcached()
         memcache_client._client_cache['1.2.3.4:11211'] = MockedMemcachePool(
             [(mock, mock)] * 2)
         memcache_client.set('some_key', [1, 2, 3])
         self.assertEqual(memcache_client.get('some_key'), [1, 2, 3])
-        memcache_client._allow_pickle = False
-        memcache_client._allow_unpickle = True
-        self.assertEqual(memcache_client.get('some_key'), [1, 2, 3])
-        memcache_client._allow_unpickle = False
+        self.assertEqual(len(mock.cache), 1)
+        key = next(iter(mock.cache))
+        self.assertEqual(mock.cache[key][0], b'2')  # JSON_FLAG
+        # Pretend we've got some really old pickle data in there
+        mock.cache[key] = (b'1',) + mock.cache[key][1:]
         self.assertIsNone(memcache_client.get('some_key'))
-        memcache_client.set('some_key', [1, 2, 3])
-        self.assertEqual(memcache_client.get('some_key'), [1, 2, 3])
-        memcache_client._allow_unpickle = True
-        self.assertEqual(memcache_client.get('some_key'), [1, 2, 3])
-        memcache_client._allow_pickle = True
-        self.assertEqual(memcache_client.get('some_key'), [1, 2, 3])
 
     def test_connection_pooling(self):
         with patch('swift.common.memcached.socket') as mock_module:
@@ -601,7 +865,8 @@ class TestMemcached(unittest.TestCase):
             mock_sock.connect = wait_connect
 
             memcache_client = memcached.MemcacheRing(['1.2.3.4:11211'],
-                                                     connect_timeout=10)
+                                                     connect_timeout=10,
+                                                     logger=self.logger)
             # sanity
             self.assertEqual(1, len(memcache_client._client_cache))
             for server, pool in memcache_client._client_cache.items():
@@ -660,17 +925,20 @@ class TestMemcached(unittest.TestCase):
             memcache_client = memcached.MemcacheRing(['1.2.3.4:11211',
                                                       '1.2.3.5:11211'],
                                                      io_timeout=0.5,
-                                                     pool_timeout=0.1)
+                                                     pool_timeout=0.1,
+                                                     logger=self.logger)
 
             # Hand out a couple slow connections to 1.2.3.5, leaving 1.2.3.4
             # fast. All ten (10) clients should try to talk to .5 first, and
             # then move on to .4, and we'll assert all that below.
             mock_conn = MagicMock(), MagicMock()
+            mock_conn[0].readline = lambda: b'STORED\r\n'
             mock_conn[1].sendall = lambda x: sleep(0.2)
             connections['1.2.3.5'].put(mock_conn)
             connections['1.2.3.5'].put(mock_conn)
 
             mock_conn = MagicMock(), MagicMock()
+            mock_conn[0].readline = lambda: b'STORED\r\n'
             connections['1.2.3.4'].put(mock_conn)
             connections['1.2.3.4'].put(mock_conn)
 
@@ -694,6 +962,315 @@ class TestMemcached(unittest.TestCase):
         # and we never got more put in that we gave out
         self.assertEqual(connections['1.2.3.5'].qsize(), 2)
         self.assertEqual(connections['1.2.3.4'].qsize(), 2)
+
+    def test_connection_slow_connect(self):
+        with patch('swift.common.memcached.socket') as mock_module:
+            def mock_getaddrinfo(host, port, family=socket.AF_INET,
+                                 socktype=socket.SOCK_STREAM, proto=0,
+                                 flags=0):
+                return [(family, socktype, proto, '', (host, port))]
+
+            mock_module.getaddrinfo = mock_getaddrinfo
+
+            # patch socket, stub socket.socket, mock sock
+            mock_sock = mock_module.socket.return_value
+
+            def wait_connect(addr):
+                # slow connect gives Timeout Exception
+                sleep(1)
+
+            # patch connect method
+            mock_sock.connect = wait_connect
+
+            memcache_client = memcached.MemcacheRing(
+                ['1.2.3.4:11211'], connect_timeout=0.1)
+
+            # sanity
+            self.assertEqual(1, len(memcache_client._client_cache))
+            for server, pool in memcache_client._client_cache.items():
+                self.assertEqual(2, pool.max_size)
+
+            # try to get connect and no connection found
+            # so it will result in StopIteration
+            conn_generator = memcache_client._get_conns(b'key')
+            with self.assertRaises(StopIteration):
+                next(conn_generator)
+
+            self.assertEqual(1, mock_sock.close.call_count)
+
+    def test_item_size_warning_threshold(self):
+        mock = MockMemcached()
+        mocked_pool = MockedMemcachePool([(mock, mock)] * 2)
+
+        def do_test(d, threshold, should_warn, error=False):
+            self.logger.clear()
+            try:
+                memcache_client = memcached.MemcacheRing(
+                    ['1.2.3.4:11211'], item_size_warning_threshold=threshold,
+                    logger=self.logger)
+                memcache_client._client_cache['1.2.3.4:11211'] = mocked_pool
+                memcache_client.set('some_key', d, serialize=False)
+                warning_lines = self.logger.get_lines_for_level('warning')
+                if should_warn:
+                    self.assertIn(
+                        'Item size larger than warning threshold: '
+                        '%d (%s) >= %d (%s)' % (
+                            len(d), human_readable(len(d)), threshold,
+                            human_readable(threshold)),
+                        warning_lines[0])
+                else:
+                    self.assertFalse(warning_lines)
+            except ValueError as err:
+                if not err:
+                    self.fail(err)
+                else:
+                    self.assertIn(
+                        'Config option must be a number, greater than 0, '
+                        'less than 100, not "%s".' % threshold,
+                        str(err))
+
+        data = '1' * 100
+        # let's start with something easy, say warning at 80
+        for data_size, warn in ((79, False), (80, True), (81, True),
+                                (99, True), (100, True)):
+            do_test(data[:data_size], 80, warn)
+
+        # if we set the threshold to -1 will turn off the warning
+        for data_size, warn in ((79, False), (80, False), (81, False),
+                                (99, False), (100, False)):
+            do_test(data[:data_size], -1, warn)
+
+        # Changing to 0 should warn on everything
+        for data_size, warn in ((0, True), (1, True), (50, True),
+                                (99, True), (100, True)):
+            do_test(data[:data_size], 0, warn)
+
+        # Let's do a big number
+        do_test('1' * 2048576, 1000000, True)
+
+
+class ExcConfigParser(object):
+
+    def read(self, path):
+        raise Exception('read called with %r' % path)
+
+
+class EmptyConfigParser(object):
+
+    def read(self, path):
+        return False
+
+
+def get_config_parser(memcache_servers='1.2.3.4:5',
+                      memcache_max_connections='4',
+                      section='memcache',
+                      item_size_warning_threshold='75'):
+    _srvs = memcache_servers
+    _maxc = memcache_max_connections
+    _section = section
+    _warn_threshold = item_size_warning_threshold
+
+    class SetConfigParser(object):
+
+        def items(self, section_name):
+            if section_name != section:
+                raise NoSectionError(section_name)
+            return {
+                'memcache_servers': memcache_servers,
+                'memcache_max_connections': memcache_max_connections
+            }
+
+        def read(self, path):
+            return True
+
+        def get(self, section, option):
+            if _section == section:
+                if option == 'memcache_servers':
+                    if _srvs == 'error':
+                        raise NoOptionError(option, section)
+                    return _srvs
+                elif option in ('memcache_max_connections',
+                                'max_connections'):
+                    if _maxc == 'error':
+                        raise NoOptionError(option, section)
+                    return _maxc
+                elif option == 'item_size_warning_threshold':
+                    if _warn_threshold == 'error':
+                        raise NoOptionError(option, section)
+                    return _warn_threshold
+                else:
+                    raise NoOptionError(option, section)
+            else:
+                raise NoSectionError(option)
+
+    return SetConfigParser
+
+
+def start_response(*args):
+    pass
+
+
+class TestLoadMemcache(unittest.TestCase):
+    def setUp(self):
+        self.logger = debug_logger()
+
+    def test_conf_default_read(self):
+        with mock.patch.object(memcached, 'ConfigParser', ExcConfigParser):
+            for d in ({},
+                      {'memcache_servers': '6.7.8.9:10'},
+                      {'memcache_max_connections': '30'},
+                      {'item_size_warning_threshold': 75},
+                      {'memcache_servers': '6.7.8.9:10',
+                       'item_size_warning_threshold': '75'},
+                      {'item_size_warning_threshold': '75',
+                       'memcache_max_connections': '30'},
+                      ):
+                with self.assertRaises(Exception) as catcher:
+                    memcached.load_memcache(d, self.logger)
+                self.assertEqual(
+                    str(catcher.exception),
+                    "read called with '/etc/swift/memcache.conf'")
+
+    def test_conf_set_no_read(self):
+        with mock.patch.object(memcached, 'ConfigParser', ExcConfigParser):
+            exc = None
+            try:
+                memcached.load_memcache({
+                    'memcache_servers': '1.2.3.4:5',
+                    'memcache_max_connections': '30',
+                    'item_size_warning_threshold': '80'
+
+                }, self.logger)
+            except Exception as err:
+                exc = err
+        self.assertIsNone(exc)
+
+    def test_conf_default(self):
+        with mock.patch.object(memcached, 'ConfigParser', EmptyConfigParser):
+            memcache = memcached.load_memcache({}, self.logger)
+        self.assertEqual(memcache.memcache_servers, ['127.0.0.1:11211'])
+        self.assertEqual(
+            memcache._client_cache['127.0.0.1:11211'].max_size, 2)
+        self.assertEqual(memcache.item_size_warning_threshold, -1)
+
+    def test_conf_inline(self):
+        with mock.patch.object(memcached, 'ConfigParser', get_config_parser()):
+            memcache = memcached.load_memcache({
+                'memcache_servers': '6.7.8.9:10',
+                'memcache_max_connections': '5',
+                'item_size_warning_threshold': '75'
+            }, self.logger)
+        self.assertEqual(memcache.memcache_servers, ['6.7.8.9:10'])
+        self.assertEqual(
+            memcache._client_cache['6.7.8.9:10'].max_size, 5)
+        self.assertEqual(memcache.item_size_warning_threshold, 75)
+
+    def test_conf_inline_ratelimiting(self):
+        with mock.patch.object(memcached, 'ConfigParser', get_config_parser()):
+            memcache = memcached.load_memcache({
+                'error_suppression_limit': '5',
+                'error_suppression_interval': '2.5',
+            }, self.logger)
+        self.assertEqual(memcache._error_limit_count, 5)
+        self.assertEqual(memcache._error_limit_time, 2.5)
+        self.assertEqual(memcache._error_limit_duration, 2.5)
+
+    def test_conf_inline_tls(self):
+        fake_context = mock.Mock()
+        with mock.patch.object(ssl, 'create_default_context',
+                               return_value=fake_context):
+            with mock.patch.object(memcached, 'ConfigParser',
+                                   get_config_parser()):
+                memcached.load_memcache({
+                    'tls_enabled': 'true',
+                    'tls_cafile': 'cafile',
+                    'tls_certfile': 'certfile',
+                    'tls_keyfile': 'keyfile',
+                }, self.logger)
+            ssl.create_default_context.assert_called_with(cafile='cafile')
+            fake_context.load_cert_chain.assert_called_with('certfile',
+                                                            'keyfile')
+
+    def test_conf_extra_no_section(self):
+        with mock.patch.object(memcached, 'ConfigParser',
+                               get_config_parser(section='foobar')):
+            memcache = memcached.load_memcache({}, self.logger)
+        self.assertEqual(memcache.memcache_servers, ['127.0.0.1:11211'])
+        self.assertEqual(
+            memcache._client_cache['127.0.0.1:11211'].max_size, 2)
+
+    def test_conf_extra_no_option(self):
+        replacement_parser = get_config_parser(
+            memcache_servers='error',
+            memcache_max_connections='error')
+        with mock.patch.object(memcached, 'ConfigParser', replacement_parser):
+            memcache = memcached.load_memcache({}, self.logger)
+        self.assertEqual(memcache.memcache_servers, ['127.0.0.1:11211'])
+        self.assertEqual(
+            memcache._client_cache['127.0.0.1:11211'].max_size, 2)
+
+    def test_conf_inline_other_max_conn(self):
+        with mock.patch.object(memcached, 'ConfigParser', get_config_parser()):
+            memcache = memcached.load_memcache({
+                'memcache_servers': '6.7.8.9:10',
+                'max_connections': '5'
+            }, self.logger)
+        self.assertEqual(memcache.memcache_servers, ['6.7.8.9:10'])
+        self.assertEqual(
+            memcache._client_cache['6.7.8.9:10'].max_size, 5)
+
+    def test_conf_inline_bad_max_conn(self):
+        with mock.patch.object(memcached, 'ConfigParser', get_config_parser()):
+            memcache = memcached.load_memcache({
+                'memcache_servers': '6.7.8.9:10',
+                'max_connections': 'bad42',
+            }, self.logger)
+        self.assertEqual(memcache.memcache_servers, ['6.7.8.9:10'])
+        self.assertEqual(
+            memcache._client_cache['6.7.8.9:10'].max_size, 4)
+
+    def test_conf_inline_bad_item_warning_threshold(self):
+        with mock.patch.object(memcached, 'ConfigParser', get_config_parser()):
+            with self.assertRaises(ValueError) as err:
+                memcached.load_memcache({
+                    'memcache_servers': '6.7.8.9:10',
+                    'item_size_warning_threshold': 'bad42',
+                }, self.logger)
+        self.assertIn('invalid literal for int() with base 10:',
+                      str(err.exception))
+
+    def test_conf_from_extra_conf(self):
+        with mock.patch.object(memcached, 'ConfigParser', get_config_parser()):
+            memcache = memcached.load_memcache({}, self.logger)
+        self.assertEqual(memcache.memcache_servers, ['1.2.3.4:5'])
+        self.assertEqual(
+            memcache._client_cache['1.2.3.4:5'].max_size, 4)
+
+    def test_conf_from_extra_conf_bad_max_conn(self):
+        with mock.patch.object(memcached, 'ConfigParser', get_config_parser(
+                memcache_max_connections='bad42')):
+            memcache = memcached.load_memcache({}, self.logger)
+        self.assertEqual(memcache.memcache_servers, ['1.2.3.4:5'])
+        self.assertEqual(
+            memcache._client_cache['1.2.3.4:5'].max_size, 2)
+
+    def test_conf_from_inline_and_maxc_from_extra_conf(self):
+        with mock.patch.object(memcached, 'ConfigParser', get_config_parser()):
+            memcache = memcached.load_memcache({
+                'memcache_servers': '6.7.8.9:10'}, self.logger)
+        self.assertEqual(memcache.memcache_servers, ['6.7.8.9:10'])
+        self.assertEqual(
+            memcache._client_cache['6.7.8.9:10'].max_size, 4)
+
+    def test_conf_from_inline_and_sers_from_extra_conf(self):
+        with mock.patch.object(memcached, 'ConfigParser', get_config_parser()):
+            memcache = memcached.load_memcache({
+                'memcache_servers': '6.7.8.9:10',
+                'memcache_max_connections': '42',
+            }, self.logger)
+        self.assertEqual(memcache.memcache_servers, ['6.7.8.9:10'])
+        self.assertEqual(
+            memcache._client_cache['6.7.8.9:10'].max_size, 42)
 
 
 if __name__ == '__main__':

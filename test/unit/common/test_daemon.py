@@ -28,10 +28,11 @@ from collections import defaultdict
 import errno
 
 from swift.common import daemon, utils
-from test.unit import debug_logger
+from test.debug_logger import debug_logger
 
 
 class MyDaemon(daemon.Daemon):
+    WORKERS_HEALTHCHECK_INTERVAL = 0
 
     def __init__(self, conf):
         self.conf = conf
@@ -109,8 +110,8 @@ class TestRunDaemon(unittest.TestCase):
 
     def setUp(self):
         for patcher in [
-            mock.patch.object(utils, 'HASH_PATH_PREFIX', 'startcap'),
-            mock.patch.object(utils, 'HASH_PATH_SUFFIX', 'endcap'),
+            mock.patch.object(utils, 'HASH_PATH_PREFIX', b'startcap'),
+            mock.patch.object(utils, 'HASH_PATH_SUFFIX', b'endcap'),
             mock.patch.object(utils, 'drop_privileges', lambda *args: None),
             mock.patch.object(utils, 'capture_stdio', lambda *args: None),
         ]:
@@ -139,6 +140,7 @@ class TestRunDaemon(unittest.TestCase):
         with mock.patch('swift.common.daemon.os') as mock_os:
             func()
         self.assertEqual(mock_os.method_calls, [
+            mock.call.getpid(),
             mock.call.killpg(0, signal.SIGTERM),
             # hard exit because bare except handlers can trap SystemExit
             mock.call._exit(0)
@@ -176,11 +178,11 @@ class TestRunDaemon(unittest.TestCase):
             # test missing section
             sample_conf = "[default]\nuser = %s\n" % getuser()
             with tmpfile(sample_conf) as conf_file:
-                self.assertRaisesRegexp(SystemExit,
-                                        'Unable to find my-daemon '
-                                        'config section in.*',
-                                        daemon.run_daemon, MyDaemon,
-                                        conf_file, once=True)
+                self.assertRaisesRegex(SystemExit,
+                                       'Unable to find my-daemon '
+                                       'config section in.*',
+                                       daemon.run_daemon, MyDaemon,
+                                       conf_file, once=True)
 
     def test_run_daemon_diff_tz(self):
         old_tz = os.environ.get('TZ', '')

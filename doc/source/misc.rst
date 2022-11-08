@@ -39,6 +39,17 @@ Container Sync Realms
     :members:
     :show-inheritance:
 
+
+.. _digest:
+
+Digest
+======
+
+.. automodule:: swift.common.digest
+    :members:
+    :undoc-members:
+    :show-inheritance:
+
 .. _direct_client:
 
 Direct Client
@@ -81,6 +92,16 @@ MemCacheD
 
 .. automodule:: swift.common.memcached
     :members:
+    :show-inheritance:
+
+.. _registry:
+
+Middleware Registry
+===================
+
+.. automodule:: swift.common.registry
+    :members:
+    :undoc-members:
     :show-inheritance:
 
 .. _request_helpers:

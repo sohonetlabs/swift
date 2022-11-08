@@ -14,53 +14,88 @@
 # limitations under the License.
 
 import re
-from UserDict import DictMixin
+try:
+    from collections.abc import MutableMapping
+except ImportError:
+    from collections import MutableMapping  # py2
 from functools import partial
 
+from swift.common import header_key_dict
 from swift.common import swob
 from swift.common.utils import config_true_value
 from swift.common.request_helpers import is_sys_meta
 
-from swift.common.middleware.s3api.utils import snake_to_camel, sysmeta_prefix
+from swift.common.middleware.s3api.utils import snake_to_camel, \
+    sysmeta_prefix, sysmeta_header
 from swift.common.middleware.s3api.etree import Element, SubElement, tostring
+from swift.common.middleware.versioned_writes.object_versioning import \
+    DELETE_MARKER_CONTENT_TYPE
 
 
-class HeaderKey(str):
+class HeaderKeyDict(header_key_dict.HeaderKeyDict):
     """
-    A string object that normalizes string as S3 clients expect with title().
+    Similar to the Swift's normal HeaderKeyDict class, but its key name is
+    normalized as S3 clients expect.
     """
-    def title(self):
-        if self.lower() == 'etag':
+    @staticmethod
+    def _title(s):
+        s = header_key_dict.HeaderKeyDict._title(s)
+        if s.lower() == 'etag':
             # AWS Java SDK expects only 'ETag'.
             return 'ETag'
-        if self.lower().startswith('x-amz-'):
+        if s.lower().startswith('x-amz-'):
             # AWS headers returned by S3 are lowercase.
-            return self.lower()
-        return str.title(self)
+            return swob.bytes_to_wsgi(swob.wsgi_to_bytes(s).lower())
+        return s
 
 
-class HeaderKeyDict(swob.HeaderKeyDict):
-    """
-    Similar to the HeaderKeyDict class in Swift, but its key name is normalized
-    as S3 clients expect.
-    """
-    def __getitem__(self, key):
-        return swob.HeaderKeyDict.__getitem__(self, HeaderKey(key))
+def translate_swift_to_s3(key, val):
+    _key = swob.bytes_to_wsgi(swob.wsgi_to_bytes(key).lower())
 
-    def __setitem__(self, key, value):
-        return swob.HeaderKeyDict.__setitem__(self, HeaderKey(key), value)
+    def translate_meta_key(_key):
+        if not _key.startswith('x-object-meta-'):
+            return _key
+        # Note that AWS allows user-defined metadata with underscores in the
+        # header, while WSGI (and other protocols derived from CGI) does not
+        # differentiate between an underscore and a dash. Fortunately,
+        # eventlet exposes the raw headers from the client, so we could
+        # translate '_' to '=5F' on the way in. Now, we translate back.
+        return 'x-amz-meta-' + _key[14:].replace('=5f', '_')
 
-    def __contains__(self, key):
-        return swob.HeaderKeyDict.__contains__(self, HeaderKey(key))
-
-    def __delitem__(self, key):
-        return swob.HeaderKeyDict.__delitem__(self, HeaderKey(key))
-
-    def get(self, key, default=None):
-        return swob.HeaderKeyDict.get(self, HeaderKey(key), default)
-
-    def pop(self, key, default=None):
-        return swob.HeaderKeyDict.pop(self, HeaderKey(key), default)
+    if _key.startswith('x-object-meta-'):
+        return translate_meta_key(_key), val
+    elif _key in ('content-length', 'content-type',
+                  'content-range', 'content-encoding',
+                  'content-disposition', 'content-language',
+                  'etag', 'last-modified', 'x-robots-tag',
+                  'cache-control', 'expires'):
+        return key, val
+    elif _key == 'x-object-version-id':
+        return 'x-amz-version-id', val
+    elif _key == 'x-copied-from-version-id':
+        return 'x-amz-copy-source-version-id', val
+    elif _key == 'x-backend-content-type' and \
+            val == DELETE_MARKER_CONTENT_TYPE:
+        return 'x-amz-delete-marker', 'true'
+    elif _key == 'access-control-expose-headers':
+        exposed_headers = val.split(', ')
+        exposed_headers.extend([
+            'x-amz-request-id',
+            'x-amz-id-2',
+        ])
+        return 'access-control-expose-headers', ', '.join(
+            translate_meta_key(h) for h in exposed_headers)
+    elif _key == 'access-control-allow-methods':
+        methods = val.split(', ')
+        try:
+            methods.remove('COPY')  # that's not a thing in S3
+        except ValueError:
+            pass  # not there? don't worry about it
+        return key, ', '.join(methods)
+    elif _key.startswith('access-control-'):
+        return key, val
+    # else, drop the header
+    return None
 
 
 class S3ResponseBase(object):
@@ -79,11 +114,7 @@ class S3Response(S3ResponseBase, swob.Response):
     def __init__(self, *args, **kwargs):
         swob.Response.__init__(self, *args, **kwargs)
 
-        if self.etag:
-            # add double quotes to the etag header
-            self.etag = self.etag
-
-        sw_sysmeta_headers = swob.HeaderKeyDict()
+        s3_sysmeta_headers = swob.HeaderKeyDict()
         sw_headers = swob.HeaderKeyDict()
         headers = HeaderKeyDict()
         self.is_slo = False
@@ -97,7 +128,7 @@ class S3Response(S3ResponseBase, swob.Response):
             s3api_sysmeta_prefix = sysmeta_prefix(_server_type).lower()
             return sysmeta_key.lower().startswith(s3api_sysmeta_prefix)
 
-        for key, val in self.headers.iteritems():
+        for key, val in self.headers.items():
             if is_sys_meta('object', key) or is_sys_meta('container', key):
                 _server_type = key.split('-')[1]
                 if is_swift3_sysmeta(key, _server_type):
@@ -106,38 +137,50 @@ class S3Response(S3ResponseBase, swob.Response):
                     key = sysmeta_prefix(_server_type) + \
                         key[len('x-%s-sysmeta-swift3-' % _server_type):]
 
-                    if key not in sw_sysmeta_headers:
+                    if key not in s3_sysmeta_headers:
                         # To avoid overwrite s3api sysmeta by older swift3
                         # sysmeta set the key only when the key does not exist
-                        sw_sysmeta_headers[key] = val
+                        s3_sysmeta_headers[key] = val
                 elif is_s3api_sysmeta(key, _server_type):
-                    sw_sysmeta_headers[key] = val
+                    s3_sysmeta_headers[key] = val
+                else:
+                    sw_headers[key] = val
             else:
                 sw_headers[key] = val
 
         # Handle swift headers
-        for key, val in sw_headers.iteritems():
-            _key = key.lower()
+        for key, val in sw_headers.items():
+            s3_pair = translate_swift_to_s3(key, val)
+            if s3_pair is None:
+                continue
+            headers[s3_pair[0]] = s3_pair[1]
 
-            if _key.startswith('x-object-meta-'):
-                # Note that AWS ignores user-defined headers with '=' in the
-                # header name. We translated underscores to '=5F' on the way
-                # in, though.
-                headers['x-amz-meta-' + _key[14:].replace('=5f', '_')] = val
-            elif _key in ('content-length', 'content-type',
-                          'content-range', 'content-encoding',
-                          'content-disposition', 'content-language',
-                          'etag', 'last-modified', 'x-robots-tag',
-                          'cache-control', 'expires'):
-                headers[key] = val
-            elif _key == 'x-static-large-object':
-                # for delete slo
-                self.is_slo = config_true_value(val)
+        self.is_slo = config_true_value(sw_headers.get(
+            'x-static-large-object'))
+
+        # Check whether we stored the AWS-style etag on upload
+        override_etag = s3_sysmeta_headers.get(
+            sysmeta_header('object', 'etag'))
+        if override_etag not in (None, ''):
+            # Multipart uploads in AWS have ETags like
+            #   <MD5(part_etag1 || ... || part_etagN)>-<number of parts>
+            headers['etag'] = override_etag
+        elif self.is_slo and 'etag' in headers:
+            # Many AWS clients use the presence of a '-' to decide whether
+            # to attempt client-side download validation, so even if we
+            # didn't store the AWS-style header, tack on a '-N'. (Use 'N'
+            # because we don't actually know how many parts there are.)
+            headers['etag'] += '-N'
 
         self.headers = headers
+
+        if self.etag:
+            # add double quotes to the etag header
+            self.etag = self.etag
+
         # Used for pure swift header handling at the request layer
         self.sw_headers = sw_headers
-        self.sysmeta_headers = sw_sysmeta_headers
+        self.sysmeta_headers = s3_sysmeta_headers
 
     @classmethod
     def from_swift_resp(cls, sw_resp):
@@ -184,6 +227,7 @@ class ErrorResponse(S3ResponseBase, swob.HTTPException):
     _status = ''
     _msg = ''
     _code = ''
+    xml_declaration = True
 
     def __init__(self, msg=None, *args, **kwargs):
         if msg:
@@ -196,10 +240,11 @@ class ErrorResponse(S3ResponseBase, swob.HTTPException):
             if self.info.get(reserved_key):
                 del(self.info[reserved_key])
 
-        swob.HTTPException.__init__(self, status=self._status,
-                                    app_iter=self._body_iter(),
-                                    content_type='application/xml', *args,
-                                    **kwargs)
+        swob.HTTPException.__init__(
+            self, status=kwargs.pop('status', self._status),
+            app_iter=self._body_iter(),
+            content_type='application/xml', *args,
+            **kwargs)
         self.headers = HeaderKeyDict(self.headers)
 
     def _body_iter(self):
@@ -212,18 +257,21 @@ class ErrorResponse(S3ResponseBase, swob.HTTPException):
 
         self._dict_to_etree(error_elem, self.info)
 
-        yield tostring(error_elem, use_s3ns=False)
+        yield tostring(error_elem, use_s3ns=False,
+                       xml_declaration=self.xml_declaration)
 
     def _dict_to_etree(self, parent, d):
         for key, value in d.items():
-            tag = re.sub('\W', '', snake_to_camel(key))
+            tag = re.sub(r'\W', '', snake_to_camel(key))
             elem = SubElement(parent, tag)
 
-            if isinstance(value, (dict, DictMixin)):
+            if isinstance(value, (dict, MutableMapping)):
                 self._dict_to_etree(elem, value)
             else:
+                if isinstance(value, (int, float, bool)):
+                    value = str(value)
                 try:
-                    elem.text = str(value)
+                    elem.text = value
                 except ValueError:
                     # We set an invalid string for XML.
                     elem.text = '(invalid string)'
@@ -286,6 +334,12 @@ class BucketNotEmpty(ErrorResponse):
     _msg = 'The bucket you tried to delete is not empty'
 
 
+class VersionedBucketNotEmpty(BucketNotEmpty):
+    _msg = 'The bucket you tried to delete is not empty. ' \
+           'You must delete all versions in the bucket.'
+    _code = 'BucketNotEmpty'
+
+
 class CredentialsNotSupported(ErrorResponse):
     _status = '400 Bad Request'
     _msg = 'This request does not support credentials.'
@@ -337,6 +391,10 @@ class InlineDataTooLarge(ErrorResponse):
 class InternalError(ErrorResponse):
     _status = '500 Internal Server Error'
     _msg = 'We encountered an internal error. Please try again.'
+
+    def __str__(self):
+        return '%s: %s (%s)' % (
+            self.__class__.__name__, self.status, self._msg)
 
 
 class InvalidAccessKeyId(ErrorResponse):
@@ -454,7 +512,7 @@ class InvalidURI(ErrorResponse):
         ErrorResponse.__init__(self, msg, uri=uri, *args, **kwargs)
 
 
-class KeyTooLong(ErrorResponse):
+class KeyTooLongError(ErrorResponse):
     _status = '400 Bad Request'
     _msg = 'Your key is too long.'
 
@@ -474,7 +532,7 @@ class MalformedPOSTRequest(ErrorResponse):
 class MalformedXML(ErrorResponse):
     _status = '400 Bad Request'
     _msg = 'The XML you provided was not well-formed or did not validate ' \
-           'against our published schema.'
+           'against our published schema'
 
 
 class MaxMessageLengthExceeded(ErrorResponse):
@@ -682,3 +740,9 @@ class UserKeyMustBeSpecified(ErrorResponse):
     _status = '400 Bad Request'
     _msg = 'The bucket POST must contain the specified field name. If it is ' \
            'specified, please check the order of the fields.'
+
+
+class BrokenMPU(ErrorResponse):
+    # This is very much a Swift-ism, and we wish we didn't need it
+    _status = '409 Conflict'
+    _msg = 'Multipart upload has broken segment data.'

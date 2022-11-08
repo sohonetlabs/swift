@@ -41,14 +41,15 @@ The filter returns HTTPBadRequest if path is invalid.
 '''
 
 import re
-from swift.common.utils import get_logger, register_swift_info
+from swift.common.utils import get_logger
+from swift.common.registry import register_swift_info
 
 from swift.common.swob import Request, HTTPBadRequest
 
 
 FORBIDDEN_CHARS = "\'\"`<>"
 MAX_LENGTH = 255
-FORBIDDEN_REGEXP = "/\./|/\.\./|/\.$|/\.\.$"
+FORBIDDEN_REGEXP = r"/\./|/\.\./|/\.$|/\.\.$"
 
 
 class NameCheckMiddleware(object):

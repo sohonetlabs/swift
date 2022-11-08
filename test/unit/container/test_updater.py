@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import six
 import six.moves.cPickle as pickle
 import mock
 import os
@@ -21,7 +22,8 @@ from contextlib import closing
 from gzip import GzipFile
 from shutil import rmtree
 from tempfile import mkdtemp
-from test.unit import debug_logger, mock_check_drive
+from test.debug_logger import debug_logger
+from test.unit import mock_check_drive
 
 from eventlet import spawn, Timeout
 
@@ -37,8 +39,8 @@ from test import listen_zero
 class TestContainerUpdater(unittest.TestCase):
 
     def setUp(self):
-        utils.HASH_PATH_SUFFIX = 'endcap'
-        utils.HASH_PATH_PREFIX = 'startcap'
+        utils.HASH_PATH_SUFFIX = b'endcap'
+        utils.HASH_PATH_PREFIX = b'startcap'
         self.testdir = os.path.join(mkdtemp(), 'tmp_test_container_updater')
         rmtree(self.testdir, ignore_errors=1)
         os.mkdir(self.testdir)
@@ -46,9 +48,15 @@ class TestContainerUpdater(unittest.TestCase):
         with closing(GzipFile(ring_file, 'wb')) as f:
             pickle.dump(
                 RingData([[0, 1, 0, 1], [1, 0, 1, 0]],
-                         [{'id': 0, 'ip': '127.0.0.1', 'port': 12345,
+                         [{'id': 0, 'ip': '127.0.0.2', 'port': 12345,
+                           'replication_ip': '127.0.0.1',
+                           # replication_port may be overridden in tests but
+                           # include here for completeness...
+                           'replication_port': 67890,
                            'device': 'sda1', 'zone': 0},
-                          {'id': 1, 'ip': '127.0.0.1', 'port': 12345,
+                          {'id': 1, 'ip': '127.0.0.2', 'port': 12345,
+                           'replication_ip': '127.0.0.1',
+                           'replication_port': 67890,
                            'device': 'sda1', 'zone': 2}], 30),
                 f)
         self.devices_dir = os.path.join(self.testdir, 'devices')
@@ -101,7 +109,7 @@ class TestContainerUpdater(unittest.TestCase):
             'devices': '/some/where/else',
             'mount_check': 'huh?',
             'swift_dir': '/not/here',
-            'interval': '600',
+            'interval': '600.1',
             'concurrency': '2',
             'containers_per_second': '10.5',
         }
@@ -109,7 +117,7 @@ class TestContainerUpdater(unittest.TestCase):
         self.assertEqual(daemon.devices, '/some/where/else')
         self.assertEqual(daemon.mount_check, False)
         self.assertEqual(daemon.swift_dir, '/not/here')
-        self.assertEqual(daemon.interval, 600)
+        self.assertEqual(daemon.interval, 600.1)
         self.assertEqual(daemon.concurrency, 2)
         self.assertEqual(daemon.max_containers_per_second, 10.5)
 
@@ -122,7 +130,6 @@ class TestContainerUpdater(unittest.TestCase):
                 container_updater.ContainerUpdater(conf)
 
         check_bad({'interval': 'foo'})
-        check_bad({'interval': '300.0'})
         check_bad({'concurrency': 'bar'})
         check_bad({'concurrency': '1.0'})
         check_bad({'slowdown': 'baz'})
@@ -196,7 +203,8 @@ class TestContainerUpdater(unittest.TestCase):
         self.assertFalse(log_lines[1:])
         self.assertEqual(1, len(mock_dump_recon.mock_calls))
 
-    def test_run_once(self):
+    @mock.patch('swift.container.updater.dump_recon_cache')
+    def test_run_once(self, mock_recon):
         cu = self._get_container_updater()
         cu.run_once()
         containers_dir = os.path.join(self.sda1, DATADIR)
@@ -230,21 +238,21 @@ class TestContainerUpdater(unittest.TestCase):
                 with Timeout(3):
                     inc = sock.makefile('rb')
                     out = sock.makefile('wb')
-                    out.write('HTTP/1.1 %d OK\r\nContent-Length: 0\r\n\r\n' %
+                    out.write(b'HTTP/1.1 %d OK\r\nContent-Length: 0\r\n\r\n' %
                               return_code)
                     out.flush()
                     self.assertEqual(inc.readline(),
-                                     'PUT /sda1/0/a/c HTTP/1.1\r\n')
+                                     b'PUT /sda1/0/a/c HTTP/1.1\r\n')
                     headers = {}
                     line = inc.readline()
-                    while line and line != '\r\n':
-                        headers[line.split(':')[0].lower()] = \
-                            line.split(':')[1].strip()
+                    while line and line != b'\r\n':
+                        headers[line.split(b':')[0].lower()] = \
+                            line.split(b':')[1].strip()
                         line = inc.readline()
-                    self.assertTrue('x-put-timestamp' in headers)
-                    self.assertTrue('x-delete-timestamp' in headers)
-                    self.assertTrue('x-object-count' in headers)
-                    self.assertTrue('x-bytes-used' in headers)
+                    self.assertIn(b'x-put-timestamp', headers)
+                    self.assertIn(b'x-delete-timestamp', headers)
+                    self.assertIn(b'x-object-count', headers)
+                    self.assertIn(b'x-bytes-used', headers)
             except BaseException as err:
                 import traceback
                 traceback.print_exc()
@@ -262,12 +270,13 @@ class TestContainerUpdater(unittest.TestCase):
         spawned = spawn(spawn_accepts)
         for dev in cu.get_account_ring().devs:
             if dev is not None:
-                dev['port'] = bindsock.getsockname()[1]
+                dev['replication_port'] = bindsock.getsockname()[1]
         cu.run_once()
-        for event in spawned.wait():
-            err = event.wait()
-            if err:
-                raise err
+        with Timeout(5):
+            for event in spawned.wait():
+                err = event.wait()
+                if err:
+                    raise err
         info = cb.get_info()
         self.assertEqual(info['object_count'], 1)
         self.assertEqual(info['bytes_used'], 3)
@@ -303,7 +312,10 @@ class TestContainerUpdater(unittest.TestCase):
         cb = ContainerBroker(os.path.join(subdir, 'hash.db'), account='a',
                              container='\xce\xa9')
         cb.initialize(normalize_timestamp(1), 0)
-        cb.put_object('\xce\xa9', normalize_timestamp(2), 3, 'text/plain',
+        obj_name = u'\N{GREEK CAPITAL LETTER OMEGA}'
+        if six.PY2:
+            obj_name = obj_name.encode('utf-8')
+        cb.put_object(obj_name, normalize_timestamp(2), 3, 'text/plain',
                       '68b329da9893e34099c7d8ad5cb9c940')
 
         def accept(sock, addr):
@@ -311,7 +323,7 @@ class TestContainerUpdater(unittest.TestCase):
                 with Timeout(3):
                     inc = sock.makefile('rb')
                     out = sock.makefile('wb')
-                    out.write('HTTP/1.1 201 OK\r\nContent-Length: 0\r\n\r\n')
+                    out.write(b'HTTP/1.1 201 OK\r\nContent-Length: 0\r\n\r\n')
                     out.flush()
                     inc.read()
             except BaseException as err:
@@ -333,19 +345,20 @@ class TestContainerUpdater(unittest.TestCase):
         spawned = spawn(spawn_accepts)
         for dev in cu.get_account_ring().devs:
             if dev is not None:
-                dev['port'] = bindsock.getsockname()[1]
+                dev['replication_port'] = bindsock.getsockname()[1]
         cu.run_once()
-        for event in spawned.wait():
-            err = event.wait()
-            if err:
-                raise err
+        with Timeout(5):
+            for event in spawned.wait():
+                err = event.wait()
+                if err:
+                    raise err
         info = cb.get_info()
         self.assertEqual(info['object_count'], 1)
         self.assertEqual(info['bytes_used'], 3)
         self.assertEqual(info['reported_object_count'], 1)
         self.assertEqual(info['reported_bytes_used'], 3)
 
-    def test_shard_container(self):
+    def test_old_style_shard_container(self):
         cu = self._get_container_updater()
         cu.run_once()
         containers_dir = os.path.join(self.sda1, DATADIR)
@@ -388,21 +401,21 @@ class TestContainerUpdater(unittest.TestCase):
                 with Timeout(3):
                     inc = sock.makefile('rb')
                     out = sock.makefile('wb')
-                    out.write('HTTP/1.1 %d OK\r\nContent-Length: 0\r\n\r\n' %
+                    out.write(b'HTTP/1.1 %d OK\r\nContent-Length: 0\r\n\r\n' %
                               return_code)
                     out.flush()
                     self.assertEqual(inc.readline(),
-                                     'PUT /sda1/2/.shards_a/c HTTP/1.1\r\n')
+                                     b'PUT /sda1/2/.shards_a/c HTTP/1.1\r\n')
                     headers = {}
                     line = inc.readline()
-                    while line and line != '\r\n':
-                        headers[line.split(':')[0].lower()] = \
-                            line.split(':')[1].strip()
+                    while line and line != b'\r\n':
+                        headers[line.split(b':')[0].lower()] = \
+                            line.split(b':')[1].strip()
                         line = inc.readline()
-                    self.assertTrue('x-put-timestamp' in headers)
-                    self.assertTrue('x-delete-timestamp' in headers)
-                    self.assertTrue('x-object-count' in headers)
-                    self.assertTrue('x-bytes-used' in headers)
+                    self.assertIn(b'x-put-timestamp', headers)
+                    self.assertIn(b'x-delete-timestamp', headers)
+                    self.assertIn(b'x-object-count', headers)
+                    self.assertIn(b'x-bytes-used', headers)
             except BaseException as err:
                 import traceback
                 traceback.print_exc()
@@ -420,12 +433,13 @@ class TestContainerUpdater(unittest.TestCase):
         spawned = spawn(spawn_accepts)
         for dev in cu.get_account_ring().devs:
             if dev is not None:
-                dev['port'] = bindsock.getsockname()[1]
+                dev['replication_port'] = bindsock.getsockname()[1]
         cu.run_once()
-        for event in spawned.wait():
-            err = event.wait()
-            if err:
-                raise err
+        with Timeout(5):
+            for event in spawned.wait():
+                err = event.wait()
+                if err:
+                    raise err
         info = cb.get_info()
         self.assertEqual(info['object_count'], 1)
         self.assertEqual(info['bytes_used'], 3)
@@ -433,6 +447,97 @@ class TestContainerUpdater(unittest.TestCase):
         self.assertEqual(info['reported_delete_timestamp'], '0')
         self.assertEqual(info['reported_object_count'], 0)
         self.assertEqual(info['reported_bytes_used'], 0)
+
+    def test_shard_container(self):
+        cu = self._get_container_updater()
+        cu.run_once()
+        containers_dir = os.path.join(self.sda1, DATADIR)
+        os.mkdir(containers_dir)
+        cu.run_once()
+        self.assertTrue(os.path.exists(containers_dir))
+        subdir = os.path.join(containers_dir, 'subdir')
+        os.mkdir(subdir)
+        cb = ContainerBroker(os.path.join(subdir, 'hash.db'),
+                             account='.shards_a', container='c')
+        cb.initialize(normalize_timestamp(1), 0)
+        cb.set_sharding_sysmeta('Quoted-Root', 'a/c')
+        self.assertFalse(cb.is_root_container())
+        cu.run_once()
+        info = cb.get_info()
+        self.assertEqual(info['object_count'], 0)
+        self.assertEqual(info['bytes_used'], 0)
+        self.assertEqual(info['reported_put_timestamp'], '0')
+        self.assertEqual(info['reported_delete_timestamp'], '0')
+        self.assertEqual(info['reported_object_count'], 0)
+        self.assertEqual(info['reported_bytes_used'], 0)
+
+        cb.put_object('o', normalize_timestamp(2), 3, 'text/plain',
+                      '68b329da9893e34099c7d8ad5cb9c940')
+        # Fake us having already reported *bad* stats under swift 2.18.0
+        cb.reported('0', '0', 1, 3)
+
+        # Should fail with a bunch of connection-refused
+        cu.run_once()
+        info = cb.get_info()
+        self.assertEqual(info['object_count'], 1)
+        self.assertEqual(info['bytes_used'], 3)
+        self.assertEqual(info['reported_put_timestamp'], '0')
+        self.assertEqual(info['reported_delete_timestamp'], '0')
+        self.assertEqual(info['reported_object_count'], 1)
+        self.assertEqual(info['reported_bytes_used'], 3)
+
+        def accept(sock, addr, return_code):
+            try:
+                with Timeout(3):
+                    inc = sock.makefile('rb')
+                    out = sock.makefile('wb')
+                    out.write(b'HTTP/1.1 %d OK\r\nContent-Length: 0\r\n\r\n' %
+                              return_code)
+                    out.flush()
+                    self.assertEqual(inc.readline(),
+                                     b'PUT /sda1/2/.shards_a/c HTTP/1.1\r\n')
+                    headers = {}
+                    line = inc.readline()
+                    while line and line != b'\r\n':
+                        headers[line.split(b':')[0].lower()] = \
+                            line.split(b':')[1].strip()
+                        line = inc.readline()
+                    self.assertIn(b'x-put-timestamp', headers)
+                    self.assertIn(b'x-delete-timestamp', headers)
+                    self.assertIn(b'x-object-count', headers)
+                    self.assertIn(b'x-bytes-used', headers)
+            except BaseException as err:
+                import traceback
+                traceback.print_exc()
+                return err
+            return None
+        bindsock = listen_zero()
+
+        def spawn_accepts():
+            events = []
+            for _junk in range(2):
+                sock, addr = bindsock.accept()
+                events.append(spawn(accept, sock, addr, 201))
+            return events
+
+        spawned = spawn(spawn_accepts)
+        for dev in cu.get_account_ring().devs:
+            if dev is not None:
+                dev['replication_port'] = bindsock.getsockname()[1]
+        cu.run_once()
+        with Timeout(5):
+            for event in spawned.wait():
+                err = event.wait()
+                if err:
+                    raise err
+        info = cb.get_info()
+        self.assertEqual(info['object_count'], 1)
+        self.assertEqual(info['bytes_used'], 3)
+        self.assertEqual(info['reported_put_timestamp'], '0000000001.00000')
+        self.assertEqual(info['reported_delete_timestamp'], '0')
+        self.assertEqual(info['reported_object_count'], 0)
+        self.assertEqual(info['reported_bytes_used'], 0)
+
 
 if __name__ == '__main__':
     unittest.main()

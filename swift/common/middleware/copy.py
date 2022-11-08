@@ -114,18 +114,17 @@ greater than 5GB.
 
 """
 
-from six.moves.urllib.parse import quote, unquote
-
 from swift.common.utils import get_logger, config_true_value, FileLikeIter, \
     close_if_possible
 from swift.common.swob import Request, HTTPPreconditionFailed, \
-    HTTPRequestEntityTooLarge, HTTPBadRequest, HTTPException
+    HTTPRequestEntityTooLarge, HTTPBadRequest, HTTPException, \
+    wsgi_quote, wsgi_unquote
 from swift.common.http import HTTP_MULTIPLE_CHOICES, is_success, HTTP_OK
 from swift.common.constraints import check_account_format, MAX_FILE_SIZE
 from swift.common.request_helpers import copy_header_subset, remove_items, \
     is_sys_meta, is_sys_or_user_meta, is_object_transient_sysmeta, \
-    check_path_header
-from swift.common.wsgi import WSGIContext, make_subrequest, load_app_config
+    check_path_header, OBJECT_SYSMETA_CONTAINER_UPDATE_OVERRIDE_PREFIX
+from swift.common.wsgi import WSGIContext, make_subrequest
 
 
 def _check_copy_from_header(req):
@@ -183,7 +182,7 @@ class ServerSideCopyWebContext(WSGIContext):
 
     def get_source_resp(self, req):
         sub_req = make_subrequest(
-            req.environ, path=quote(req.path_info), headers=req.headers,
+            req.environ, path=wsgi_quote(req.path_info), headers=req.headers,
             swift_source='SSC')
         return sub_req.get_response(self.app)
 
@@ -221,30 +220,15 @@ class ServerSideCopyMiddleware(object):
     def __init__(self, app, conf):
         self.app = app
         self.logger = get_logger(conf, log_route="copy")
-        self._load_object_post_as_copy_conf(conf)
-        self.object_post_as_copy = \
-            config_true_value(conf.get('object_post_as_copy', 'false'))
-        if self.object_post_as_copy:
-            msg = ('object_post_as_copy=true is deprecated; This '
-                   'option is now ignored')
-            self.logger.warning(msg)
-
-    def _load_object_post_as_copy_conf(self, conf):
-        if ('object_post_as_copy' in conf or '__file__' not in conf):
-            # Option is explicitly set in middleware conf. In that case,
-            # we assume operator knows what he's doing.
-            # This takes preference over the one set in proxy app
-            return
-
-        proxy_conf = load_app_config(conf['__file__'])
-        if 'object_post_as_copy' in proxy_conf:
-            conf['object_post_as_copy'] = proxy_conf['object_post_as_copy']
 
     def __call__(self, env, start_response):
         req = Request(env)
         try:
             (version, account, container, obj) = req.split_path(4, 4, True)
+            is_obj_req = True
         except ValueError:
+            is_obj_req = False
+        if not is_obj_req:
             # If obj component is not present in req, do not proceed further.
             return self.app(env, start_response)
 
@@ -275,9 +259,9 @@ class ServerSideCopyMiddleware(object):
                                           )(req.environ, start_response)
         dest_account = account
         if 'Destination-Account' in req.headers:
-            dest_account = unquote(req.headers.get('Destination-Account'))
+            dest_account = wsgi_unquote(req.headers.get('Destination-Account'))
             dest_account = check_account_format(req, dest_account)
-            req.headers['X-Copy-From-Account'] = quote(account)
+            req.headers['X-Copy-From-Account'] = wsgi_quote(account)
             account = dest_account
             del req.headers['Destination-Account']
         dest_container, dest_object = _check_destination_header(req)
@@ -293,7 +277,7 @@ class ServerSideCopyMiddleware(object):
         req.path_info = '/%s/%s/%s/%s' % (
             ver, dest_account, dest_container, dest_object)
         req.headers['Content-Length'] = 0
-        req.headers['X-Copy-From'] = quote(source)
+        req.headers['X-Copy-From'] = wsgi_quote(source)
         del req.headers['Destination']
         return self.handle_PUT(req, start_response)
 
@@ -330,11 +314,14 @@ class ServerSideCopyMiddleware(object):
     def _create_response_headers(self, source_path, source_resp, sink_req):
         resp_headers = dict()
         acct, path = source_path.split('/', 3)[2:4]
-        resp_headers['X-Copied-From-Account'] = quote(acct)
-        resp_headers['X-Copied-From'] = quote(path)
+        resp_headers['X-Copied-From-Account'] = wsgi_quote(acct)
+        resp_headers['X-Copied-From'] = wsgi_quote(path)
         if 'last-modified' in source_resp.headers:
             resp_headers['X-Copied-From-Last-Modified'] = \
                 source_resp.headers['last-modified']
+        if 'X-Object-Version-Id' in source_resp.headers:
+            resp_headers['X-Copied-From-Version-Id'] = \
+                source_resp.headers['X-Object-Version-Id']
         # Existing sys and user meta of source object is added to response
         # headers in addition to the new ones.
         _copy_headers(sink_req.headers, resp_headers)
@@ -352,7 +339,7 @@ class ServerSideCopyMiddleware(object):
         src_account_name = req.headers.get('X-Copy-From-Account')
         if src_account_name:
             src_account_name = check_account_format(
-                req, unquote(src_account_name))
+                req, wsgi_unquote(src_account_name))
         else:
             src_account_name = acct
         src_container_name, src_obj_name = _check_copy_from_header(req)
@@ -390,6 +377,8 @@ class ServerSideCopyMiddleware(object):
             sink_req.headers.update(req.headers)
 
         params = sink_req.params
+        params_updated = False
+
         if params.get('multipart-manifest') == 'get':
             if 'X-Static-Large-Object' in source_resp.headers:
                 params['multipart-manifest'] = 'put'
@@ -397,6 +386,13 @@ class ServerSideCopyMiddleware(object):
                 del params['multipart-manifest']
                 sink_req.headers['X-Object-Manifest'] = \
                     source_resp.headers['X-Object-Manifest']
+            params_updated = True
+
+        if 'version-id' in params:
+            del params['version-id']
+            params_updated = True
+
+        if params_updated:
             sink_req.params = params
 
         # Set swift.source, data source, content length and etag
@@ -421,7 +417,7 @@ class ServerSideCopyMiddleware(object):
             # since we're not copying the source etag, make sure that any
             # container update override values are not copied.
             remove_items(sink_req.headers, lambda k: k.startswith(
-                'X-Object-Sysmeta-Container-Update-Override-'))
+                OBJECT_SYSMETA_CONTAINER_UPDATE_OVERRIDE_PREFIX.title()))
 
         # We no longer need these headers
         sink_req.headers.pop('X-Copy-From', None)

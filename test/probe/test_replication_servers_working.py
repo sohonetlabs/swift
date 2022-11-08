@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from io import BytesIO
 from unittest import main
 from uuid import uuid4
 import os
@@ -25,9 +26,10 @@ from swiftclient import client
 from swift.obj.diskfile import get_data_dir
 
 from test.probe.common import ReplProbeTest
+from swift.common.request_helpers import get_reserved_name
 from swift.common.utils import readconf
 
-EXCLUDE_FILES = re.compile('^(hashes\.(pkl|invalid)|lock(-\d+)?)$')
+EXCLUDE_FILES = re.compile(r'^(hashes\.(pkl|invalid)|lock(-\d+)?)$')
 
 
 def collect_info(path_list):
@@ -80,6 +82,15 @@ class TestReplicatorFunctions(ReplProbeTest):
     different port values.
     """
 
+    def put_data(self):
+        container = 'container-%s' % uuid4()
+        client.put_container(self.url, self.token, container,
+                             headers={'X-Storage-Policy':
+                                      self.policy.name})
+
+        obj = 'object-%s' % uuid4()
+        client.put_object(self.url, self.token, container, obj, 'VERIFY')
+
     def test_main(self):
         # Create one account, container and object file.
         # Find node with account, container and object replicas.
@@ -102,13 +113,7 @@ class TestReplicatorFunctions(ReplProbeTest):
             path_list.append(os.path.join(device_path, device))
 
         # Put data to storage nodes
-        container = 'container-%s' % uuid4()
-        client.put_container(self.url, self.token, container,
-                             headers={'X-Storage-Policy':
-                                      self.policy.name})
-
-        obj = 'object-%s' % uuid4()
-        client.put_object(self.url, self.token, container, obj, 'VERIFY')
+        self.put_data()
 
         # Get all data file information
         (files_list, dir_list) = collect_info(path_list)
@@ -124,13 +129,13 @@ class TestReplicatorFunctions(ReplProbeTest):
                 test_node_dir_list.append(d)
         # Run all replicators
         try:
-            self.replicators.start()
-
             # Delete some files
             for directory in os.listdir(test_node):
                 shutil.rmtree(os.path.join(test_node, directory))
 
             self.assertFalse(os.listdir(test_node))
+
+            self.replicators.start()
 
             # We will keep trying these tests until they pass for up to 60s
             begin = time.time()
@@ -142,17 +147,28 @@ class TestReplicatorFunctions(ReplProbeTest):
                     for files in test_node_files_list:
                         self.assertIn(files, new_files_list[0])
 
-                    for dir in test_node_dir_list:
-                        self.assertIn(dir, new_dir_list[0])
+                    for directory in test_node_dir_list:
+                        self.assertIn(directory, new_dir_list[0])
+
+                    # We want to make sure that replication is completely
+                    # settled; any invalidated hashes should be rehashed so
+                    # hashes.pkl is stable
+                    for directory in os.listdir(
+                            os.path.join(test_node, data_dir)):
+                        hashes_invalid_path = os.path.join(
+                            test_node, data_dir, directory, 'hashes.invalid')
+                        self.assertEqual(os.stat(
+                            hashes_invalid_path).st_size, 0)
                     break
                 except Exception:
                     if time.time() - begin > 60:
                         raise
                     time.sleep(1)
 
+            self.replicators.stop()
+
             # Delete directories and files in objects storage without
             # deleting file "hashes.pkl".
-            # Check, that files not replicated.
             for directory in os.listdir(os.path.join(test_node, data_dir)):
                 for input_dir in os.listdir(os.path.join(
                         test_node, data_dir, directory)):
@@ -161,23 +177,17 @@ class TestReplicatorFunctions(ReplProbeTest):
                         shutil.rmtree(os.path.join(
                             test_node, data_dir, directory, input_dir))
 
-            # We will keep trying these tests until they pass for up to 60s
-            begin = time.time()
-            while True:
-                try:
-                    for directory in os.listdir(os.path.join(
-                            test_node, data_dir)):
-                        for input_dir in os.listdir(os.path.join(
-                                test_node, data_dir, directory)):
-                            self.assertFalse(os.path.isdir(
-                                os.path.join(test_node, data_dir,
-                                             directory, input_dir)))
-                    break
-                except Exception:
-                    if time.time() - begin > 60:
-                        raise
-                    time.sleep(1)
+            self.replicators.once()
+            # Check, that files not replicated.
+            for directory in os.listdir(os.path.join(
+                    test_node, data_dir)):
+                for input_dir in os.listdir(os.path.join(
+                        test_node, data_dir, directory)):
+                    self.assertFalse(os.path.isdir(
+                        os.path.join(test_node, data_dir,
+                                     directory, input_dir)))
 
+            self.replicators.start()
             # Now, delete file "hashes.pkl".
             # Check, that all files were replicated.
             for directory in os.listdir(os.path.join(test_node, data_dir)):
@@ -203,6 +213,20 @@ class TestReplicatorFunctions(ReplProbeTest):
                     time.sleep(1)
         finally:
             self.replicators.stop()
+
+
+class TestReplicatorFunctionsReservedNames(TestReplicatorFunctions):
+    def put_data(self):
+        int_client = self.make_internal_client()
+        int_client.create_account(self.account)
+        container = get_reserved_name('container', str(uuid4()))
+        int_client.create_container(self.account, container,
+                                    headers={'X-Storage-Policy':
+                                             self.policy.name})
+
+        obj = get_reserved_name('object', str(uuid4()))
+        int_client.upload_object(
+            BytesIO(b'VERIFY'), self.account, container, obj)
 
 
 if __name__ == '__main__':

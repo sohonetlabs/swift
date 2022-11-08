@@ -13,7 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
+import functools
+import io
 import json
 import os
 import random
@@ -21,7 +22,7 @@ import sys
 import socket
 import time
 
-from unittest2 import SkipTest
+from unittest import SkipTest
 from xml.dom import minidom
 
 import six
@@ -30,7 +31,9 @@ from six.moves import urllib
 from swiftclient import get_auth
 
 from swift.common import constraints
-from swift.common.utils import config_true_value
+from swift.common.http import is_success
+from swift.common.swob import str_to_wsgi, wsgi_to_str
+from swift.common.utils import config_true_value, md5
 
 from test import safe_repr
 
@@ -46,12 +49,13 @@ class RequestError(Exception):
 
 
 class ResponseError(Exception):
-    def __init__(self, response, method=None, path=None):
-        self.status = response.status
-        self.reason = response.reason
+    def __init__(self, response, method=None, path=None, details=None):
+        self.status = getattr(response, 'status', 0)
+        self.reason = getattr(response, 'reason', '[unknown]')
         self.method = method
         self.path = path
-        self.headers = response.getheaders()
+        self.headers = getattr(response, 'getheaders', lambda: [])()
+        self.details = details
 
         for name, value in self.headers:
             if name.lower() == 'x-trans-id':
@@ -66,8 +70,11 @@ class ResponseError(Exception):
         return repr(self)
 
     def __repr__(self):
-        return '%d: %r (%r %r) txid=%s' % (
+        msg = '%d: %r (%r %r) txid=%s' % (
             self.status, self.reason, self.method, self.path, self.txid)
+        if self.details:
+            msg += '\n%s' % self.details
+        return msg
 
 
 def listing_empty(method):
@@ -105,20 +112,103 @@ def listing_items(method):
             items = []
 
 
+def putrequest(self, method, url, skip_host=False, skip_accept_encoding=False):
+    '''Send a request to the server.
+
+    This is mostly a regurgitation of CPython's HTTPConnection.putrequest,
+    but fixed up so we can still send arbitrary bytes in the request line
+    on py3. See also: https://bugs.python.org/issue36274
+
+    To use, swap out a HTTP(S)Connection's putrequest with something like::
+
+       conn.putrequest = putrequest.__get__(conn)
+
+    :param method: specifies an HTTP request method, e.g. 'GET'.
+    :param url: specifies the object being requested, e.g. '/index.html'.
+    :param skip_host: if True does not add automatically a 'Host:' header
+    :param skip_accept_encoding: if True does not add automatically an
+       'Accept-Encoding:' header
+    '''
+    # (Mostly) inline the HTTPConnection implementation; just fix it
+    # so we can send non-ascii request lines. For comparison, see
+    # https://github.com/python/cpython/blob/v2.7.16/Lib/httplib.py#L888-L1003
+    # and https://github.com/python/cpython/blob/v3.7.2/
+    # Lib/http/client.py#L1061-L1183
+    if self._HTTPConnection__response \
+            and self._HTTPConnection__response.isclosed():
+        self._HTTPConnection__response = None
+
+    if self._HTTPConnection__state == http_client._CS_IDLE:
+        self._HTTPConnection__state = http_client._CS_REQ_STARTED
+    else:
+        raise http_client.CannotSendRequest(self._HTTPConnection__state)
+
+    self._method = method
+    if not url:
+        url = '/'
+    self._path = url
+    request = '%s %s %s' % (method, url, self._http_vsn_str)
+    if not isinstance(request, bytes):
+        # This choice of encoding is the whole reason we copy/paste from
+        # cpython. When making backend requests, it should never be
+        # necessary; however, we have some functional tests that want
+        # to send non-ascii bytes.
+        # TODO: when https://bugs.python.org/issue36274 is resolved, make
+        # sure we fix up our API to match whatever upstream chooses to do
+        self._output(request.encode('latin1'))
+    else:
+        self._output(request)
+
+    if self._http_vsn == 11:
+        if not skip_host:
+            netloc = ''
+            if url.startswith('http'):
+                nil, netloc, nil, nil, nil = urllib.parse.urlsplit(url)
+
+            if netloc:
+                try:
+                    netloc_enc = netloc.encode("ascii")
+                except UnicodeEncodeError:
+                    netloc_enc = netloc.encode("idna")
+                self.putheader('Host', netloc_enc)
+            else:
+                if self._tunnel_host:
+                    host = self._tunnel_host
+                    port = self._tunnel_port
+                else:
+                    host = self.host
+                    port = self.port
+
+                try:
+                    host_enc = host.encode("ascii")
+                except UnicodeEncodeError:
+                    host_enc = host.encode("idna")
+
+                if host.find(':') >= 0:
+                    host_enc = b'[' + host_enc + b']'
+
+                if port == self.default_port:
+                    self.putheader('Host', host_enc)
+                else:
+                    host_enc = host_enc.decode("ascii")
+                    self.putheader('Host', "%s:%s" % (host_enc, port))
+
+        if not skip_accept_encoding:
+            self.putheader('Accept-Encoding', 'identity')
+
+
 class Connection(object):
     def __init__(self, config):
-        for key in 'auth_host auth_port auth_ssl username password'.split():
+        for key in 'auth_uri username password'.split():
             if key not in config:
                 raise SkipTest(
                     "Missing required configuration parameter: %s" % key)
 
-        self.auth_host = config['auth_host']
-        self.auth_port = int(config['auth_port'])
-        self.auth_ssl = config['auth_ssl'] in ('on', 'true', 'yes', '1')
+        self.auth_url = config['auth_uri']
         self.insecure = config_true_value(config.get('insecure', 'false'))
-        self.auth_prefix = config.get('auth_prefix', '/')
         self.auth_version = str(config.get('auth_version', '1'))
 
+        self.domain = config.get('domain')
         self.account = config.get('account')
         self.username = config['username']
         self.password = config['password']
@@ -126,6 +216,7 @@ class Connection(object):
         self.storage_netloc = None
         self.storage_path = None
         self.conn_class = None
+        self.connection = None  # until you call .http_connect()
 
     @property
     def storage_url(self):
@@ -134,6 +225,9 @@ class Connection(object):
 
     @storage_url.setter
     def storage_url(self, value):
+        if six.PY2 and not isinstance(value, bytes):
+            value = value.encode('utf-8')
+
         url = urllib.parse.urlparse(value)
 
         if url.scheme == 'http':
@@ -164,18 +258,10 @@ class Connection(object):
         return Account(self, self.account)
 
     def authenticate(self):
-        if self.auth_version == "1":
-            auth_path = '%sv1.0' % (self.auth_prefix)
-            if self.account:
-                auth_user = '%s:%s' % (self.account, self.username)
-            else:
-                auth_user = self.username
+        if self.auth_version == "1" and self.account:
+            auth_user = '%s:%s' % (self.account, self.username)
         else:
             auth_user = self.username
-            auth_path = self.auth_prefix
-        auth_scheme = 'https://' if self.auth_ssl else 'http://'
-        auth_netloc = "%s:%d" % (self.auth_host, self.auth_port)
-        auth_url = auth_scheme + auth_netloc + auth_path
 
         if self.insecure:
             try:
@@ -187,11 +273,16 @@ class Connection(object):
             else:
                 requests.packages.urllib3.disable_warnings(
                     InsecureRequestWarning)
+        if self.domain:
+            os_opts = {'project_domain_name': self.domain,
+                       'user_domain_name': self.domain}
+        else:
+            os_opts = {}
         authargs = dict(snet=False, tenant_name=self.account,
-                        auth_version=self.auth_version, os_options={},
+                        auth_version=self.auth_version, os_options=os_opts,
                         insecure=self.insecure)
         (storage_url, storage_token) = get_auth(
-            auth_url, auth_user, self.password, **authargs)
+            self.auth_url, auth_user, self.password, **authargs)
 
         if not (storage_url and storage_token):
             raise AuthenticationFailed()
@@ -216,7 +307,7 @@ class Connection(object):
                                    cfg={'absolute_path': True})
         if status // 100 == 4:
             return {}
-        if not 200 <= status <= 299:
+        if not is_success(status):
             raise ResponseError(self.response, 'GET', '/info')
         return json.loads(self.response.read())
 
@@ -229,6 +320,7 @@ class Connection(object):
                 context=ssl._create_unverified_context())
         else:
             self.connection = self.conn_class(self.storage_netloc)
+        self.connection.putrequest = putrequest.__get__(self.connection)
 
     def make_path(self, path=None, cfg=None):
         if path is None:
@@ -242,7 +334,7 @@ class Connection(object):
         if path:
             quote = urllib.parse.quote
             if cfg.get('no_quote') or cfg.get('no_path_quote'):
-                quote = lambda x: x
+                quote = str_to_wsgi
             return '%s/%s' % (self.storage_path,
                               '/'.join([quote(i) for i in path]))
         else:
@@ -260,10 +352,11 @@ class Connection(object):
             headers['X-Auth-Token'] = cfg.get('use_token')
 
         if isinstance(hdrs, dict):
-            headers.update(hdrs)
+            headers.update((str_to_wsgi(h), str_to_wsgi(v))
+                           for h, v in hdrs.items())
         return headers
 
-    def make_request(self, method, path=None, data='', hdrs=None, parms=None,
+    def make_request(self, method, path=None, data=b'', hdrs=None, parms=None,
                      cfg=None):
         if path is None:
             path = []
@@ -288,15 +381,25 @@ class Connection(object):
             path = '%s?%s' % (path, '&'.join(query_args))
         if not cfg.get('no_content_length'):
             if cfg.get('set_content_length'):
-                headers['Content-Length'] = cfg.get('set_content_length')
+                headers['Content-Length'] = str(cfg.get('set_content_length'))
             else:
-                headers['Content-Length'] = len(data)
+                headers['Content-Length'] = str(len(data))
 
         def try_request():
             self.http_connect()
             self.connection.request(method, path, data, headers)
             return self.connection.getresponse()
 
+        try:
+            self.response = self.request_with_retry(try_request)
+        except RequestError as e:
+            details = "{method} {path} headers: {headers} data: {data}".format(
+                method=method, path=path, headers=headers, data=data)
+            raise RequestError('Unable to complete request: %s.\n%s' % (
+                details, str(e)))
+        return self.response.status
+
+    def request_with_retry(self, try_request):
         self.response = None
         try_count = 0
         fail_messages = []
@@ -305,6 +408,9 @@ class Connection(object):
 
             try:
                 self.response = try_request()
+            except socket.timeout as e:
+                fail_messages.append(safe_repr(e))
+                continue
             except http_client.HTTPException as e:
                 fail_messages.append(safe_repr(e))
                 continue
@@ -318,17 +424,13 @@ class Connection(object):
                 if try_count != 5:
                     time.sleep(5)
                 continue
-
             break
 
         if self.response:
-            return self.response.status
+            return self.response
 
-        request = "{method} {path} headers: {headers} data: {data}".format(
-            method=method, path=path, headers=headers, data=data)
-        raise RequestError('Unable to complete http request: %s. '
-                           'Attempts: %s, Failures: %s' %
-                           (request, len(fail_messages), fail_messages))
+        raise RequestError('Attempts: %s, Failures: %s' % (
+            len(fail_messages), fail_messages))
 
     def put_start(self, path, hdrs=None, parms=None, cfg=None, chunked=False):
         if hdrs is None:
@@ -362,13 +464,13 @@ class Connection(object):
 
     def put_data(self, data, chunked=False):
         if chunked:
-            self.connection.send('%x\r\n%s\r\n' % (len(data), data))
+            self.connection.send(b'%x\r\n%s\r\n' % (len(data), data))
         else:
             self.connection.send(data)
 
     def put_end(self, chunked=False):
         if chunked:
-            self.connection.send('0\r\n\r\n')
+            self.connection.send(b'0\r\n\r\n')
 
         self.response = self.connection.getresponse()
         # Hope it isn't big!
@@ -398,13 +500,16 @@ class Base(object):
                 'x-container-bytes-used',
             )
 
-        headers = dict(self.conn.response.getheaders())
+        # NB: on py2, headers are always lower; on py3, they match the bytes
+        # on the wire
+        headers = dict((wsgi_to_str(h).lower(), wsgi_to_str(v))
+                       for h, v in self.conn.response.getheaders())
         ret = {}
 
         for return_key, header in required_fields:
             if header not in headers:
-                raise ValueError("%s was not found in response header" %
-                                 (header,))
+                raise ValueError("%s was not found in response headers: %r" %
+                                 (header, headers))
 
             if is_int_header(header):
                 ret[return_key] = int(headers[header])
@@ -436,7 +541,7 @@ class Account(Base):
                        for k, v in metadata.items())
 
         self.conn.make_request('POST', self.path, hdrs=headers, cfg=cfg)
-        if not 200 <= self.conn.response.status <= 299:
+        if not is_success(self.conn.response.status):
             raise ResponseError(self.conn.response, 'POST',
                                 self.conn.make_path(self.path))
         return True
@@ -463,8 +568,9 @@ class Account(Base):
         if status == 200:
             if format_type == 'json':
                 conts = json.loads(self.conn.response.read())
-                for cont in conts:
-                    cont['name'] = cont['name'].encode('utf-8')
+                if six.PY2:
+                    for cont in conts:
+                        cont['name'] = cont['name'].encode('utf-8')
                 return conts
             elif format_type == 'xml':
                 conts = []
@@ -476,13 +582,18 @@ class Account(Base):
                             childNodes[0].nodeValue
                     conts.append(cont)
                 for cont in conts:
-                    cont['name'] = cont['name'].encode('utf-8')
+                    if six.PY2:
+                        cont['name'] = cont['name'].encode('utf-8')
+                    for key in ('count', 'bytes'):
+                        cont[key] = int(cont[key])
                 return conts
             else:
-                lines = self.conn.response.read().split('\n')
+                lines = self.conn.response.read().split(b'\n')
                 if lines and not lines[-1]:
                     lines = lines[:-1]
-                return lines
+                if six.PY2:
+                    return lines
+                return [line.decode('utf-8') for line in lines]
         elif status == 204:
             return []
 
@@ -492,7 +603,8 @@ class Account(Base):
     def delete_containers(self):
         for c in listing_items(self.containers):
             cont = self.container(c)
-            cont.update_metadata(hdrs={'x-versions-location': ''})
+            cont.update_metadata(hdrs={'x-versions-location': ''},
+                                 tolerate_missing=True)
             if not cont.delete_recursive():
                 return False
 
@@ -546,41 +658,48 @@ class Container(Base):
         return self.conn.make_request('PUT', self.path, hdrs=hdrs,
                                       parms=parms, cfg=cfg) in (201, 202)
 
-    def update_metadata(self, hdrs=None, cfg=None):
+    def update_metadata(self, hdrs=None, cfg=None, tolerate_missing=False):
         if hdrs is None:
             hdrs = {}
         if cfg is None:
             cfg = {}
 
         self.conn.make_request('POST', self.path, hdrs=hdrs, cfg=cfg)
-        if not 200 <= self.conn.response.status <= 299:
-            raise ResponseError(self.conn.response, 'POST',
-                                self.conn.make_path(self.path))
-        return True
+        if is_success(self.conn.response.status):
+            return True
+        if tolerate_missing and self.conn.response.status == 404:
+            return True
+        raise ResponseError(self.conn.response, 'POST',
+                            self.conn.make_path(self.path))
 
-    def delete(self, hdrs=None, parms=None):
+    def delete(self, hdrs=None, parms=None, tolerate_missing=False):
         if hdrs is None:
             hdrs = {}
         if parms is None:
             parms = {}
+        allowed_codes = (204, 404) if tolerate_missing else (204, )
         return self.conn.make_request('DELETE', self.path, hdrs=hdrs,
-                                      parms=parms) == 204
+                                      parms=parms) in allowed_codes
 
-    def delete_files(self):
-        for f in listing_items(self.files):
+    def delete_files(self, tolerate_missing=False):
+        partialed_files = functools.partial(
+            self.files, tolerate_missing=tolerate_missing)
+
+        for f in listing_items(partialed_files):
             file_item = self.file(f)
             if not file_item.delete(tolerate_missing=True):
                 return False
 
-        return listing_empty(self.files)
+        return listing_empty(partialed_files)
 
     def delete_recursive(self):
-        return self.delete_files() and self.delete()
+        return self.delete_files(tolerate_missing=True) and \
+            self.delete(tolerate_missing=True)
 
     def file(self, file_name):
         return File(self.conn, self.account, self.name, file_name)
 
-    def files(self, hdrs=None, parms=None, cfg=None):
+    def files(self, hdrs=None, parms=None, cfg=None, tolerate_missing=False):
         if hdrs is None:
             hdrs = {}
         if parms is None:
@@ -588,7 +707,7 @@ class Container(Base):
         if cfg is None:
             cfg = {}
         format_type = parms.get('format', None)
-        if format_type not in [None, 'json', 'xml']:
+        if format_type not in [None, 'plain', 'json', 'xml']:
             raise RequestError('Invalid format: %s' % format_type)
         if format_type is None and 'format' in parms:
             del parms['format']
@@ -596,13 +715,15 @@ class Container(Base):
         status = self.conn.make_request('GET', self.path, hdrs=hdrs,
                                         parms=parms, cfg=cfg)
         if status == 200:
-            if format_type == 'json':
+            if format_type == 'json' or 'versions' in parms:
                 files = json.loads(self.conn.response.read())
 
-                for file_item in files:
-                    for key in ('name', 'subdir', 'content_type'):
-                        if key in file_item:
-                            file_item[key] = file_item[key].encode('utf-8')
+                if six.PY2:
+                    for file_item in files:
+                        for key in ('name', 'subdir', 'content_type',
+                                    'version_id'):
+                            if key in file_item:
+                                file_item[key] = file_item[key].encode('utf-8')
                 return files
             elif format_type == 'xml':
                 files = []
@@ -625,28 +746,32 @@ class Container(Base):
 
                 for file_item in files:
                     if 'subdir' in file_item:
-                        file_item['subdir'] = file_item['subdir'].\
-                            encode('utf-8')
+                        if six.PY2:
+                            file_item['subdir'] = \
+                                file_item['subdir'].encode('utf-8')
                     else:
-                        file_item['name'] = file_item['name'].encode('utf-8')
-                        file_item['content_type'] = file_item['content_type'].\
-                            encode('utf-8')
+                        if six.PY2:
+                            file_item.update({
+                                k: file_item[k].encode('utf-8')
+                                for k in ('name', 'content_type')})
                         file_item['bytes'] = int(file_item['bytes'])
                 return files
             else:
                 content = self.conn.response.read()
                 if content:
-                    lines = content.split('\n')
+                    lines = content.split(b'\n')
                     if lines and not lines[-1]:
                         lines = lines[:-1]
-                    return lines
+                    if six.PY2:
+                        return lines
+                    return [line.decode('utf-8') for line in lines]
                 else:
                     return []
-        elif status == 204:
+        elif status == 204 or (status == 404 and tolerate_missing):
             return []
 
         raise ResponseError(self.conn.response, 'GET',
-                            self.conn.make_path(self.path))
+                            self.conn.make_path(self.path, cfg=cfg))
 
     def info(self, hdrs=None, parms=None, cfg=None):
         if hdrs is None:
@@ -669,8 +794,10 @@ class Container(Base):
                 # versioning is enabled.
                 ['versions', 'x-versions-location'],
                 ['versions', 'x-history-location'],
+                ['versions_enabled', 'x-versions-enabled'],
                 ['tempurl_key', 'x-container-meta-temp-url-key'],
-                ['tempurl_key2', 'x-container-meta-temp-url-key-2']]
+                ['tempurl_key2', 'x-container-meta-temp-url-key-2'],
+                ['container_quota_bytes', 'x-container-meta-quota-bytes']]
 
             return self.header_fields(required_fields, optional_fields)
 
@@ -701,11 +828,11 @@ class File(Base):
         headers = {}
         if not cfg.get('no_content_length'):
             if cfg.get('set_content_length'):
-                headers['Content-Length'] = cfg.get('set_content_length')
+                headers['Content-Length'] = str(cfg.get('set_content_length'))
             elif self.size:
-                headers['Content-Length'] = self.size
+                headers['Content-Length'] = str(self.size)
             else:
-                headers['Content-Length'] = 0
+                headers['Content-Length'] = '0'
 
         if cfg.get('use_token'):
             headers['X-Auth-Token'] = cfg.get('use_token')
@@ -726,10 +853,10 @@ class File(Base):
     def compute_md5sum(cls, data):
         block_size = 4096
 
-        if isinstance(data, str):
-            data = six.StringIO(data)
+        if isinstance(data, bytes):
+            data = io.BytesIO(data)
 
-        checksum = hashlib.md5()
+        checksum = md5(usedforsecurity=False)
         buff = data.read(block_size)
         while buff:
             checksum.update(buff)
@@ -737,7 +864,8 @@ class File(Base):
         data.seek(0)
         return checksum.hexdigest()
 
-    def copy(self, dest_cont, dest_file, hdrs=None, parms=None, cfg=None):
+    def copy(self, dest_cont, dest_file, hdrs=None, parms=None, cfg=None,
+             return_resp=False):
         if hdrs is None:
             hdrs = {}
         if parms is None:
@@ -759,6 +887,8 @@ class File(Base):
                                   cfg=cfg, parms=parms) != 201:
             raise ResponseError(self.conn.response, 'COPY',
                                 self.conn.make_path(self.path))
+        if return_resp:
+            return self.conn.response
         return True
 
     def copy_account(self, dest_account, dest_cont, dest_file,
@@ -826,11 +956,13 @@ class File(Base):
                   ['last_modified', 'last-modified'],
                   ['etag', 'etag']]
         optional_fields = [['x_object_manifest', 'x-object-manifest'],
+                           ['x_manifest_etag', 'x-manifest-etag'],
+                           ['x_object_version_id', 'x-object-version-id'],
                            ['x_symlink_target', 'x-symlink-target']]
 
         header_fields = self.header_fields(fields,
                                            optional_fields=optional_fields)
-        header_fields['etag'] = header_fields['etag'].strip('"')
+        header_fields['etag'] = header_fields['etag']
         return header_fields
 
     def initialize(self, hdrs=None, parms=None):
@@ -845,21 +977,23 @@ class File(Base):
                                         parms=parms)
         if status == 404:
             return False
-        elif (status < 200) or (status > 299):
+        elif not is_success(status):
             raise ResponseError(self.conn.response, 'HEAD',
                                 self.conn.make_path(self.path))
 
-        for hdr in self.conn.response.getheaders():
-            if hdr[0].lower() == 'content-type':
-                self.content_type = hdr[1]
-            if hdr[0].lower().startswith('x-object-meta-'):
-                self.metadata[hdr[0][14:]] = hdr[1]
-            if hdr[0].lower() == 'etag':
-                self.etag = hdr[1].strip('"')
-            if hdr[0].lower() == 'content-length':
-                self.size = int(hdr[1])
-            if hdr[0].lower() == 'last-modified':
-                self.last_modified = hdr[1]
+        for hdr, val in self.conn.response.getheaders():
+            hdr = wsgi_to_str(hdr).lower()
+            val = wsgi_to_str(val)
+            if hdr == 'content-type':
+                self.content_type = val
+            if hdr.startswith('x-object-meta-'):
+                self.metadata[hdr[14:]] = val
+            if hdr == 'etag':
+                self.etag = val
+            if hdr == 'content-length':
+                self.size = int(val)
+            if hdr == 'last-modified':
+                self.last_modified = val
 
         return True
 
@@ -876,7 +1010,7 @@ class File(Base):
     def random_data(cls, size=None):
         if size is None:
             size = random.randint(1, 32768)
-        fd = open('/dev/urandom', 'r')
+        fd = open('/dev/urandom', 'rb')
         data = fd.read(size)
         fd.close()
         return data
@@ -898,15 +1032,15 @@ class File(Base):
         status = self.conn.make_request('GET', self.path, hdrs=hdrs,
                                         cfg=cfg, parms=parms)
 
-        if (status < 200) or (status > 299):
+        if not is_success(status):
             raise ResponseError(self.conn.response, 'GET',
                                 self.conn.make_path(self.path))
 
-        for hdr in self.conn.response.getheaders():
-            if hdr[0].lower() == 'content-type':
-                self.content_type = hdr[1]
-            if hdr[0].lower() == 'content-range':
-                self.content_range = hdr[1]
+        for hdr, val in self.conn.response.getheaders():
+            if hdr.lower() == 'content-type':
+                self.content_type = wsgi_to_str(val)
+            if hdr.lower() == 'content-range':
+                self.content_range = val
 
         if hasattr(buffer, 'write'):
             scratch = self.conn.response.read(8192)
@@ -925,11 +1059,11 @@ class File(Base):
     def read_md5(self):
         status = self.conn.make_request('GET', self.path)
 
-        if (status < 200) or (status > 299):
+        if not is_success(status):
             raise ResponseError(self.conn.response, 'GET',
                                 self.conn.make_path(self.path))
 
-        checksum = hashlib.md5()
+        checksum = md5(usedforsecurity=False)
 
         scratch = self.conn.response.read(8192)
         while len(scratch) > 0:
@@ -955,15 +1089,15 @@ class File(Base):
             headers = self.make_headers(cfg=cfg)
             if not cfg.get('no_content_length'):
                 if cfg.get('set_content_length'):
-                    headers['Content-Length'] = \
-                        cfg.get('set_content_length')
+                    headers['Content-Length'] = str(
+                        cfg.get('set_content_length'))
                 else:
-                    headers['Content-Length'] = 0
+                    headers['Content-Length'] = '0'
 
             self.conn.make_request('POST', self.path, hdrs=headers,
                                    parms=parms, cfg=cfg)
 
-            if self.conn.response.status not in (201, 202):
+            if self.conn.response.status != 202:
                 raise ResponseError(self.conn.response, 'POST',
                                     self.conn.make_path(self.path))
 
@@ -995,7 +1129,7 @@ class File(Base):
         else:
             raise RuntimeError
 
-    def write(self, data='', hdrs=None, parms=None, callback=None, cfg=None,
+    def write(self, data=b'', hdrs=None, parms=None, callback=None, cfg=None,
               return_resp=False):
         if hdrs is None:
             hdrs = {}
@@ -1006,7 +1140,7 @@ class File(Base):
 
         block_size = 2 ** 20
 
-        if isinstance(data, file):
+        if all(hasattr(data, attr) for attr in ('flush', 'seek', 'fileno')):
             try:
                 data.flush()
                 data.seek(0)
@@ -1014,32 +1148,34 @@ class File(Base):
                 pass
             self.size = int(os.fstat(data.fileno())[6])
         else:
-            data = six.StringIO(data)
-            self.size = data.len
+            data = io.BytesIO(data)
+            self.size = data.seek(0, os.SEEK_END)
+            data.seek(0)
 
         headers = self.make_headers(cfg=cfg)
         headers.update(hdrs)
 
-        self.conn.put_start(self.path, hdrs=headers, parms=parms, cfg=cfg)
+        def try_request():
+            # rewind to be ready for another attempt
+            data.seek(0)
+            self.conn.put_start(self.path, hdrs=headers, parms=parms, cfg=cfg)
 
-        transferred = 0
-        buff = data.read(block_size)
-        buff_len = len(buff)
-        try:
-            while buff_len > 0:
+            transferred = 0
+            for buff in iter(lambda: data.read(block_size), b''):
                 self.conn.put_data(buff)
-                transferred += buff_len
+                transferred += len(buff)
                 if callable(callback):
                     callback(transferred, self.size)
-                buff = data.read(block_size)
-                buff_len = len(buff)
 
             self.conn.put_end()
-        except socket.timeout as err:
-            raise err
+            return self.conn.response
 
-        if (self.conn.response.status < 200) or \
-           (self.conn.response.status > 299):
+        try:
+            self.response = self.conn.request_with_retry(try_request)
+        except RequestError as e:
+            raise ResponseError(self.conn.response, 'PUT',
+                                self.conn.make_path(self.path), details=str(e))
+        if not is_success(self.response.status):
             raise ResponseError(self.conn.response, 'PUT',
                                 self.conn.make_path(self.path))
 
@@ -1066,7 +1202,7 @@ class File(Base):
         if not self.write(data, hdrs=hdrs, parms=parms, cfg=cfg):
             raise ResponseError(self.conn.response, 'PUT',
                                 self.conn.make_path(self.path))
-        self.md5 = self.compute_md5sum(six.StringIO(data))
+        self.md5 = self.compute_md5sum(io.BytesIO(data))
         return data
 
     def write_random_return_resp(self, size=None, hdrs=None, parms=None,
@@ -1083,7 +1219,7 @@ class File(Base):
                           return_resp=True)
         if not resp:
             raise ResponseError(self.conn.response)
-        self.md5 = self.compute_md5sum(six.StringIO(data))
+        self.md5 = self.compute_md5sum(io.BytesIO(data))
         return resp
 
     def post(self, hdrs=None, parms=None, cfg=None, return_resp=False):
@@ -1100,7 +1236,7 @@ class File(Base):
         self.conn.make_request('POST', self.path, hdrs=headers,
                                parms=parms, cfg=cfg)
 
-        if self.conn.response.status not in (201, 202):
+        if self.conn.response.status != 202:
             raise ResponseError(self.conn.response, 'POST',
                                 self.conn.make_path(self.path))
 

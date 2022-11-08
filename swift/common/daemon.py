@@ -45,6 +45,7 @@ class Daemon(object):
     multiple daemonized workers, they simply provide the behavior of the daemon
     and context specific knowledge about how workers should be started.
     """
+    WORKERS_HEALTHCHECK_INTERVAL = 5.0
 
     def __init__(self, conf):
         self.conf = conf
@@ -132,17 +133,19 @@ class DaemonStrategy(object):
     def setup(self, **kwargs):
         utils.validate_configuration()
         utils.drop_privileges(self.daemon.conf.get('user', 'swift'))
+        utils.clean_up_daemon_hygiene()
         utils.capture_stdio(self.logger, **kwargs)
 
         def kill_children(*args):
             self.running = False
-            self.logger.info('SIGTERM received')
+            self.logger.notice('SIGTERM received (%s)', os.getpid())
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             os.killpg(0, signal.SIGTERM)
             os._exit(0)
 
         signal.signal(signal.SIGTERM, kill_children)
         self.running = True
+        utils.systemd_notify(self.logger)
 
     def _run_inline(self, once=False, **kwargs):
         """Run the daemon"""
@@ -238,7 +241,7 @@ class DaemonStrategy(object):
                 if not self.spawned_pids():
                     self.logger.notice('Finished %s', os.getpid())
                     break
-            time.sleep(0.1)
+            time.sleep(self.daemon.WORKERS_HEALTHCHECK_INTERVAL)
         self.daemon.post_multiprocess_run()
         return 0
 
@@ -267,7 +270,7 @@ def run_daemon(klass, conf_file, section_name='', once=False, **kwargs):
     """
     # very often the config section_name is based on the class name
     # the None singleton will be passed through to readconf as is
-    if section_name is '':
+    if section_name == '':
         section_name = sub(r'([a-z])([A-Z])', r'\1-\2',
                            klass.__name__).lower()
     try:

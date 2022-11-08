@@ -17,8 +17,10 @@ from swift import gettext_ as _
 
 import eventlet
 
-from swift.common.utils import cache_from_env, get_logger, register_swift_info
+from swift.common.utils import cache_from_env, get_logger
+from swift.common.registry import register_swift_info
 from swift.proxy.controllers.base import get_account_info, get_container_info
+from swift.common.constraints import valid_api_version
 from swift.common.memcached import MemcacheConnectionError
 from swift.common.swob import Request, Response
 
@@ -241,6 +243,10 @@ class RateLimitMiddleware(object):
         if not self.memcache_client:
             return None
 
+        if req.environ.get('swift.ratelimit.handled'):
+            return None
+        req.environ['swift.ratelimit.handled'] = True
+
         try:
             account_info = get_account_info(req.environ, self.app,
                                             swift_source='RL')
@@ -277,11 +283,14 @@ class RateLimitMiddleware(object):
                 if need_to_sleep > 0:
                     eventlet.sleep(need_to_sleep)
             except MaxSleepTimeHitError as e:
+                if obj_name:
+                    path = '/'.join((account_name, container_name, obj_name))
+                else:
+                    path = '/'.join((account_name, container_name))
                 self.logger.error(
-                    _('Returning 498 for %(meth)s to %(acc)s/%(cont)s/%(obj)s '
-                      '. Ratelimit (Max Sleep) %(e)s'),
-                    {'meth': req.method, 'acc': account_name,
-                     'cont': container_name, 'obj': obj_name, 'e': str(e)})
+                    _('Returning 498 for %(meth)s to %(path)s. '
+                      'Ratelimit (Max Sleep) %(e)s'),
+                    {'meth': req.method, 'path': path, 'e': str(e)})
                 error_resp = Response(status='498 Rate Limited',
                                       body='Slow down', request=req)
                 return error_resp
@@ -306,6 +315,8 @@ class RateLimitMiddleware(object):
             version, account, container, obj = req.split_path(1, 4, True)
         except ValueError:
             return self.app(env, start_response)
+        if not valid_api_version(version):
+            return self.app(env, start_response)
         ratelimit_resp = self.handle_ratelimit(req, account, container, obj)
         if ratelimit_resp is None:
             return self.app(env, start_response)
@@ -321,8 +332,7 @@ def filter_factory(global_conf, **local_conf):
     conf.update(local_conf)
 
     account_ratelimit = float(conf.get('account_ratelimit', 0))
-    max_sleep_time_seconds = \
-        float(conf.get('max_sleep_time_seconds', 60))
+    max_sleep_time_seconds = float(conf.get('max_sleep_time_seconds', 60))
     container_ratelimits, cont_limit_info = interpret_conf_limits(
         conf, 'container_ratelimit_', info=1)
     container_listing_ratelimits, cont_list_limit_info = \

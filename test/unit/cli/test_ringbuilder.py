@@ -31,8 +31,9 @@ from swift.cli import ringbuilder
 from swift.cli.ringbuilder import EXIT_SUCCESS, EXIT_WARNING, EXIT_ERROR
 from swift.common import exceptions
 from swift.common.ring import RingBuilder
+from swift.common.ring.composite_builder import CompositeRingBuilder
 
-from test.unit import Timeout
+from test.unit import Timeout, write_stub_builder
 
 try:
     from itertools import zip_longest
@@ -298,6 +299,36 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         self.assertSystemExit(
             EXIT_ERROR, ringbuilder._parse_set_weight_values, argv)
 
+    def test_set_region_values_no_devices(self):
+        # Test no devices
+        self.assertSystemExit(
+            EXIT_ERROR, ringbuilder._set_region_values, [], 100, {})
+
+    def test_parse_set_region_values_number_of_arguments(self):
+        # Test Number of arguments abnormal
+        argv = ["r1", "100", "r2"]
+        self.assertSystemExit(
+            EXIT_ERROR, ringbuilder._parse_set_region_values, argv)
+
+        argv = ["--region", "2"]
+        self.assertSystemExit(
+            EXIT_ERROR, ringbuilder._parse_set_region_values, argv)
+
+    def test_set_zone_values_no_devices(self):
+        # Test no devices
+        self.assertSystemExit(
+            EXIT_ERROR, ringbuilder._set_zone_values, [], 100, {})
+
+    def test_parse_set_zone_values_number_of_arguments(self):
+        # Test Number of arguments abnormal
+        argv = ["r1", "100", "r2"]
+        self.assertSystemExit(
+            EXIT_ERROR, ringbuilder._parse_set_zone_values, argv)
+
+        argv = ["--region", "2"]
+        self.assertSystemExit(
+            EXIT_ERROR, ringbuilder._parse_set_zone_values, argv)
+
     def test_set_info_values_no_devices(self):
         # Test no devices
         # _set_info_values doesn't take argv-like arguments
@@ -504,7 +535,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
 
         argv = ["", self.tmpfile, "add",
                 "r0z0-127.0.1.1:6200/sda1_some meta data", "100"]
-        self.assertSystemExit(EXIT_WARNING, ringbuilder.main, argv)
+        self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
 
     def test_remove_device(self):
         for search_value in self.search_values:
@@ -786,7 +817,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         ring.save(self.tmpfile)
 
         argv = ["", self.tmpfile, "remove", "d0"]
-        self.assertSystemExit(EXIT_WARNING, ringbuilder.main, argv)
+        self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
 
     def test_set_weight(self):
         for search_value in self.search_values:
@@ -1002,6 +1033,288 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         self.create_sample_ring()
         # Test No matching devices
         argv = ["", self.tmpfile, "set_weight",
+                "--ip", "unknown"]
+        self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+
+    def _check_region(self, ring, dev_id, expected_region):
+        for dev in ring.devs:
+            if dev['id'] != dev_id:
+                self.assertNotEqual(dev['region'], expected_region)
+            else:
+                self.assertEqual(dev['region'], expected_region)
+
+        # Final check, rebalance and check ring is ok
+        ring.rebalance()
+        self.assertTrue(ring.validate())
+
+    def test_set_region(self):
+        for search_value in self.search_values:
+            self.create_sample_ring()
+
+            argv = ["", self.tmpfile, "set_region",
+                    search_value, "314"]
+            self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+
+            ring = RingBuilder.load(self.tmpfile)
+            self._check_region(ring, 0, 314)
+
+    def test_set_region_ipv4_old_format(self):
+        self.create_sample_ring()
+        # Test ipv4(old format)
+        argv = ["", self.tmpfile, "set_region",
+                "d0r0z0-127.0.0.1:6200R127.0.0.1:6200/sda1_some meta data",
+                "314"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+        ring = RingBuilder.load(self.tmpfile)
+
+        self._check_region(ring, 0, 314)
+
+    def test_set_region_ipv6_old_format(self):
+        self.create_sample_ring()
+        # add IPV6
+        argv = \
+            ["", self.tmpfile, "add",
+             "--region", "2", "--zone", "3",
+             "--ip", "[2001:0000:1234:0000:0000:C1C0:ABCD:0876]",
+             "--port", "6000",
+             "--replication-ip", "[2::10]",
+             "--replication-port", "7000",
+             "--device", "sda3", "--meta", "some meta data",
+             "--weight", "100"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+
+        # Test ipv6(old format)
+        argv = ["", self.tmpfile, "set_region",
+                "d4r2z3-[2001:0000:1234:0000:0000:C1C0:ABCD:0876]:6000"
+                "R[2::10]:7000/sda3_some meta data", "314"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+        ring = RingBuilder.load(self.tmpfile)
+
+        self._check_region(ring, 4, 314)
+
+    def test_set_region_ipv4_new_format(self):
+        self.create_sample_ring()
+        # Test ipv4(new format)
+        argv = \
+            ["", self.tmpfile, "set_region",
+             "--id", "0", "--region", "0", "--zone", "0",
+             "--ip", "127.0.0.1",
+             "--port", "6200",
+             "--replication-ip", "127.0.0.1",
+             "--replication-port", "6200",
+             "--device", "sda1", "--meta", "some meta data", "314"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+        ring = RingBuilder.load(self.tmpfile)
+
+        self._check_region(ring, 0, 314)
+
+    def test_set_region_ipv6_new_format(self):
+        self.create_sample_ring()
+        # add IPV6
+        argv = \
+            ["", self.tmpfile, "add",
+             "--region", "2", "--zone", "3",
+             "--ip", "[2001:0000:1234:0000:0000:C1C0:ABCD:0876]",
+             "--port", "6000",
+             "--replication-ip", "[2::10]",
+             "--replication-port", "7000",
+             "--device", "sda3", "--meta", "some meta data",
+             "--weight", "100"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+
+        # Test ipv6(new format)
+        argv = \
+            ["", self.tmpfile, "set_region",
+             "--id", "4", "--region", "2", "--zone", "3",
+             "--ip", "[2001:0000:1234:0000:0000:C1C0:ABCD:0876]",
+             "--port", "6000",
+             "--replication-ip", "[2::10]",
+             "--replication-port", "7000",
+             "--device", "sda3", "--meta", "some meta data", "314"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+        ring = RingBuilder.load(self.tmpfile)
+
+        self._check_region(ring, 4, 314)
+
+    def test_set_region_domain_new_format(self):
+        self.create_sample_ring()
+        # add domain name
+        argv = \
+            ["", self.tmpfile, "add",
+             "--region", "2", "--zone", "3",
+             "--ip", "test.test.com",
+             "--port", "6000",
+             "--replication-ip", "r.test.com",
+             "--replication-port", "7000",
+             "--device", "sda3", "--meta", "some meta data",
+             "--weight", "100"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+
+        # Test domain name
+        argv = \
+            ["", self.tmpfile, "set_region",
+             "--id", "4", "--region", "2", "--zone", "3",
+             "--ip", "test.test.com",
+             "--port", "6000",
+             "--replication-ip", "r.test.com",
+             "--replication-port", "7000",
+             "--device", "sda3", "--meta", "some meta data", "314"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+        ring = RingBuilder.load(self.tmpfile)
+
+        self._check_region(ring, 4, 314)
+
+    def test_set_region_number_of_arguments(self):
+        self.create_sample_ring()
+        # Test Number of arguments abnormal
+        argv = ["", self.tmpfile, "set_region"]
+        self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+
+    def test_set_region_no_matching(self):
+        self.create_sample_ring()
+        # Test No matching devices
+        argv = ["", self.tmpfile, "set_region",
+                "--ip", "unknown"]
+        self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+
+    def test_set_zone(self):
+        for search_value in self.search_values:
+            self.create_sample_ring()
+
+            argv = ["", self.tmpfile, "set_zone",
+                    search_value, "314"]
+            self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+            ring = RingBuilder.load(self.tmpfile)
+
+            self._check_zone(ring, 0, 314)
+
+    def test_set_zone_ipv4_old_format(self):
+        self.create_sample_ring()
+        # Test ipv4(old format)
+        argv = ["", self.tmpfile, "set_zone",
+                "d0r0z0-127.0.0.1:6200R127.0.0.1:6200/sda1_some meta data",
+                "314"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+        ring = RingBuilder.load(self.tmpfile)
+
+        self._check_zone(ring, 0, 314)
+
+    def _check_zone(self, ring, dev_id, expected_zone):
+        for dev in ring.devs:
+            if dev['id'] != dev_id:
+                self.assertFalse(dev['zone'] == expected_zone)
+            else:
+                self.assertEqual(dev['zone'], expected_zone)
+
+        # Final check, rebalance and check ring is ok
+        ring.rebalance()
+        self.assertTrue(ring.validate())
+
+    def test_set_zone_ipv6_old_format(self):
+        self.create_sample_ring()
+        # add IPV6
+        argv = \
+            ["", self.tmpfile, "add",
+             "--region", "2", "--zone", "3",
+             "--ip", "[2001:0000:1234:0000:0000:C1C0:ABCD:0876]",
+             "--port", "6000",
+             "--replication-ip", "[2::10]",
+             "--replication-port", "7000",
+             "--device", "sda3", "--meta", "some meta data",
+             "--weight", "100"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+
+        # Test ipv6(old format)
+        argv = ["", self.tmpfile, "set_zone",
+                "d4r2z3-[2001:0000:1234:0000:0000:C1C0:ABCD:0876]:6000"
+                "R[2::10]:7000/sda3_some meta data", "314"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+        ring = RingBuilder.load(self.tmpfile)
+
+        self._check_zone(ring, 4, 314)
+
+    def test_set_zone_ipv4_new_format(self):
+        self.create_sample_ring()
+        # Test ipv4(new format)
+        argv = \
+            ["", self.tmpfile, "set_zone",
+             "--id", "0", "--region", "0", "--zone", "0",
+             "--ip", "127.0.0.1",
+             "--port", "6200",
+             "--replication-ip", "127.0.0.1",
+             "--replication-port", "6200",
+             "--device", "sda1", "--meta", "some meta data", "314"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+        ring = RingBuilder.load(self.tmpfile)
+
+        self._check_zone(ring, 0, 314)
+
+    def test_set_zone_ipv6_new_format(self):
+        self.create_sample_ring()
+        # add IPV6
+        argv = \
+            ["", self.tmpfile, "add",
+             "--region", "2", "--zone", "3",
+             "--ip", "[2001:0000:1234:0000:0000:C1C0:ABCD:0876]",
+             "--port", "6000",
+             "--replication-ip", "[2::10]",
+             "--replication-port", "7000",
+             "--device", "sda3", "--meta", "some meta data",
+             "--weight", "100"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+
+        # Test ipv6(new format)
+        argv = \
+            ["", self.tmpfile, "set_zone",
+             "--id", "4", "--region", "2",
+             "--ip", "[2001:0000:1234:0000:0000:C1C0:ABCD:0876]",
+             "--port", "6000",
+             "--replication-ip", "[2::10]",
+             "--replication-port", "7000",
+             "--device", "sda3", "--meta", "some meta data", "314"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+        ring = RingBuilder.load(self.tmpfile)
+
+        self._check_zone(ring, 4, 314)
+
+    def test_set_zone_domain_new_format(self):
+        self.create_sample_ring()
+        # add domain name
+        argv = \
+            ["", self.tmpfile, "add",
+             "--region", "2", "--zone", "3",
+             "--ip", "test.test.com",
+             "--port", "6000",
+             "--replication-ip", "r.test.com",
+             "--replication-port", "7000",
+             "--device", "sda3", "--meta", "some meta data",
+             "--weight", "100"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+
+        # Test domain name
+        argv = \
+            ["", self.tmpfile, "set_zone",
+             "--id", "4", "--region", "2", "--zone", "3",
+             "--ip", "test.test.com",
+             "--port", "6000",
+             "--replication-ip", "r.test.com",
+             "--replication-port", "7000",
+             "--device", "sda3", "--meta", "some meta data", "314"]
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
+        ring = RingBuilder.load(self.tmpfile)
+
+        self._check_zone(ring, 4, 314)
+
+    def test_set_zone_number_of_arguments(self):
+        self.create_sample_ring()
+        # Test Number of arguments abnormal
+        argv = ["", self.tmpfile, "set_zone"]
+        self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+
+    def test_set_zone_no_matching(self):
+        self.create_sample_ring()
+        # Test No matching devices
+        argv = ["", self.tmpfile, "set_zone",
                 "--ip", "unknown"]
         self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
 
@@ -1411,10 +1724,31 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         argv = ["", self.tmpfile, "validate"]
         self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
 
+    def test_validate_composite_builder_file(self):
+        b1, b1_file = write_stub_builder(self.tmpdir, 1)
+        b2, b2_file = write_stub_builder(self.tmpdir, 2)
+        cb = CompositeRingBuilder([b1_file, b2_file])
+        cb.compose()
+        cb_file = os.path.join(self.tmpdir, 'composite.builder')
+        cb.save(cb_file)
+        argv = ["", cb_file, "validate"]
+        with mock.patch("sys.stdout", six.StringIO()) as mock_stdout:
+            self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+        lines = mock_stdout.getvalue().strip().split('\n')
+        self.assertIn("Ring Builder file is invalid", lines[0])
+        self.assertIn("appears to be a composite ring builder file", lines[0])
+        self.assertFalse(lines[1:])
+
     def test_validate_empty_file(self):
         open(self.tmpfile, 'a').close
         argv = ["", self.tmpfile, "validate"]
-        self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+        with mock.patch("sys.stdout", six.StringIO()) as mock_stdout:
+            self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+        lines = mock_stdout.getvalue().strip().split('\n')
+        self.assertIn("Ring Builder file is invalid", lines[0])
+        self.assertNotIn("appears to be a composite ring builder file",
+                         lines[0])
+        self.assertFalse(lines[1:])
 
     def test_validate_corrupted_file(self):
         self.create_sample_ring()
@@ -1427,19 +1761,35 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         # corrupt the file
         with open(self.tmpfile, 'wb') as f:
             f.write(os.urandom(1024))
-        self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+        with mock.patch("sys.stdout", six.StringIO()) as mock_stdout:
+            self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+        lines = mock_stdout.getvalue().strip().split('\n')
+        self.assertIn("Ring Builder file is invalid", lines[0])
+        self.assertNotIn("appears to be a composite ring builder file",
+                         lines[0])
+        self.assertFalse(lines[1:])
 
     def test_validate_non_existent_file(self):
         rand_file = '%s/%s' % (tempfile.gettempdir(), str(uuid.uuid4()))
         argv = ["", rand_file, "validate"]
-        self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+        with mock.patch("sys.stdout", six.StringIO()) as mock_stdout:
+            self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+        lines = mock_stdout.getvalue().strip().split('\n')
+        self.assertIn("Ring Builder file does not exist", lines[0])
+        self.assertNotIn("appears to be a composite ring builder file",
+                         lines[0])
+        self.assertFalse(lines[1:])
 
     def test_validate_non_accessible_file(self):
         with mock.patch.object(
                 RingBuilder, 'load',
-                mock.Mock(side_effect=exceptions.PermissionError)):
+                mock.Mock(side_effect=exceptions.PermissionError("boom"))):
             argv = ["", self.tmpfile, "validate"]
-            self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+            with mock.patch("sys.stdout", six.StringIO()) as mock_stdout:
+                self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
+        lines = mock_stdout.getvalue().strip().split('\n')
+        self.assertIn("boom", lines[0])
+        self.assertFalse(lines[1:])
 
     def test_validate_generic_error(self):
         with mock.patch.object(
@@ -1727,7 +2077,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
                       'port': 66201,
                       'device': 'sda2',
                       })
-        ring.add_dev({'weight': 100.0,
+        ring.add_dev({'weight': 10000.0,
                       'region': 2,
                       'zone': 2,
                       'ip': '2001:db8:85a3::8a2e:370:7336',
@@ -1808,13 +2158,13 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
                 "--replication-ip", "127.0.0.5",
                 "--replication-port", "6004",
                 "--device", "sda5", "--weight", "100.0"]
-        self.assertRaises(SystemExit, ringbuilder.main, argv)
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
         argv = ["", self.tmpfile, "remove", "--id", "0"]
-        self.assertRaises(SystemExit, ringbuilder.main, argv)
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
         argv = ["", self.tmpfile, "remove", "--id", "3"]
-        self.assertRaises(SystemExit, ringbuilder.main, argv)
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
         argv = ["", self.tmpfile, "rebalance"]
-        self.assertRaises(SystemExit, ringbuilder.main, argv)
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
         argv = \
             ["", self.tmpfile, "add",
              "--region", "2", "--zone", "1",
@@ -1822,14 +2172,14 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
              "--replication-ip", "127.0.0.6",
              "--replication-port", "6005",
              "--device", "sdb6", "--weight", "100.0"]
-        self.assertRaises(SystemExit, ringbuilder.main, argv)
+        self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
 
         # Check the order of the devices listed the output.
         argv = ["", self.tmpfile]
         with mock.patch("sys.stdout", mock_stdout), mock.patch(
                 "sys.stderr", mock_stderr), mock.patch(
                     'swift.common.ring.builder.time', return_value=now):
-            self.assertRaises(SystemExit, ringbuilder.main, argv)
+            self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
         self.assertOutputStub(mock_stdout.getvalue(), builder_id=ring.id)
 
     def test_default_ringfile_check(self):
@@ -1842,7 +2192,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         with mock.patch("sys.stdout", mock_stdout):
             with mock.patch("sys.stderr", mock_stderr):
                 self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
-        ring_not_found_re = re.compile("Ring file .*\.ring\.gz not found")
+        ring_not_found_re = re.compile(r"Ring file .*\.ring\.gz not found")
         self.assertTrue(ring_not_found_re.findall(mock_stdout.getvalue()))
 
         # write ring file
@@ -1854,7 +2204,9 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         with mock.patch("sys.stdout", mock_stdout):
             with mock.patch("sys.stderr", mock_stderr):
                 self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
-        ring_up_to_date_re = re.compile("Ring file .*\.ring\.gz is up-to-date")
+        ring_up_to_date_re = re.compile(
+            r"Ring file .*\.ring\.gz is up-to-date"
+        )
         self.assertTrue(ring_up_to_date_re.findall(mock_stdout.getvalue()))
 
         # change builder (set weight)
@@ -1866,7 +2218,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         with mock.patch("sys.stdout", mock_stdout):
             with mock.patch("sys.stderr", mock_stderr):
                 self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
-        ring_obsolete_re = re.compile("Ring file .*\.ring\.gz is obsolete")
+        ring_obsolete_re = re.compile(r"Ring file .*\.ring\.gz is obsolete")
         self.assertTrue(ring_obsolete_re.findall(mock_stdout.getvalue()))
 
         # write ring file
@@ -1888,7 +2240,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         with mock.patch("sys.stdout", mock_stdout):
             with mock.patch("sys.stderr", mock_stderr):
                 self.assertSystemExit(EXIT_SUCCESS, ringbuilder.main, argv)
-        ring_invalid_re = re.compile("Ring file .*\.ring\.gz is invalid")
+        ring_invalid_re = re.compile(r"Ring file .*\.ring\.gz is invalid")
         self.assertTrue(ring_invalid_re.findall(mock_stdout.getvalue()))
 
     def test_default_no_device_ring_without_exception(self):
@@ -2184,7 +2536,7 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
         ring.save(self.tmpfile)
 
         argv = ["", self.tmpfile, "rebalance", "3"]
-        self.assertSystemExit(EXIT_WARNING, ringbuilder.main, argv)
+        self.assertSystemExit(EXIT_ERROR, ringbuilder.main, argv)
 
     def test_write_ring(self):
         self.create_sample_ring()
@@ -2225,9 +2577,33 @@ class TestCommands(unittest.TestCase, RunSwiftRingBuilderMixin):
 
         # Note that we've picked up an extension
         builder = RingBuilder.load(self.tmpfile + '.builder')
+        # Version was recorded in the .ring.gz!
+        self.assertEqual(builder.version, 5)
         # Note that this is different from the original! But it more-closely
         # reflects the reality that we have an extra replica for 12 of 64 parts
         self.assertEqual(builder.replicas, 1.1875)
+
+    def test_write_builder_no_version(self):
+        self.create_sample_ring()
+        rb = RingBuilder.load(self.tmpfile)
+        rb.rebalance()
+
+        # Make sure we write down the ring in the old way, with no version
+        rd = rb.get_ring()
+        rd.version = None
+        rd.save(self.tmpfile + ".ring.gz")
+
+        ring_file = os.path.join(os.path.dirname(self.tmpfile),
+                                 os.path.basename(self.tmpfile) + ".ring.gz")
+        os.remove(self.tmpfile)  # loses file...
+
+        argv = ["", ring_file, "write_builder", "24"]
+        self.assertIsNone(ringbuilder.main(argv))
+
+        # Note that we've picked up an extension
+        builder = RingBuilder.load(self.tmpfile + '.builder')
+        # No version in the .ring.gz; default to 0
+        self.assertEqual(builder.version, 0)
 
     def test_write_builder_after_device_removal(self):
         # Test regenerating builder file after having removed a device

@@ -16,27 +16,29 @@
 import errno
 import os
 import mock
+import posix
 import unittest
 from tempfile import mkdtemp
 from shutil import rmtree
-from time import gmtime
-from test.unit import FakeLogger
 import itertools
 import random
+from io import BytesIO
 
 import json
-from six import BytesIO
 from six import StringIO
+from six.moves.urllib.parse import quote
 import xml.dom.minidom
 
 from swift import __version__ as swift_version
 from swift.common.swob import (Request, WsgiBytesIO, HTTPNoContent)
-from swift.common import constraints
+from swift.common.constraints import ACCOUNT_LISTING_LIMIT
+from swift.account.backend import AccountBroker
 from swift.account.server import AccountController
 from swift.common.utils import (normalize_timestamp, replication, public,
                                 mkdirs, storage_directory, Timestamp)
-from swift.common.request_helpers import get_sys_meta_prefix
-from test.unit import patch_policies, debug_logger, mock_check_drive
+from swift.common.request_helpers import get_sys_meta_prefix, get_reserved_name
+from test.debug_logger import debug_logger
+from test.unit import patch_policies, mock_check_drive, make_timestamp_iter
 from swift.common.storage_policy import StoragePolicy, POLICIES
 
 
@@ -48,8 +50,11 @@ class TestAccountController(unittest.TestCase):
         self.testdir_base = mkdtemp()
         self.testdir = os.path.join(self.testdir_base, 'account_server')
         mkdirs(os.path.join(self.testdir, 'sda1'))
+        self.logger = debug_logger()
         self.controller = AccountController(
-            {'devices': self.testdir, 'mount_check': 'false'})
+            {'devices': self.testdir, 'mount_check': 'false'},
+            logger=self.logger)
+        self.ts = make_timestamp_iter()
 
     def tearDown(self):
         """Tear down for testing swift.account.server.AccountController"""
@@ -58,6 +63,22 @@ class TestAccountController(unittest.TestCase):
         except OSError as err:
             if err.errno != errno.ENOENT:
                 raise
+
+    def test_init(self):
+        conf = {
+            'devices': self.testdir,
+            'mount_check': 'false',
+        }
+        AccountController(conf, logger=self.logger)
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
+        conf['auto_create_account_prefix'] = '-'
+        AccountController(conf, logger=self.logger)
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [
+            'Option auto_create_account_prefix is deprecated. '
+            'Configure auto_create_account_prefix under the '
+            'swift-constraints section of swift.conf. This option '
+            'will be ignored in a future release.'
+        ])
 
     def test_OPTIONS(self):
         server_handler = AccountController(
@@ -192,6 +213,33 @@ class TestAccountController(unittest.TestCase):
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 400)
 
+    def test_REPLICATE_insufficient_space(self):
+        conf = {'devices': self.testdir,
+                'mount_check': 'false',
+                'fallocate_reserve': '2%'}
+        account_controller = AccountController(conf)
+
+        req = Request.blank('/sda1/p/a',
+                            environ={'REQUEST_METHOD': 'REPLICATE'})
+        statvfs_result = posix.statvfs_result([
+            4096,     # f_bsize
+            4096,     # f_frsize
+            2854907,  # f_blocks
+            59000,    # f_bfree
+            57000,    # f_bavail  (just under 2% free)
+            1280000,  # f_files
+            1266040,  # f_ffree,
+            1266040,  # f_favail,
+            4096,     # f_flag
+            255,      # f_namemax
+        ])
+        with mock.patch('os.statvfs',
+                        return_value=statvfs_result) as mock_statvfs:
+            resp = req.get_response(account_controller)
+        self.assertEqual(resp.status_int, 507)
+        self.assertEqual(mock_statvfs.mock_calls,
+                         [mock.call(os.path.join(self.testdir, 'sda1'))])
+
     def test_REPLICATE_rsync_then_merge_works(self):
         def fake_rsync_then_merge(self, drive, db_file, args):
             return HTTPNoContent()
@@ -201,7 +249,7 @@ class TestAccountController(unittest.TestCase):
             req = Request.blank('/sda1/p/a/',
                                 environ={'REQUEST_METHOD': 'REPLICATE'},
                                 headers={})
-            json_string = '["rsync_then_merge", "a.db"]'
+            json_string = b'["rsync_then_merge", "a.db"]'
             inbuf = WsgiBytesIO(json_string)
             req.environ['wsgi.input'] = inbuf
             resp = req.get_response(self.controller)
@@ -216,7 +264,7 @@ class TestAccountController(unittest.TestCase):
             req = Request.blank('/sda1/p/a/',
                                 environ={'REQUEST_METHOD': 'REPLICATE'},
                                 headers={})
-            json_string = '["complete_rsync", "a.db"]'
+            json_string = b'["complete_rsync", "a.db"]'
             inbuf = WsgiBytesIO(json_string)
             req.environ['wsgi.input'] = inbuf
             resp = req.get_response(self.controller)
@@ -228,7 +276,7 @@ class TestAccountController(unittest.TestCase):
                             headers={})
 
         # check valuerror
-        wsgi_input_valuerror = '["sync" : sync, "-1"]'
+        wsgi_input_valuerror = b'["sync" : sync, "-1"]'
         inbuf1 = WsgiBytesIO(wsgi_input_valuerror)
         req.environ['wsgi.input'] = inbuf1
         resp = req.get_response(self.controller)
@@ -239,7 +287,7 @@ class TestAccountController(unittest.TestCase):
         req = Request.blank('/sda1/p/a/',
                             environ={'REQUEST_METHOD': 'REPLICATE'},
                             headers={})
-        json_string = '["unknown_sync", "a.db"]'
+        json_string = b'["unknown_sync", "a.db"]'
         inbuf = WsgiBytesIO(json_string)
         req.environ['wsgi.input'] = inbuf
         resp = req.get_response(self.controller)
@@ -253,7 +301,7 @@ class TestAccountController(unittest.TestCase):
         req = Request.blank('/sda1/p/a/',
                             environ={'REQUEST_METHOD': 'REPLICATE'},
                             headers={})
-        json_string = '["unknown_sync", "a.db"]'
+        json_string = b'["unknown_sync", "a.db"]'
         inbuf = WsgiBytesIO(json_string)
         req.environ['wsgi.input'] = inbuf
         resp = req.get_response(self.controller)
@@ -358,7 +406,7 @@ class TestAccountController(unittest.TestCase):
                             headers={'Accept': 'application/plain;q=1;q=0.5'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 400)
-        self.assertEqual(resp.body, '')
+        self.assertEqual(resp.body, b'')
 
     def test_HEAD_invalid_format(self):
         format = '%D1%BD%8A9'  # invalid UTF-8; should be %E1%BD%8A9 (E -> D)
@@ -378,6 +426,35 @@ class TestAccountController(unittest.TestCase):
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 404)
         self.assertNotIn('X-Account-Status', resp.headers)
+
+    def test_PUT_insufficient_space(self):
+        conf = {'devices': self.testdir,
+                'mount_check': 'false',
+                'fallocate_reserve': '2%'}
+        account_controller = AccountController(conf)
+
+        req = Request.blank(
+            '/sda1/p/a',
+            environ={'REQUEST_METHOD': 'PUT'},
+            headers={'X-Timestamp': '1517612949.541469'})
+        statvfs_result = posix.statvfs_result([
+            4096,     # f_bsize
+            4096,     # f_frsize
+            2854907,  # f_blocks
+            59000,    # f_bfree
+            57000,    # f_bavail  (just under 2% free)
+            1280000,  # f_files
+            1266040,  # f_ffree,
+            1266040,  # f_favail,
+            4096,     # f_flag
+            255,      # f_namemax
+        ])
+        with mock.patch('os.statvfs',
+                        return_value=statvfs_result) as mock_statvfs:
+            resp = req.get_response(account_controller)
+        self.assertEqual(resp.status_int, 507)
+        self.assertEqual(mock_statvfs.mock_calls,
+                         [mock.call(os.path.join(self.testdir, 'sda1'))])
 
     def test_PUT(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
@@ -440,8 +517,67 @@ class TestAccountController(unittest.TestCase):
                             headers={'X-Timestamp': normalize_timestamp(2)})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 403)
-        self.assertEqual(resp.body, 'Recently deleted')
+        self.assertEqual(resp.body, b'Recently deleted')
         self.assertEqual(resp.headers['X-Account-Status'], 'Deleted')
+
+    def test_create_reserved_namespace_account(self):
+        path = '/sda1/p/%s' % get_reserved_name('a')
+        req = Request.blank(path, method='PUT', headers={
+            'X-Timestamp': next(self.ts).internal})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status, '201 Created')
+
+        path = '/sda1/p/%s' % get_reserved_name('foo', 'bar')
+        req = Request.blank(path, method='PUT', headers={
+            'X-Timestamp': next(self.ts).internal})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status, '201 Created')
+
+    def test_create_invalid_reserved_namespace_account(self):
+        account_name = get_reserved_name('foo', 'bar')[1:]
+        path = '/sda1/p/%s' % account_name
+        req = Request.blank(path, method='PUT', headers={
+            'X-Timestamp': next(self.ts).internal})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status, '400 Bad Request')
+
+    def test_create_reserved_container_in_account(self):
+        # create account
+        path = '/sda1/p/a'
+        req = Request.blank(path, method='PUT', headers={
+            'X-Timestamp': next(self.ts).internal})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 201)
+        # put null container in it
+        path += '/%s' % get_reserved_name('c', 'stuff')
+        req = Request.blank(path, method='PUT', headers={
+            'X-Timestamp': next(self.ts).internal,
+            'X-Put-Timestamp': next(self.ts).internal,
+            'X-Delete-Timestamp': 0,
+            'X-Object-Count': 0,
+            'X-Bytes-Used': 0,
+        })
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status, '201 Created')
+
+    def test_create_invalid_reserved_container_in_account(self):
+        # create account
+        path = '/sda1/p/a'
+        req = Request.blank(path, method='PUT', headers={
+            'X-Timestamp': next(self.ts).internal})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 201)
+        # put invalid container in it
+        path += '/%s' % get_reserved_name('c', 'stuff')[1:]
+        req = Request.blank(path, method='PUT', headers={
+            'X-Timestamp': next(self.ts).internal,
+            'X-Put-Timestamp': next(self.ts).internal,
+            'X-Delete-Timestamp': 0,
+            'X-Object-Count': 0,
+            'X-Bytes-Used': 0,
+        })
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status, '400 Bad Request')
 
     def test_PUT_non_utf8_metadata(self):
         # Set metadata header
@@ -465,6 +601,51 @@ class TestAccountController(unittest.TestCase):
                      'X-Will-Not-Be-Saved': b'\xff'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 202)
+
+    def test_utf8_metadata(self):
+        ts_str = normalize_timestamp(1)
+
+        def get_test_meta(method, headers):
+            # Set metadata header
+            headers.setdefault('X-Timestamp', ts_str)
+            req = Request.blank(
+                '/sda1/p/a', environ={'REQUEST_METHOD': method},
+                headers=headers)
+            resp = req.get_response(self.controller)
+            self.assertIn(resp.status_int, (201, 202, 204))
+            db_path = os.path.join(*next(
+                (dir_name, file_name)
+                for dir_name, _, files in os.walk(self.testdir)
+                for file_name in files if file_name.endswith('.db')
+            ))
+            broker = AccountBroker(db_path)
+            # Why not use broker.metadata, you ask? Because we want to get
+            # as close to the on-disk format as is reasonable.
+            result = json.loads(broker.get_raw_metadata())
+            # Clear it out for the next run
+            with broker.get() as conn:
+                conn.execute("UPDATE account_stat SET metadata=''")
+                conn.commit()
+            return result
+
+        wsgi_str = '\xf0\x9f\x91\x8d'
+        uni_str = u'\U0001f44d'
+
+        self.assertEqual(
+            get_test_meta('PUT', {'x-account-sysmeta-' + wsgi_str: wsgi_str}),
+            {u'X-Account-Sysmeta-' + uni_str: [uni_str, ts_str]})
+
+        self.assertEqual(
+            get_test_meta('PUT', {'x-account-meta-' + wsgi_str: wsgi_str}),
+            {u'X-Account-Meta-' + uni_str: [uni_str, ts_str]})
+
+        self.assertEqual(
+            get_test_meta('POST', {'x-account-sysmeta-' + wsgi_str: wsgi_str}),
+            {u'X-Account-Sysmeta-' + uni_str: [uni_str, ts_str]})
+
+        self.assertEqual(
+            get_test_meta('POST', {'x-account-meta-' + wsgi_str: wsgi_str}),
+            {u'X-Account-Meta-' + uni_str: [uni_str, ts_str]})
 
     def test_PUT_GET_metadata(self):
         # Set metadata header
@@ -603,7 +784,7 @@ class TestAccountController(unittest.TestCase):
             headers={'X-Timestamp': normalize_timestamp(1),
                      'X-Account-Meta-Test': 'Value'})
         resp = req.get_response(self.controller)
-        self.assertEqual(resp.status_int, 204)
+        self.assertEqual(resp.status_int, 204, resp.body)
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'HEAD'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 204)
@@ -700,6 +881,35 @@ class TestAccountController(unittest.TestCase):
                                                   'HTTP_X_TIMESTAMP': '1'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 400)
+
+    def test_POST_insufficient_space(self):
+        conf = {'devices': self.testdir,
+                'mount_check': 'false',
+                'fallocate_reserve': '2%'}
+        account_controller = AccountController(conf)
+
+        req = Request.blank(
+            '/sda1/p/a',
+            environ={'REQUEST_METHOD': 'POST'},
+            headers={'X-Timestamp': '1517611584.937603'})
+        statvfs_result = posix.statvfs_result([
+            4096,     # f_bsize
+            4096,     # f_frsize
+            2854907,  # f_blocks
+            59000,    # f_bfree
+            57000,    # f_bavail  (just under 2% free)
+            1280000,  # f_files
+            1266040,  # f_ffree,
+            1266040,  # f_favail,
+            4096,     # f_flag
+            255,      # f_namemax
+        ])
+        with mock.patch('os.statvfs',
+                        return_value=statvfs_result) as mock_statvfs:
+            resp = req.get_response(account_controller)
+        self.assertEqual(resp.status_int, 507)
+        self.assertEqual(mock_statvfs.mock_calls,
+                         [mock.call(os.path.join(self.testdir, 'sda1'))])
 
     def test_POST_timestamp_not_float(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'POST',
@@ -799,11 +1009,11 @@ class TestAccountController(unittest.TestCase):
                             headers={'Accept': 'application/plain;q=foo'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 400)
-        self.assertEqual(resp.body, 'Invalid Accept header')
+        self.assertEqual(resp.body, b'Invalid Accept header')
 
     def test_GET_over_limit(self):
         req = Request.blank(
-            '/sda1/p/a?limit=%d' % (constraints.ACCOUNT_LISTING_LIMIT + 1),
+            '/sda1/p/a?limit=%d' % (ACCOUNT_LISTING_LIMIT + 1),
             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 412)
@@ -829,7 +1039,8 @@ class TestAccountController(unittest.TestCase):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.body.strip().split('\n'), ['c1', 'c2'])
+        self.assertEqual(resp.body.strip().split(b'\n'),
+                         [b'c1', b'c2'])
         req = Request.blank('/sda1/p/a/c1', environ={'REQUEST_METHOD': 'PUT'},
                             headers={'X-Put-Timestamp': '1',
                                      'X-Delete-Timestamp': '0',
@@ -847,7 +1058,8 @@ class TestAccountController(unittest.TestCase):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.body.strip().split('\n'), ['c1', 'c2'])
+        self.assertEqual(resp.body.strip().split(b'\n'),
+                         [b'c1', b'c2'])
         self.assertEqual(resp.content_type, 'text/plain')
         self.assertEqual(resp.charset, 'utf-8')
 
@@ -856,7 +1068,8 @@ class TestAccountController(unittest.TestCase):
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.body.strip().split('\n'), ['c1', 'c2'])
+        self.assertEqual(resp.body.strip().split(b'\n'),
+                         [b'c1', b'c2'])
         self.assertEqual(resp.content_type, 'text/plain')
         self.assertEqual(resp.charset, 'utf-8')
 
@@ -1109,12 +1322,14 @@ class TestAccountController(unittest.TestCase):
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.body.strip().split('\n'), ['c0', 'c1', 'c2'])
+        self.assertEqual(resp.body.strip().split(b'\n'),
+                         [b'c0', b'c1', b'c2'])
         req = Request.blank('/sda1/p/a?limit=3&marker=c2',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.body.strip().split('\n'), ['c3', 'c4'])
+        self.assertEqual(resp.body.strip().split(b'\n'),
+                         [b'c3', b'c4'])
 
     def test_GET_limit_marker_json(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
@@ -1255,7 +1470,7 @@ class TestAccountController(unittest.TestCase):
         req.accept = '*/*'
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.body, 'c1\n')
+        self.assertEqual(resp.body, b'c1\n')
 
     def test_GET_accept_application_wildcard(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
@@ -1330,7 +1545,7 @@ class TestAccountController(unittest.TestCase):
         req.accept = 'application/json'
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.body, 'c1\n')
+        self.assertEqual(resp.body, b'c1\n')
 
     def test_GET_accept_not_valid(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
@@ -1347,13 +1562,6 @@ class TestAccountController(unittest.TestCase):
         req.accept = 'application/xml*'
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 406)
-
-    def test_GET_delimiter_too_long(self):
-        req = Request.blank('/sda1/p/a?delimiter=xx',
-                            environ={'REQUEST_METHOD': 'GET',
-                                     'HTTP_X_TIMESTAMP': '0'})
-        resp = req.get_response(self.controller)
-        self.assertEqual(resp.status_int, 412)
 
     def test_GET_prefix_delimiter_plain(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
@@ -1383,20 +1591,21 @@ class TestAccountController(unittest.TestCase):
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.body.strip().split('\n'), ['sub.'])
+        self.assertEqual(resp.body.strip().split(b'\n'),
+                         [b'sub.'])
         req = Request.blank('/sda1/p/a?prefix=sub.&delimiter=.',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
         self.assertEqual(
-            resp.body.strip().split('\n'),
-            ['sub.0', 'sub.0.', 'sub.1', 'sub.1.', 'sub.2', 'sub.2.'])
+            resp.body.strip().split(b'\n'),
+            [b'sub.0', b'sub.0.', b'sub.1', b'sub.1.', b'sub.2', b'sub.2.'])
         req = Request.blank('/sda1/p/a?prefix=sub.1.&delimiter=.',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.body.strip().split('\n'),
-                         ['sub.1.0', 'sub.1.1', 'sub.1.2'])
+        self.assertEqual(resp.body.strip().split(b'\n'),
+                         [b'sub.1.0', b'sub.1.1', b'sub.1.2'])
 
     def test_GET_prefix_delimiter_json(self):
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
@@ -1517,13 +1726,544 @@ class TestAccountController(unittest.TestCase):
                         listing.append(node2.firstChild.nodeValue)
         self.assertEqual(listing, ['sub.1.0', 'sub.1.1', 'sub.1.2'])
 
+    def test_GET_leading_delimiter(self):
+        req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'PUT',
+                                                  'HTTP_X_TIMESTAMP': '0'})
+        resp = req.get_response(self.controller)
+        for first in range(3):
+            req = Request.blank(
+                '/sda1/p/a/.sub.%s' % first,
+                environ={'REQUEST_METHOD': 'PUT'},
+                headers={'X-Put-Timestamp': '1',
+                         'X-Delete-Timestamp': '0',
+                         'X-Object-Count': '0',
+                         'X-Bytes-Used': '0',
+                         'X-Timestamp': normalize_timestamp(0)})
+            req.get_response(self.controller)
+            for second in range(3):
+                req = Request.blank(
+                    '/sda1/p/a/.sub.%s.%s' % (first, second),
+                    environ={'REQUEST_METHOD': 'PUT'},
+                    headers={'X-Put-Timestamp': '1',
+                             'X-Delete-Timestamp': '0',
+                             'X-Object-Count': '0',
+                             'X-Bytes-Used': '0',
+                             'X-Timestamp': normalize_timestamp(0)})
+                req.get_response(self.controller)
+        req = Request.blank('/sda1/p/a?delimiter=.',
+                            environ={'REQUEST_METHOD': 'GET'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.body.strip().split(b'\n'),
+                         [b'.'])
+        req = Request.blank('/sda1/p/a?prefix=.&delimiter=.',
+                            environ={'REQUEST_METHOD': 'GET'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.body.strip().split(b'\n'),
+                         [b'.sub.'])
+        req = Request.blank('/sda1/p/a?prefix=.sub.&delimiter=.',
+                            environ={'REQUEST_METHOD': 'GET'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(
+            resp.body.strip().split(b'\n'),
+            [b'.sub.0', b'.sub.0.', b'.sub.1', b'.sub.1.',
+             b'.sub.2', b'.sub.2.'])
+        req = Request.blank('/sda1/p/a?prefix=.sub.1.&delimiter=.',
+                            environ={'REQUEST_METHOD': 'GET'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.body.strip().split(b'\n'),
+                         [b'.sub.1.0', b'.sub.1.1', b'.sub.1.2'])
+
+    def test_GET_multichar_delimiter(self):
+        self.maxDiff = None
+        req = Request.blank('/sda1/p/a', method='PUT', headers={
+            'x-timestamp': '0'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 201, resp.body)
+        for i in ('US~~TX~~A', 'US~~TX~~B', 'US~~OK~~A', 'US~~OK~~B',
+                  'US~~OK~Tulsa~~A', 'US~~OK~Tulsa~~B',
+                  'US~~UT~~A', 'US~~UT~~~B'):
+            req = Request.blank('/sda1/p/a/%s' % i, method='PUT', headers={
+                'X-Put-Timestamp': '1',
+                'X-Delete-Timestamp': '0',
+                'X-Object-Count': '0',
+                'X-Bytes-Used': '0',
+                'X-Timestamp': normalize_timestamp(0)})
+            resp = req.get_response(self.controller)
+            self.assertEqual(resp.status_int, 201)
+        req = Request.blank(
+            '/sda1/p/a?prefix=US~~&delimiter=~~&format=json',
+            environ={'REQUEST_METHOD': 'GET'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(
+            json.loads(resp.body),
+            [{"subdir": "US~~OK~Tulsa~~"},
+             {"subdir": "US~~OK~~"},
+             {"subdir": "US~~TX~~"},
+             {"subdir": "US~~UT~~"}])
+
+        req = Request.blank(
+            '/sda1/p/a?prefix=US~~&delimiter=~~&format=json&reverse=on',
+            environ={'REQUEST_METHOD': 'GET'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(
+            json.loads(resp.body),
+            [{"subdir": "US~~UT~~"},
+             {"subdir": "US~~TX~~"},
+             {"subdir": "US~~OK~~"},
+             {"subdir": "US~~OK~Tulsa~~"}])
+
+        req = Request.blank(
+            '/sda1/p/a?prefix=US~~UT&delimiter=~~&format=json',
+            environ={'REQUEST_METHOD': 'GET'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(
+            json.loads(resp.body),
+            [{"subdir": "US~~UT~~"}])
+
+        req = Request.blank(
+            '/sda1/p/a?prefix=US~~UT&delimiter=~~&format=json&reverse=on',
+            environ={'REQUEST_METHOD': 'GET'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(
+            json.loads(resp.body),
+            [{"subdir": "US~~UT~~"}])
+
+        req = Request.blank(
+            '/sda1/p/a?prefix=US~~UT~&delimiter=~~&format=json',
+            environ={'REQUEST_METHOD': 'GET'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(
+            [{k: v for k, v in item.items() if k in ('subdir', 'name')}
+             for item in json.loads(resp.body)],
+            [{"name": "US~~UT~~A"},
+             {"subdir": "US~~UT~~~"}])
+
+        req = Request.blank(
+            '/sda1/p/a?prefix=US~~UT~&delimiter=~~&format=json&reverse=on',
+            environ={'REQUEST_METHOD': 'GET'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(
+            [{k: v for k, v in item.items() if k in ('subdir', 'name')}
+             for item in json.loads(resp.body)],
+            [{"subdir": "US~~UT~~~"},
+             {"name": "US~~UT~~A"}])
+
+        req = Request.blank(
+            '/sda1/p/a?prefix=US~~UT~~&delimiter=~~&format=json',
+            environ={'REQUEST_METHOD': 'GET'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(
+            [{k: v for k, v in item.items() if k in ('subdir', 'name')}
+             for item in json.loads(resp.body)],
+            [{"name": "US~~UT~~A"},
+             {"name": "US~~UT~~~B"}])
+
+        req = Request.blank(
+            '/sda1/p/a?prefix=US~~UT~~&delimiter=~~&format=json&reverse=on',
+            environ={'REQUEST_METHOD': 'GET'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(
+            [{k: v for k, v in item.items() if k in ('subdir', 'name')}
+             for item in json.loads(resp.body)],
+            [{"name": "US~~UT~~~B"},
+             {"name": "US~~UT~~A"}])
+
+        req = Request.blank(
+            '/sda1/p/a?prefix=US~~UT~~~&delimiter=~~&format=json',
+            environ={'REQUEST_METHOD': 'GET'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(
+            [{k: v for k, v in item.items() if k in ('subdir', 'name')}
+             for item in json.loads(resp.body)],
+            [{"name": "US~~UT~~~B"}])
+
+    def _expected_listing(self, containers):
+        return [dict(
+            last_modified=c['timestamp'].isoformat, **{
+                k: v for k, v in c.items()
+                if k != 'timestamp'
+            }) for c in sorted(containers, key=lambda c: c['name'])]
+
+    def _report_containers(self, containers, account='a'):
+        req = Request.blank('/sda1/p/%s' % account, method='PUT', headers={
+            'x-timestamp': next(self.ts).internal})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int // 100, 2, resp.body)
+        for container in containers:
+            path = '/sda1/p/%s/%s' % (account, container['name'])
+            req = Request.blank(path, method='PUT', headers={
+                'X-Put-Timestamp': container['timestamp'].internal,
+                'X-Delete-Timestamp': container.get(
+                    'deleted', Timestamp(0)).internal,
+                'X-Object-Count': container['count'],
+                'X-Bytes-Used': container['bytes'],
+            })
+            resp = req.get_response(self.controller)
+            self.assertEqual(resp.status_int // 100, 2, resp.body)
+
+    def test_delimiter_with_reserved_and_no_public(self):
+        containers = [{
+            'name': get_reserved_name('null', 'test01'),
+            'bytes': 200,
+            'count': 2,
+            'timestamp': next(self.ts),
+        }]
+        self._report_containers(containers)
+
+        req = Request.blank('/sda1/p/a', headers={
+            'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body), [])
+
+        req = Request.blank('/sda1/p/a', headers={
+            'X-Backend-Allow-Reserved-Names': 'true',
+            'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         self._expected_listing(containers))
+
+        req = Request.blank('/sda1/p/a?prefix=%s&delimiter=l' %
+                            get_reserved_name('nul'), headers={
+                                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body), [])
+
+        req = Request.blank('/sda1/p/a?prefix=%s&delimiter=l' %
+                            get_reserved_name('nul'), headers={
+                                'X-Backend-Allow-Reserved-Names': 'true',
+                                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body), [{
+            'subdir': '%s' % get_reserved_name('null')}])
+
+    def test_delimiter_with_reserved_and_public(self):
+        containers = [{
+            'name': get_reserved_name('null', 'test01'),
+            'bytes': 200,
+            'count': 2,
+            'timestamp': next(self.ts),
+        }, {
+            'name': 'nullish',
+            'bytes': 10,
+            'count': 10,
+            'timestamp': next(self.ts),
+        }]
+        self._report_containers(containers)
+
+        req = Request.blank('/sda1/p/a?prefix=nul&delimiter=l', headers={
+            'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body), [{'subdir': 'null'}])
+
+        # allow-reserved header doesn't really make a difference
+        req = Request.blank('/sda1/p/a?prefix=nul&delimiter=l', headers={
+            'X-Backend-Allow-Reserved-Names': 'true',
+            'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body), [{'subdir': 'null'}])
+
+        req = Request.blank('/sda1/p/a?prefix=%s&delimiter=l' %
+                            get_reserved_name('nul'), headers={
+                                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body), [])
+
+        req = Request.blank('/sda1/p/a?prefix=%s&delimiter=l' %
+                            get_reserved_name('nul'), headers={
+                                'X-Backend-Allow-Reserved-Names': 'true',
+                                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body), [{
+            'subdir': '%s' % get_reserved_name('null')}])
+
+        req = Request.blank('/sda1/p/a?delimiter=%00', headers={
+                            'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         self._expected_listing(containers)[1:])
+
+        req = Request.blank('/sda1/p/a?delimiter=%00', headers={
+                            'X-Backend-Allow-Reserved-Names': 'true',
+                            'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         [{'subdir': '\x00'}] +
+                         self._expected_listing(containers)[1:])
+
+    def test_markers_with_reserved(self):
+        containers = [{
+            'name': get_reserved_name('null', 'test01'),
+            'bytes': 200,
+            'count': 2,
+            'timestamp': next(self.ts),
+        }, {
+            'name': get_reserved_name('null', 'test02'),
+            'bytes': 10,
+            'count': 10,
+            'timestamp': next(self.ts),
+        }]
+        self._report_containers(containers)
+
+        req = Request.blank('/sda1/p/a?marker=%s' %
+                            get_reserved_name('null', ''), headers={
+                                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body), [])
+
+        req = Request.blank('/sda1/p/a?marker=%s' %
+                            get_reserved_name('null', ''), headers={
+                                'X-Backend-Allow-Reserved-Names': 'true',
+                                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         self._expected_listing(containers))
+
+        req = Request.blank('/sda1/p/a?marker=%s' % quote(
+            self._expected_listing(containers)[0]['name']), headers={
+                'X-Backend-Allow-Reserved-Names': 'true',
+                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         self._expected_listing(containers)[1:])
+
+        containers.append({
+            'name': get_reserved_name('null', 'test03'),
+            'bytes': 300,
+            'count': 30,
+            'timestamp': next(self.ts),
+        })
+        self._report_containers(containers)
+
+        req = Request.blank('/sda1/p/a?marker=%s' % quote(
+            self._expected_listing(containers)[0]['name']), headers={
+                'X-Backend-Allow-Reserved-Names': 'true',
+                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         self._expected_listing(containers)[1:])
+
+        req = Request.blank('/sda1/p/a?marker=%s' % quote(
+            self._expected_listing(containers)[1]['name']), headers={
+                'X-Backend-Allow-Reserved-Names': 'true',
+                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         self._expected_listing(containers)[-1:])
+
+    def test_prefix_with_reserved(self):
+        containers = [{
+            'name': get_reserved_name('null', 'test01'),
+            'bytes': 200,
+            'count': 2,
+            'timestamp': next(self.ts),
+        }, {
+            'name': get_reserved_name('null', 'test02'),
+            'bytes': 10,
+            'count': 10,
+            'timestamp': next(self.ts),
+        }, {
+            'name': get_reserved_name('null', 'foo'),
+            'bytes': 10,
+            'count': 10,
+            'timestamp': next(self.ts),
+        }, {
+            'name': get_reserved_name('nullish'),
+            'bytes': 300,
+            'count': 32,
+            'timestamp': next(self.ts),
+        }]
+        self._report_containers(containers)
+
+        req = Request.blank('/sda1/p/a?prefix=%s' %
+                            get_reserved_name('null', 'test'), headers={
+                                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body), [])
+
+        req = Request.blank('/sda1/p/a?prefix=%s' %
+                            get_reserved_name('null', 'test'), headers={
+                                'X-Backend-Allow-Reserved-Names': 'true',
+                                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         self._expected_listing(containers[:2]))
+
+    def test_prefix_and_delim_with_reserved(self):
+        containers = [{
+            'name': get_reserved_name('null', 'test01'),
+            'bytes': 200,
+            'count': 2,
+            'timestamp': next(self.ts),
+        }, {
+            'name': get_reserved_name('null', 'test02'),
+            'bytes': 10,
+            'count': 10,
+            'timestamp': next(self.ts),
+        }, {
+            'name': get_reserved_name('null', 'foo'),
+            'bytes': 10,
+            'count': 10,
+            'timestamp': next(self.ts),
+        }, {
+            'name': get_reserved_name('nullish'),
+            'bytes': 300,
+            'count': 32,
+            'timestamp': next(self.ts),
+        }]
+        self._report_containers(containers)
+
+        req = Request.blank('/sda1/p/a?prefix=%s&delimiter=%s' % (
+            get_reserved_name('null'), get_reserved_name()), headers={
+                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body), [])
+
+        req = Request.blank('/sda1/p/a?prefix=%s&delimiter=%s' % (
+            get_reserved_name('null'), get_reserved_name()), headers={
+                'X-Backend-Allow-Reserved-Names': 'true',
+                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        expected = [{'subdir': get_reserved_name('null', '')}] + \
+            self._expected_listing(containers[-1:])
+        self.assertEqual(json.loads(resp.body), expected)
+
+    def test_reserved_markers_with_non_reserved(self):
+        containers = [{
+            'name': get_reserved_name('null', 'test01'),
+            'bytes': 200,
+            'count': 2,
+            'timestamp': next(self.ts),
+        }, {
+            'name': get_reserved_name('null', 'test02'),
+            'bytes': 10,
+            'count': 10,
+            'timestamp': next(self.ts),
+        }, {
+            'name': 'nullish',
+            'bytes': 300,
+            'count': 32,
+            'timestamp': next(self.ts),
+        }]
+        self._report_containers(containers)
+
+        req = Request.blank('/sda1/p/a?marker=%s' %
+                            get_reserved_name('null', ''), headers={
+                                'X-Backend-Allow-Reserved-Names': 'true',
+                                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         self._expected_listing(containers))
+
+        req = Request.blank('/sda1/p/a?marker=%s' %
+                            get_reserved_name('null', ''), headers={
+                                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         [c for c in self._expected_listing(containers)
+                          if get_reserved_name() not in c['name']])
+
+        req = Request.blank('/sda1/p/a?marker=%s' %
+                            get_reserved_name('null', ''), headers={
+                                'X-Backend-Allow-Reserved-Names': 'true',
+                                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         self._expected_listing(containers))
+
+        req = Request.blank('/sda1/p/a?marker=%s' % quote(
+            self._expected_listing(containers)[0]['name']), headers={
+                'X-Backend-Allow-Reserved-Names': 'true',
+                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         self._expected_listing(containers)[1:])
+
+    def test_null_markers(self):
+        containers = [{
+            'name': get_reserved_name('null', ''),
+            'bytes': 200,
+            'count': 2,
+            'timestamp': next(self.ts),
+        }, {
+            'name': get_reserved_name('null', 'test01'),
+            'bytes': 200,
+            'count': 2,
+            'timestamp': next(self.ts),
+        }, {
+            'name': 'null',
+            'bytes': 300,
+            'count': 32,
+            'timestamp': next(self.ts),
+        }]
+        self._report_containers(containers)
+
+        req = Request.blank('/sda1/p/a?marker=%s' % get_reserved_name('null'),
+                            headers={'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         self._expected_listing(containers)[-1:])
+
+        req = Request.blank('/sda1/p/a?marker=%s' % get_reserved_name('null'),
+                            headers={'X-Backend-Allow-Reserved-Names': 'true',
+                                     'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         self._expected_listing(containers))
+
+        req = Request.blank('/sda1/p/a?marker=%s' %
+                            get_reserved_name('null', ''), headers={
+                                'X-Backend-Allow-Reserved-Names': 'true',
+                                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         self._expected_listing(containers)[1:])
+
+        req = Request.blank('/sda1/p/a?marker=%s' %
+                            get_reserved_name('null', 'test00'), headers={
+                                'X-Backend-Allow-Reserved-Names': 'true',
+                                'Accept': 'application/json'})
+        resp = req.get_response(self.controller)
+        self.assertEqual(resp.status_int, 200, resp.body)
+        self.assertEqual(json.loads(resp.body),
+                         self._expected_listing(containers)[1:])
+
     def test_through_call(self):
         inbuf = BytesIO()
         errbuf = StringIO()
         outbuf = StringIO()
 
         def start_response(*args):
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
         self.controller.__call__({'REQUEST_METHOD': 'GET',
                                   'SCRIPT_NAME': '',
@@ -1549,7 +2289,7 @@ class TestAccountController(unittest.TestCase):
         outbuf = StringIO()
 
         def start_response(*args):
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
         self.controller.__call__({'REQUEST_METHOD': 'GET',
                                   'SCRIPT_NAME': '',
@@ -1575,11 +2315,11 @@ class TestAccountController(unittest.TestCase):
         outbuf = StringIO()
 
         def start_response(*args):
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
         self.controller.__call__({'REQUEST_METHOD': 'GET',
                                   'SCRIPT_NAME': '',
-                                  'PATH_INFO': '\x00',
+                                  'PATH_INFO': '/sda1/p/a/c\xd8\x3e%20',
                                   'SERVER_NAME': '127.0.0.1',
                                   'SERVER_PORT': '8080',
                                   'SERVER_PROTOCOL': 'HTTP/1.0',
@@ -1600,7 +2340,7 @@ class TestAccountController(unittest.TestCase):
         outbuf = StringIO()
 
         def start_response(*args):
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
         self.controller.__call__({'REQUEST_METHOD': 'method_doesnt_exist',
                                   'PATH_INFO': '/sda1/p/a'},
@@ -1613,7 +2353,7 @@ class TestAccountController(unittest.TestCase):
         outbuf = StringIO()
 
         def start_response(*args):
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
         self.controller.__call__({'REQUEST_METHOD': '__init__',
                                   'PATH_INFO': '/sda1/p/a'},
@@ -1641,18 +2381,13 @@ class TestAccountController(unittest.TestCase):
             resp = req.get_response(self.controller)
             self.assertEqual(resp.status_int, 400,
                              "%d on param %s" % (resp.status_int, param))
-        # Good UTF8 sequence for delimiter, too long (1 byte delimiters only)
-        req = Request.blank('/sda1/p/a?delimiter=\xce\xa9',
-                            environ={'REQUEST_METHOD': 'GET'})
-        resp = req.get_response(self.controller)
-        self.assertEqual(resp.status_int, 412,
-                         "%d on param delimiter" % (resp.status_int))
         Request.blank('/sda1/p/a',
                       headers={'X-Timestamp': normalize_timestamp(1)},
                       environ={'REQUEST_METHOD': 'PUT'}).get_response(
                           self.controller)
         # Good UTF8 sequence, ignored for limit, doesn't affect other queries
-        for param in ('limit', 'marker', 'prefix', 'end_marker', 'format'):
+        for param in ('limit', 'marker', 'prefix', 'end_marker', 'format',
+                      'delimiter'):
             req = Request.blank('/sda1/p/a?%s=\xce\xa9' % param,
                                 environ={'REQUEST_METHOD': 'GET'})
             resp = req.get_response(self.controller)
@@ -1720,7 +2455,7 @@ class TestAccountController(unittest.TestCase):
     def test_serv_reserv(self):
         # Test replication_server flag was set from configuration file.
         conf = {'devices': self.testdir, 'mount_check': 'false'}
-        self.assertIsNone(AccountController(conf).replication_server)
+        self.assertTrue(AccountController(conf).replication_server)
         for val in [True, '1', 'True', 'true']:
             conf['replication_server'] = val
             self.assertTrue(AccountController(conf).replication_server)
@@ -1744,15 +2479,13 @@ class TestAccountController(unittest.TestCase):
         # swift.account.server.AccountController.__call__
         inbuf = BytesIO()
         errbuf = StringIO()
-        outbuf = StringIO()
         self.controller = AccountController(
             {'devices': self.testdir,
              'mount_check': 'false',
              'replication_server': 'false'})
 
         def start_response(*args):
-            """Sends args to outbuf"""
-            outbuf.writelines(args)
+            pass
 
         method = 'PUT'
         env = {'REQUEST_METHOD': method,
@@ -1783,14 +2516,12 @@ class TestAccountController(unittest.TestCase):
         # swift.account.server.AccountController.__call__
         inbuf = BytesIO()
         errbuf = StringIO()
-        outbuf = StringIO()
         self.controller = AccountController(
             {'devices': self.testdir, 'mount_check': 'false',
              'replication_server': 'false'})
 
         def start_response(*args):
-            """Sends args to outbuf"""
-            outbuf.writelines(args)
+            pass
 
         method = 'PUT'
         env = {'REQUEST_METHOD': method,
@@ -1808,8 +2539,8 @@ class TestAccountController(unittest.TestCase):
                'wsgi.multiprocess': False,
                'wsgi.run_once': False}
 
-        answer = ['<html><h1>Method Not Allowed</h1><p>The method is not '
-                  'allowed for this resource.</p></html>']
+        answer = [b'<html><h1>Method Not Allowed</h1><p>The method is not '
+                  b'allowed for this resource.</p></html>']
         mock_method = replication(public(lambda x: mock.MagicMock()))
         with mock.patch.object(self.controller, method,
                                new=mock_method):
@@ -1817,7 +2548,7 @@ class TestAccountController(unittest.TestCase):
             response = self.controller.__call__(env, start_response)
             self.assertEqual(response, answer)
 
-    def test_call_incorrect_replication_method(self):
+    def test_replicaiton_server_call_all_methods(self):
         inbuf = BytesIO()
         errbuf = StringIO()
         outbuf = StringIO()
@@ -1826,17 +2557,17 @@ class TestAccountController(unittest.TestCase):
              'replication_server': 'true'})
 
         def start_response(*args):
-            """Sends args to outbuf"""
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
-        obj_methods = ['DELETE', 'PUT', 'HEAD', 'GET', 'POST', 'OPTIONS']
+        obj_methods = ['PUT', 'HEAD', 'GET', 'POST', 'DELETE', 'OPTIONS']
         for method in obj_methods:
             env = {'REQUEST_METHOD': method,
                    'SCRIPT_NAME': '',
-                   'PATH_INFO': '/sda1/p/a/c',
+                   'PATH_INFO': '/sda1/p/a',
                    'SERVER_NAME': '127.0.0.1',
                    'SERVER_PORT': '8080',
                    'SERVER_PROTOCOL': 'HTTP/1.0',
+                   'HTTP_X_TIMESTAMP': next(self.ts).internal,
                    'CONTENT_LENGTH': '0',
                    'wsgi.version': (1, 0),
                    'wsgi.url_scheme': 'http',
@@ -1847,12 +2578,11 @@ class TestAccountController(unittest.TestCase):
                    'wsgi.run_once': False}
             self.controller(env, start_response)
             self.assertEqual(errbuf.getvalue(), '')
-            self.assertEqual(outbuf.getvalue()[:4], '405 ')
+            self.assertIn(outbuf.getvalue()[:4], ('200 ', '201 ', '204 '))
 
     def test__call__raise_timeout(self):
         inbuf = WsgiBytesIO()
         errbuf = StringIO()
-        outbuf = StringIO()
         self.logger = debug_logger('test')
         self.account_controller = AccountController(
             {'devices': self.testdir, 'mount_check': 'false',
@@ -1860,8 +2590,7 @@ class TestAccountController(unittest.TestCase):
             logger=self.logger)
 
         def start_response(*args):
-            # Sends args to outbuf
-            outbuf.writelines(args)
+            pass
 
         method = 'PUT'
 
@@ -1887,7 +2616,7 @@ class TestAccountController(unittest.TestCase):
         with mock.patch.object(self.account_controller, method,
                                new=mock_put_method):
             response = self.account_controller.__call__(env, start_response)
-            self.assertTrue(response[0].startswith(
+            self.assertTrue(response[0].decode('ascii').startswith(
                 'Traceback (most recent call last):'))
             self.assertEqual(self.logger.get_lines_for_level('error'), [
                 'ERROR __call__ error with %(method)s %(path)s : ' % {
@@ -1896,7 +2625,7 @@ class TestAccountController(unittest.TestCase):
             self.assertEqual(self.logger.get_lines_for_level('info'), [])
 
     def test_GET_log_requests_true(self):
-        self.controller.logger = FakeLogger()
+        self.controller.logger = debug_logger()
         self.controller.log_requests = True
 
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'GET'})
@@ -1905,7 +2634,7 @@ class TestAccountController(unittest.TestCase):
         self.assertTrue(self.controller.logger.log_dict['info'])
 
     def test_GET_log_requests_false(self):
-        self.controller.logger = FakeLogger()
+        self.controller.logger = debug_logger()
         self.controller.log_requests = False
         req = Request.blank('/sda1/p/a', environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.controller)
@@ -1916,19 +2645,18 @@ class TestAccountController(unittest.TestCase):
         req = Request.blank(
             '/sda1/p/a',
             environ={'REQUEST_METHOD': 'HEAD', 'REMOTE_ADDR': '1.2.3.4'})
-        self.controller.logger = FakeLogger()
+        self.controller.logger = debug_logger()
         with mock.patch(
-                'time.gmtime', mock.MagicMock(side_effect=[gmtime(10001.0)])):
+                'time.time',
+                mock.MagicMock(side_effect=[10000.0, 10001.0, 10002.0,
+                                            10002.0])):
             with mock.patch(
-                    'time.time',
-                    mock.MagicMock(side_effect=[10000.0, 10001.0, 10002.0])):
-                with mock.patch(
-                        'os.getpid', mock.MagicMock(return_value=1234)):
-                    req.get_response(self.controller)
+                    'os.getpid', mock.MagicMock(return_value=1234)):
+                req.get_response(self.controller)
         self.assertEqual(
-            self.controller.logger.log_dict['info'],
-            [(('1.2.3.4 - - [01/Jan/1970:02:46:41 +0000] "HEAD /sda1/p/a" 404 '
-             '- "-" "-" "-" 2.0000 "-" 1234 -',), {})])
+            self.controller.logger.get_lines_for_level('info'),
+            ['1.2.3.4 - - [01/Jan/1970:02:46:42 +0000] "HEAD /sda1/p/a" 404 '
+             '- "-" "-" "-" 2.0000 "-" 1234 -'])
 
     def test_policy_stats_with_legacy(self):
         ts = itertools.count()

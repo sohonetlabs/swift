@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import unittest2
+import unittest
 import os
 
 import test.functional as tf
@@ -69,7 +69,7 @@ class TestS3ApiService(S3ApiBase):
             self.assertTrue(b.find('CreationDate') is not None)
 
     def test_service_error_signature_not_match(self):
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = auth_error_conn.make_request('GET')
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
         self.assertEqual(headers['content-type'], 'application/xml')
@@ -80,8 +80,8 @@ class TestS3ApiService(S3ApiBase):
             'GET', headers={'Date': '', 'x-amz-date': ''})
         self.assertEqual(status, 403)
         self.assertEqual(get_error_code(body), 'AccessDenied')
-        self.assertIn('AWS authentication requires a valid Date '
-                      'or x-amz-date header', body)
+        self.assertIn(b'AWS authentication requires a valid Date '
+                      b'or x-amz-date header', body)
 
 
 class TestS3ApiServiceSigV4(TestS3ApiService):
@@ -96,5 +96,6 @@ class TestS3ApiServiceSigV4(TestS3ApiService):
     def setUp(self):
         super(TestS3ApiServiceSigV4, self).setUp()
 
+
 if __name__ == '__main__':
-    unittest2.main()
+    unittest.main()

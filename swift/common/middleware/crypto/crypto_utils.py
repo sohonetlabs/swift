@@ -14,7 +14,6 @@
 # limitations under the License.
 import base64
 import binascii
-import collections
 import json
 import os
 
@@ -24,7 +23,7 @@ import six
 from six.moves.urllib import parse as urlparse
 
 from swift import gettext_ as _
-from swift.common.exceptions import EncryptionException
+from swift.common.exceptions import EncryptionException, UnknownSecretIdError
 from swift.common.swob import HTTPInternalServerError
 from swift.common.utils import get_logger
 from swift.common.wsgi import WSGIContext
@@ -40,7 +39,7 @@ class Crypto(object):
     cipher = 'AES_CTR_256'
     # AES will accept several key sizes - we are using 256 bits i.e. 32 bytes
     key_length = 32
-    iv_length = algorithms.AES.block_size / 8
+    iv_length = algorithms.AES.block_size // 8
 
     def __init__(self, conf=None):
         self.logger = get_logger(conf, log_route="crypto")
@@ -78,9 +77,9 @@ class Crypto(object):
             # The CTR mode offset is incremented for every AES block and taken
             # modulo 2^128.
             offset_blocks, offset_in_block = divmod(offset, self.iv_length)
-            ivl = long(binascii.hexlify(iv), 16) + offset_blocks
+            ivl = int(binascii.hexlify(iv), 16) + offset_blocks
             ivl %= 1 << algorithms.AES.block_size
-            iv = str(bytearray.fromhex(format(
+            iv = bytes(bytearray.fromhex(format(
                 ivl, '0%dx' % (2 * self.iv_length))))
         else:
             offset_in_block = 0
@@ -89,7 +88,7 @@ class Crypto(object):
                         backend=self.backend)
         dec = engine.decryptor()
         # Adjust decryption boundary within current AES block
-        dec.update('*' * offset_in_block)
+        dec.update(b'*' * offset_in_block)
         return dec
 
     def create_iv(self):
@@ -155,7 +154,7 @@ class CryptoWSGIContext(WSGIContext):
         self.logger = logger
         self.server_type = server_type
 
-    def get_keys(self, env, required=None):
+    def get_keys(self, env, required=None, key_id=None):
         # Get the key(s) from the keymaster
         required = required if required is not None else [self.server_type]
         try:
@@ -165,11 +164,14 @@ class CryptoWSGIContext(WSGIContext):
             raise HTTPInternalServerError(
                 "Unable to retrieve encryption keys.")
 
+        err = None
         try:
-            keys = fetch_crypto_keys()
+            keys = fetch_crypto_keys(key_id=key_id)
+        except UnknownSecretIdError as err:
+            self.logger.error('get_keys(): unknown key id: %s', err)
+            raise
         except Exception as err:  # noqa
-            self.logger.exception(_(
-                'ERROR get_keys(): from callback: %s') % err)
+            self.logger.exception('get_keys(): from callback: %s', err)
             raise HTTPInternalServerError(
                 "Unable to retrieve encryption keys.")
 
@@ -189,6 +191,17 @@ class CryptoWSGIContext(WSGIContext):
             raise HTTPInternalServerError(
                 "Unable to retrieve encryption keys.")
 
+        return keys
+
+    def get_multiple_keys(self, env):
+        # get a list of keys from the keymaster containing one dict of keys for
+        # each of the keymaster root secret ids
+        keys = [self.get_keys(env)]
+        active_key_id = keys[0]['id']
+        for other_key_id in keys[0].get('all_ids', []):
+            if other_key_id == active_key_id:
+                continue
+            keys.append(self.get_keys(env, key_id=other_key_id))
         return keys
 
 
@@ -217,7 +230,7 @@ def dump_crypto_meta(crypto_meta):
         json.dumps(b64_encode_meta(crypto_meta), sort_keys=True))
 
 
-def load_crypto_meta(value):
+def load_crypto_meta(value, b64decode=True):
     """
     Build the crypto_meta from the json object.
 
@@ -229,22 +242,24 @@ def load_crypto_meta(value):
           as native unicode strings on py3).
 
     :param value: a string serialization of a crypto meta dict
+    :param b64decode: decode the 'key' and 'iv' values to bytes, default True
     :returns: a dict containing crypto meta items
     :raises EncryptionException: if an error occurs while parsing the
                                  crypto meta
     """
     def b64_decode_meta(crypto_meta):
         return {
-            str(name): (base64.b64decode(val) if name in ('iv', 'key')
-                        else b64_decode_meta(val) if isinstance(val, dict)
-                        else val.encode('utf8') if six.PY2 else val)
+            str(name): (
+                base64.b64decode(val) if name in ('iv', 'key') and b64decode
+                else b64_decode_meta(val) if isinstance(val, dict)
+                else val.encode('utf8') if six.PY2 else val)
             for name, val in crypto_meta.items()}
 
     try:
         if not isinstance(value, six.string_types):
             raise ValueError('crypto meta not a string')
         val = json.loads(urlparse.unquote_plus(value))
-        if not isinstance(val, collections.Mapping):
+        if not isinstance(val, dict):
             raise ValueError('crypto meta not a Mapping')
         return b64_decode_meta(val)
     except (KeyError, ValueError, TypeError) as err:
@@ -260,6 +275,8 @@ def append_crypto_meta(value, crypto_meta):
     :param crypto_meta: a dict of crypto meta
     :return: a string of the form <value>; swift_meta=<serialized crypto meta>
     """
+    if not isinstance(value, str):
+        raise ValueError
     return '%s; swift_meta=%s' % (value, dump_crypto_meta(crypto_meta))
 
 

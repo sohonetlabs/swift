@@ -15,11 +15,14 @@
 # limitations under the License.
 
 import unittest
-from urlparse import urlparse, urlunparse
+from six.moves.urllib.parse import urlparse, urlunparse
 import uuid
 from random import shuffle
 
-from keystoneclient.v3 import client
+try:
+    from keystoneclient.v3 import ksc
+except ImportError:
+    ksc = None
 from swiftclient import get_auth, http_connection
 
 import test.functional as tf
@@ -3025,7 +3028,7 @@ class BaseClient(object):
 class KeystoneClient(BaseClient):
     def get_id_info(self):
         id_info = {}
-        for user_name, user_info in self.users.iteritems():
+        for user_name, user_info in self.users.items():
             if user_name != '':
                 user_id, project_id = self._get_id(user_name)
                 id_info[user_name + '_id'] = user_id
@@ -3034,7 +3037,7 @@ class KeystoneClient(BaseClient):
 
     def _get_id(self, user_name):
         info = self.users.get(user_name)
-        keystone_client = client.Client(
+        keystone_client = ksc.Client(
             auth_url=self.auth_url,
             version=(self.auth_version,),
             username=user_name,
@@ -3092,6 +3095,8 @@ class SwiftClient(BaseClient):
 
 class BaseTestAC(unittest.TestCase):
     def setUp(self):
+        if ksc is None:
+            raise unittest.SkipTest('keystoneclient is not available')
         self.reseller_admin = tf.swift_test_user[5]
         self.client = SwiftClient()
 
@@ -3294,7 +3299,7 @@ class TestContainerACL(BaseTestAC):
         test_case = super(TestContainerACL, self)._convert_data(data)
         prep_container_header = test_case['prep_container_header']
         if prep_container_header is not None:
-            for header, header_val in prep_container_header.iteritems():
+            for header, header_val in prep_container_header.items():
                 prep_container_header[header] = header_val % self.id_info
         return test_case
 

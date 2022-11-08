@@ -31,6 +31,7 @@ are also not considered part of the backend API.
 """
 
 import six.moves.cPickle as pickle
+import binascii
 import copy
 import errno
 import fcntl
@@ -39,7 +40,6 @@ import os
 import re
 import time
 import uuid
-import hashlib
 import logging
 import traceback
 import xattr
@@ -56,7 +56,6 @@ import six
 from pyeclib.ec_iface import ECDriverError, ECInvalidFragmentMetadata, \
     ECBadFragmentChecksum, ECInvalidParameter
 
-from swift import gettext_ as _
 from swift.common.constraints import check_drive
 from swift.common.request_helpers import is_sys_meta
 from swift.common.utils import mkdirs, Timestamp, \
@@ -64,23 +63,24 @@ from swift.common.utils import mkdirs, Timestamp, \
     fsync_dir, drop_buffer_cache, lock_path, write_pickle, \
     config_true_value, listdir, split_path, remove_file, \
     get_md5_socket, F_SETPIPE_SZ, decode_timestamps, encode_timestamps, \
-    MD5_OF_EMPTY_STRING, link_fd_to_path, o_tmpfile_supported, \
-    O_TMPFILE, makedirs_count, replace_partition_in_path
+    MD5_OF_EMPTY_STRING, link_fd_to_path, \
+    O_TMPFILE, makedirs_count, replace_partition_in_path, remove_directory, \
+    md5, is_file_older, non_negative_float
 from swift.common.splice import splice, tee
 from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist, \
     DiskFileCollision, DiskFileNoSpace, DiskFileDeviceUnavailable, \
     DiskFileDeleted, DiskFileError, DiskFileNotOpen, PathNotDir, \
     ReplicationLockTimeout, DiskFileExpired, DiskFileXattrNotSupported, \
-    DiskFileBadMetadataChecksum
+    DiskFileBadMetadataChecksum, PartitionLockTimeout
 from swift.common.swob import multi_range_iterator
 from swift.common.storage_policy import (
     get_policy_string, split_policy_string, PolicyError, POLICIES,
     REPL_POLICY, EC_POLICY)
-from functools import partial
 
 
 PICKLE_PROTOCOL = 2
 DEFAULT_RECLAIM_AGE = timedelta(weeks=1).total_seconds()
+DEFAULT_COMMIT_WINDOW = 60.0
 HASH_FILE = 'hashes.pkl'
 HASH_INVALIDATIONS_FILE = 'hashes.invalid'
 METADATA_KEY = b'user.swift.metadata'
@@ -93,20 +93,42 @@ DATAFILE_SYSTEM_META = {'x-static-large-object'}
 DATADIR_BASE = 'objects'
 ASYNCDIR_BASE = 'async_pending'
 TMP_BASE = 'tmp'
-get_data_dir = partial(get_policy_string, DATADIR_BASE)
-get_async_dir = partial(get_policy_string, ASYNCDIR_BASE)
-get_tmp_dir = partial(get_policy_string, TMP_BASE)
 MIN_TIME_UPDATE_AUDITOR_STATUS = 60
 # This matches rsync tempfiles, like ".<timestamp>.data.Xy095a"
 RE_RSYNC_TEMPFILE = re.compile(r'^\..*\.([a-zA-Z0-9_]){6}$')
 
 
-def _unlink_if_present(filename):
-    try:
-        os.unlink(filename)
-    except OSError as err:
-        if err.errno != errno.ENOENT:
-            raise
+def get_data_dir(policy_or_index):
+    '''
+    Get the data dir for the given policy.
+
+    :param policy_or_index: ``StoragePolicy`` instance, or an index (string or
+                            int); if None, the legacy Policy-0 is assumed.
+    :returns: ``objects`` or ``objects-<N>`` as appropriate
+    '''
+    return get_policy_string(DATADIR_BASE, policy_or_index)
+
+
+def get_async_dir(policy_or_index):
+    '''
+    Get the async dir for the given policy.
+
+    :param policy_or_index: ``StoragePolicy`` instance, or an index (string or
+                            int); if None, the legacy Policy-0 is assumed.
+    :returns: ``async_pending`` or ``async_pending-<N>`` as appropriate
+    '''
+    return get_policy_string(ASYNCDIR_BASE, policy_or_index)
+
+
+def get_tmp_dir(policy_or_index):
+    '''
+    Get the temp dir for the given policy.
+
+    :param policy_or_index: ``StoragePolicy`` instance, or an index (string or
+                            int); if None, the legacy Policy-0 is assumed.
+    :returns: ``tmp`` or ``tmp-<N>`` as appropriate
+    '''
+    return get_policy_string(TMP_BASE, policy_or_index)
 
 
 def _get_filename(fd):
@@ -131,10 +153,16 @@ def _encode_metadata(metadata):
 
     :param metadata: a dict
     """
-    def encode_str(item):
-        if isinstance(item, six.text_type):
-            return item.encode('utf8')
-        return item
+    if six.PY2:
+        def encode_str(item):
+            if isinstance(item, six.text_type):
+                return item.encode('utf8')
+            return item
+    else:
+        def encode_str(item):
+            if isinstance(item, six.text_type):
+                return item.encode('utf8', 'surrogateescape')
+            return item
 
     return dict(((encode_str(k), encode_str(v)) for k, v in metadata.items()))
 
@@ -194,14 +222,16 @@ def read_metadata(fd, add_missing_checksum=False):
         # exist. This is fine; it just means that this object predates the
         # introduction of metadata checksums.
         if add_missing_checksum:
-            new_checksum = hashlib.md5(metadata).hexdigest()
+            new_checksum = (md5(metadata, usedforsecurity=False)
+                            .hexdigest().encode('ascii'))
             try:
                 xattr.setxattr(fd, METADATA_CHECKSUM_KEY, new_checksum)
             except (IOError, OSError) as e:
                 logging.error("Error adding metadata: %s" % e)
 
     if metadata_checksum:
-        computed_checksum = hashlib.md5(metadata).hexdigest().encode('ascii')
+        computed_checksum = (md5(metadata, usedforsecurity=False)
+                             .hexdigest().encode('ascii'))
         if metadata_checksum != computed_checksum:
             raise DiskFileBadMetadataChecksum(
                 "Metadata checksum mismatch for %s: "
@@ -226,7 +256,8 @@ def write_metadata(fd, metadata, xattr_size=65536):
     :param metadata: metadata to write
     """
     metastr = pickle.dumps(_encode_metadata(metadata), PICKLE_PROTOCOL)
-    metastr_md5 = hashlib.md5(metastr).hexdigest().encode('ascii')
+    metastr_md5 = (
+        md5(metastr, usedforsecurity=False).hexdigest().encode('ascii'))
     key = 0
     try:
         while metastr:
@@ -299,7 +330,11 @@ def quarantine_renamer(device_path, corrupted_file_path):
     to_dir = join(device_path, 'quarantined',
                   get_data_dir(policy),
                   basename(from_dir))
-    invalidate_hash(dirname(from_dir))
+    if len(basename(from_dir)) == 3:
+        # quarantining whole suffix
+        invalidate_hash(from_dir)
+    else:
+        invalidate_hash(dirname(from_dir))
     try:
         renamer(from_dir, to_dir, fsync=False)
     except OSError as e:
@@ -308,6 +343,12 @@ def quarantine_renamer(device_path, corrupted_file_path):
         to_dir = "%s-%s" % (to_dir, uuid.uuid4().hex)
         renamer(from_dir, to_dir, fsync=False)
     return to_dir
+
+
+def valid_suffix(value):
+    if not isinstance(value, six.string_types) or len(value) != 3:
+        return False
+    return all(c in '0123456789abcdef' for c in value)
 
 
 def read_hashes(partition_dir):
@@ -332,6 +373,12 @@ def read_hashes(partition_dir):
             # given invalid input depending on the way in which the
             # input is invalid.
             pass
+
+    # Check for corrupted data that could break os.listdir()
+    if not all(valid_suffix(key) or key in ('valid', 'updated')
+               for key in hashes):
+        return {'valid': False}
+
     # hashes.pkl w/o valid updated key is "valid" but "forever old"
     hashes.setdefault('valid', True)
     hashes.setdefault('updated', -1)
@@ -370,7 +417,7 @@ def consolidate_hashes(partition_dir):
 
         found_invalidation_entry = False
         try:
-            with open(invalidations_file, 'rb') as inv_fh:
+            with open(invalidations_file, 'r') as inv_fh:
                 for line in inv_fh:
                     found_invalidation_entry = True
                     suffix = line.strip()
@@ -406,35 +453,58 @@ def invalidate_hash(suffix_dir):
         inv_fh.write(suffix + b"\n")
 
 
-def relink_paths(target_path, new_target_path, check_existing=False):
+def relink_paths(target_path, new_target_path, ignore_missing=True):
     """
-    Hard-links a file located in target_path using the second path
-    new_target_path. Creates intermediate directories if required.
+    Hard-links a file located in ``target_path`` using the second path
+    ``new_target_path``. Creates intermediate directories if required.
 
     :param target_path: current absolute filename
     :param new_target_path: new absolute filename for the hardlink
-    :param check_existing: if True, check whether the link is already present
-                           before attempting to create a new one
+    :param ignore_missing: if True then no exception is raised if the link
+        could not be made because ``target_path`` did not exist, otherwise an
+        OSError will be raised.
+    :raises: OSError if the hard link could not be created, unless the intended
+        hard link already exists or the ``target_path`` does not exist and
+        ``must_exist`` if False.
+    :returns: True if the link was created by the call to this method, False
+        otherwise.
     """
-
+    link_created = False
     if target_path != new_target_path:
-        logging.debug('Relinking %s to %s due to next_part_power set',
-                      target_path, new_target_path)
         new_target_dir = os.path.dirname(new_target_path)
-        if not os.path.isdir(new_target_dir):
+        try:
             os.makedirs(new_target_dir)
+        except OSError as err:
+            if err.errno != errno.EEXIST:
+                raise
 
-        link_exists = False
-        if check_existing:
-            try:
-                new_stat = os.stat(new_target_path)
-                orig_stat = os.stat(target_path)
-                link_exists = (new_stat.st_ino == orig_stat.st_ino)
-            except OSError:
-                pass  # if anything goes wrong, try anyway
-
-        if not link_exists:
+        try:
             os.link(target_path, new_target_path)
+            link_created = True
+        except OSError as err:
+            # there are some circumstances in which it may be ok that the
+            # attempted link failed
+            ok = False
+            if err.errno == errno.ENOENT:
+                # this is ok if the *target* path doesn't exist anymore
+                ok = not os.path.exists(target_path) and ignore_missing
+            if err.errno == errno.EEXIST:
+                # this is ok *if* the intended link has already been made
+                try:
+                    orig_stat = os.stat(target_path)
+                except OSError as sub_err:
+                    # this is ok: the *target* path doesn't exist anymore
+                    ok = sub_err.errno == errno.ENOENT and ignore_missing
+                else:
+                    try:
+                        new_stat = os.stat(new_target_path)
+                        ok = new_stat.st_ino == orig_stat.st_ino
+                    except OSError:
+                        # squash this exception; the original will be raised
+                        pass
+            if not ok:
+                raise err
+    return link_created
 
 
 def get_part_path(dev_path, policy, partition):
@@ -512,7 +582,7 @@ def object_audit_location_generator(devices, datadir, mount_check=True,
             try:
                 suffixes = listdir(part_path)
             except OSError as e:
-                if e.errno != errno.ENOTDIR:
+                if e.errno not in (errno.ENOTDIR, errno.ENODATA):
                     raise
                 continue
             for asuffix in suffixes:
@@ -520,7 +590,7 @@ def object_audit_location_generator(devices, datadir, mount_check=True,
                 try:
                     hashes = listdir(suff_path)
                 except OSError as e:
-                    if e.errno != errno.ENOTDIR:
+                    if e.errno not in (errno.ENOTDIR, errno.ENODATA):
                         raise
                     continue
                 for hsh in hashes:
@@ -544,14 +614,14 @@ def get_auditor_status(datadir_path, logger, auditor_type):
             status = statusfile.read()
     except (OSError, IOError) as e:
         if e.errno != errno.ENOENT and logger:
-            logger.warning(_('Cannot read %(auditor_status)s (%(err)s)') %
+            logger.warning('Cannot read %(auditor_status)s (%(err)s)',
                            {'auditor_status': auditor_status, 'err': e})
         return listdir(datadir_path)
     try:
         status = json.loads(status)
     except ValueError as e:
-        logger.warning(_('Loading JSON from %(auditor_status)s failed'
-                         ' (%(err)s)') %
+        logger.warning('Loading JSON from %(auditor_status)s failed'
+                       ' (%(err)s)',
                        {'auditor_status': auditor_status, 'err': e})
         return listdir(datadir_path)
     return status['partitions']
@@ -578,7 +648,7 @@ def update_auditor_status(datadir_path, logger, partitions, auditor_type):
             statusfile.write(status)
     except (OSError, IOError) as e:
         if logger:
-            logger.warning(_('Cannot write %(auditor_status)s (%(err)s)') %
+            logger.warning('Cannot write %(auditor_status)s (%(err)s)',
                            {'auditor_status': auditor_status, 'err': e})
 
 
@@ -591,40 +661,14 @@ def clear_auditor_status(devices, datadir, auditor_type="ALL"):
         remove_file(auditor_status)
 
 
-def strip_self(f):
-    """
-    Wrapper to attach module level functions to base class.
-    """
-    def wrapper(self, *args, **kwargs):
-        return f(*args, **kwargs)
-    return wrapper
-
-
 class DiskFileRouter(object):
-
-    policy_type_to_manager_cls = {}
-
-    @classmethod
-    def register(cls, policy_type):
-        """
-        Decorator for Storage Policy implementations to register
-        their DiskFile implementation.
-        """
-        def register_wrapper(diskfile_cls):
-            if policy_type in cls.policy_type_to_manager_cls:
-                raise PolicyError(
-                    '%r is already registered for the policy_type %r' % (
-                        cls.policy_type_to_manager_cls[policy_type],
-                        policy_type))
-            cls.policy_type_to_manager_cls[policy_type] = diskfile_cls
-            return diskfile_cls
-        return register_wrapper
 
     def __init__(self, *args, **kwargs):
         self.policy_to_manager = {}
         for policy in POLICIES:
-            manager_cls = self.policy_type_to_manager_cls[policy.policy_type]
-            self.policy_to_manager[int(policy)] = manager_cls(*args, **kwargs)
+            # create diskfile managers now to provoke any errors
+            self.policy_to_manager[int(policy)] = \
+                policy.get_diskfile_manager(*args, **kwargs)
 
     def __getitem__(self, policy):
         return self.policy_to_manager[int(policy)]
@@ -654,10 +698,11 @@ class BaseDiskFileManager(object):
     """
 
     diskfile_cls = None  # must be set by subclasses
+    policy = None  # must be set by subclasses
 
-    invalidate_hash = strip_self(invalidate_hash)
-    consolidate_hashes = strip_self(consolidate_hashes)
-    quarantine_renamer = strip_self(quarantine_renamer)
+    invalidate_hash = staticmethod(invalidate_hash)
+    consolidate_hashes = staticmethod(consolidate_hashes)
+    quarantine_renamer = staticmethod(quarantine_renamer)
 
     def __init__(self, conf, logger):
         self.logger = logger
@@ -667,6 +712,8 @@ class BaseDiskFileManager(object):
         self.bytes_per_sync = int(conf.get('mb_per_sync', 512)) * 1024 * 1024
         self.mount_check = config_true_value(conf.get('mount_check', 'true'))
         self.reclaim_age = int(conf.get('reclaim_age', DEFAULT_RECLAIM_AGE))
+        self.commit_window = non_negative_float(conf.get(
+            'commit_window', DEFAULT_COMMIT_WINDOW))
         replication_concurrency_per_device = conf.get(
             'replication_concurrency_per_device')
         replication_one_per_device = conf.get('replication_one_per_device')
@@ -720,7 +767,12 @@ class BaseDiskFileManager(object):
                 with open('/proc/sys/fs/pipe-max-size') as f:
                     max_pipe_size = int(f.read())
                 self.pipe_size = min(max_pipe_size, self.disk_chunk_size)
-        self.use_linkat = o_tmpfile_supported()
+        self.use_linkat = True
+
+    @classmethod
+    def check_policy(cls, policy):
+        if policy.policy_type != cls.policy:
+            raise ValueError('Invalid policy_type: %s' % policy.policy_type)
 
     def make_on_disk_filename(self, timestamp, ext=None,
                               ctype_timestamp=None, *a, **kw):
@@ -759,11 +811,12 @@ class BaseDiskFileManager(object):
             rv = '%s%s' % (rv, ext)
         return rv
 
-    def parse_on_disk_filename(self, filename):
+    def parse_on_disk_filename(self, filename, policy):
         """
         Parse an on disk file name.
 
         :param filename: the file name including extension
+        :param policy: storage policy used to store the file
         :returns: a dict, with keys for timestamp, ext and ctype_timestamp:
 
             * timestamp is a :class:`~swift.common.utils.Timestamp`
@@ -870,7 +923,8 @@ class BaseDiskFileManager(object):
         return self._split_list(
             file_info_list, lambda x: x['timestamp'] >= timestamp)
 
-    def get_ondisk_files(self, files, datadir, verify=True, **kwargs):
+    def get_ondisk_files(self, files, datadir, verify=True, policy=None,
+                         **kwargs):
         """
         Given a simple list of files names, determine the files that constitute
         a valid fileset i.e. a set of files that defines the state of an
@@ -888,9 +942,13 @@ class BaseDiskFileManager(object):
         valid fileset, or None.
 
         :param files: a list of file names.
-        :param datadir: directory name files are from.
+        :param datadir: directory name files are from; this is used to
+                        construct file paths in the results, but the datadir is
+                        not modified by this method.
         :param verify: if True verify that the ondisk file contract has not
                        been violated, otherwise do not verify.
+        :param policy: storage policy used to store the files. Used to
+                       validate fragment indexes for EC policies.
         :returns: a dict that will contain keys:
                     ts_file   -> path to a .ts file or None
                     data_file -> path to a .data file or None
@@ -924,7 +982,7 @@ class BaseDiskFileManager(object):
         for afile in files:
             # Categorize files by extension
             try:
-                file_info = self.parse_on_disk_filename(afile)
+                file_info = self.parse_on_disk_filename(afile, policy)
                 file_info['filename'] = afile
                 exts[file_info['ext']].append(file_info)
             except DiskFileError as e:
@@ -960,12 +1018,12 @@ class BaseDiskFileManager(object):
                 # ctype_timestamp...
                 exts['.meta'][1:] = sorted(
                     exts['.meta'][1:],
-                    key=lambda info: info['ctype_timestamp'],
+                    key=lambda info: info['ctype_timestamp'] or 0,
                     reverse=True)
                 # ...and retain this IFF its ctype_timestamp is greater than
                 # newest meta file
-                if (exts['.meta'][1]['ctype_timestamp'] >
-                        exts['.meta'][0]['ctype_timestamp']):
+                if ((exts['.meta'][1]['ctype_timestamp'] or 0) >
+                        (exts['.meta'][0]['ctype_timestamp'] or 0)):
                     if (exts['.meta'][1]['timestamp'] ==
                             exts['.meta'][0]['timestamp']):
                         # both at same timestamp so retain only the one with
@@ -1050,8 +1108,14 @@ class BaseDiskFileManager(object):
             remove_file(join(hsh_path, results['ts_info']['filename']))
             files.remove(results.pop('ts_info')['filename'])
         for file_info in results.get('possible_reclaim', []):
-            # stray files are not deleted until reclaim-age
-            if is_reclaimable(file_info['timestamp']):
+            # stray files are not deleted until reclaim-age; non-durable data
+            # files are not deleted unless they were written before
+            # commit_window
+            filepath = join(hsh_path, file_info['filename'])
+            if (is_reclaimable(file_info['timestamp']) and
+                    (file_info.get('durable', True) or
+                     self.commit_window <= 0 or
+                     is_file_older(filepath, self.commit_window))):
                 results.setdefault('obsolete', []).append(file_info)
         for file_info in results.get('obsolete', []):
             remove_file(join(hsh_path, file_info['filename']))
@@ -1079,12 +1143,28 @@ class BaseDiskFileManager(object):
         """
         raise NotImplementedError
 
-    def _hash_suffix_dir(self, path):
+    def _hash_suffix_dir(self, path, policy):
         """
 
         :param path: full path to directory
+        :param policy: storage policy used
         """
-        hashes = defaultdict(hashlib.md5)
+        if six.PY2:
+            hashes = defaultdict(lambda: md5(usedforsecurity=False))
+        else:
+            class shim(object):
+                def __init__(self):
+                    self.md5 = md5(usedforsecurity=False)
+
+                def update(self, s):
+                    if isinstance(s, str):
+                        self.md5.update(s.encode('utf-8'))
+                    else:
+                        self.md5.update(s)
+
+                def hexdigest(self):
+                    return self.md5.hexdigest()
+            hashes = defaultdict(shim)
         try:
             path_contents = sorted(os.listdir(path))
         except OSError as err:
@@ -1094,17 +1174,43 @@ class BaseDiskFileManager(object):
         for hsh in path_contents:
             hsh_path = join(path, hsh)
             try:
-                ondisk_info = self.cleanup_ondisk_files(hsh_path)
+                ondisk_info = self.cleanup_ondisk_files(
+                    hsh_path, policy=policy)
             except OSError as err:
+                partition_path = dirname(path)
+                objects_path = dirname(partition_path)
+                device_path = dirname(objects_path)
                 if err.errno == errno.ENOTDIR:
-                    partition_path = dirname(path)
-                    objects_path = dirname(partition_path)
-                    device_path = dirname(objects_path)
-                    quar_path = quarantine_renamer(device_path, hsh_path)
+                    # The made-up filename is so that the eventual dirpath()
+                    # will result in this object directory that we care about.
+                    # Some failures will result in an object directory
+                    # becoming a file, thus causing the parent directory to
+                    # be qarantined.
+                    quar_path = quarantine_renamer(device_path,
+                                                   join(hsh_path,
+                                                        "made-up-filename"))
                     logging.exception(
-                        _('Quarantined %(hsh_path)s to %(quar_path)s because '
-                          'it is not a directory'), {'hsh_path': hsh_path,
-                                                     'quar_path': quar_path})
+                        'Quarantined %(hsh_path)s to %(quar_path)s because '
+                        'it is not a directory', {'hsh_path': hsh_path,
+                                                  'quar_path': quar_path})
+                    continue
+                elif err.errno == errno.ENODATA:
+                    try:
+                        # We've seen cases where bad sectors lead to ENODATA
+                        # here; use a similar hack as above
+                        quar_path = quarantine_renamer(
+                            device_path,
+                            join(hsh_path, "made-up-filename"))
+                        orig_path = hsh_path
+                    except (OSError, IOError):
+                        # We've *also* seen the bad sectors lead to us needing
+                        # to quarantine the whole suffix
+                        quar_path = quarantine_renamer(device_path, hsh_path)
+                        orig_path = path
+                    logging.exception(
+                        'Quarantined %(orig_path)s to %(quar_path)s because '
+                        'it could not be listed', {'orig_path': orig_path,
+                                                   'quar_path': quar_path})
                     continue
                 raise
             if not ondisk_info['files']:
@@ -1148,11 +1254,12 @@ class BaseDiskFileManager(object):
             raise PathNotDir()
         return hashes
 
-    def _hash_suffix(self, path):
+    def _hash_suffix(self, path, policy=None):
         """
         Performs reclamation and returns an md5 of all (remaining) files.
 
         :param path: full path to directory
+        :param policy: storage policy used to store the files
         :raises PathNotDir: if given path is not a valid directory
         :raises OSError: for non-ENOTDIR errors
         """
@@ -1224,16 +1331,19 @@ class BaseDiskFileManager(object):
             modified = True
             self.logger.debug('Run listdir on %s', partition_path)
         hashes.update((suffix, None) for suffix in recalculate)
-        for suffix, hash_ in hashes.items():
+        for suffix, hash_ in list(hashes.items()):
+            if suffix in ('valid', 'updated'):
+                continue
             if not hash_:
                 suffix_dir = join(partition_path, suffix)
                 try:
-                    hashes[suffix] = self._hash_suffix(suffix_dir)
+                    hashes[suffix] = self._hash_suffix(
+                        suffix_dir, policy=policy)
                     hashed += 1
                 except PathNotDir:
                     del hashes[suffix]
                 except OSError:
-                    logging.exception(_('Error hashing suffix'))
+                    logging.exception('Error hashing suffix')
                 modified = True
         if modified:
             with lock_path(partition_path):
@@ -1278,24 +1388,47 @@ class BaseDiskFileManager(object):
             return None
 
     @contextmanager
-    def replication_lock(self, device):
+    def replication_lock(self, device, policy, partition):
         """
-        A context manager that will lock on the device given, if
-        configured to do so.
+        A context manager that will lock on the partition and, if configured
+        to do so, on the device given.
 
         :param device: name of target device
+        :param policy: policy targeted by the replication request
+        :param partition: partition targeted by the replication request
         :raises ReplicationLockTimeout: If the lock on the device
             cannot be granted within the configured timeout.
         """
-        if self.replication_concurrency_per_device:
-            dev_path = self.get_dev_path(device)
-            with lock_path(
-                    dev_path,
-                    timeout=self.replication_lock_timeout,
-                    timeout_class=ReplicationLockTimeout,
-                    limit=self.replication_concurrency_per_device):
+        limit_time = time.time() + self.replication_lock_timeout
+        with self.partition_lock(device, policy, partition, name='replication',
+                                 timeout=self.replication_lock_timeout):
+            if self.replication_concurrency_per_device:
+                with lock_path(self.get_dev_path(device),
+                               timeout=limit_time - time.time(),
+                               timeout_class=ReplicationLockTimeout,
+                               limit=self.replication_concurrency_per_device):
+                    yield True
+            else:
                 yield True
-        else:
+
+    @contextmanager
+    def partition_lock(self, device, policy, partition, name=None,
+                       timeout=None):
+        """
+        A context manager that will lock on the partition given.
+
+        :param device: device targeted by the lock request
+        :param policy: policy targeted by the lock request
+        :param partition: partition targeted by the lock request
+        :raises PartitionLockTimeout: If the lock on the partition
+            cannot be granted within the configured timeout.
+        """
+        if timeout is None:
+            timeout = self.replication_lock_timeout
+        part_path = os.path.join(self.get_dev_path(device),
+                                 get_data_dir(policy), str(partition))
+        with lock_path(part_path, timeout=timeout,
+                       timeout_class=PartitionLockTimeout, limit=1, name=name):
             yield True
 
     def pickle_async_update(self, device, account, container, obj, data,
@@ -1343,8 +1476,7 @@ class BaseDiskFileManager(object):
         return self.diskfile_cls(self, dev_path,
                                  partition, account, container, obj,
                                  policy=policy, use_splice=self.use_splice,
-                                 pipe_size=self.pipe_size,
-                                 use_linkat=self.use_linkat, **kwargs)
+                                 pipe_size=self.pipe_size, **kwargs)
 
     def clear_auditor_status(self, policy, auditor_type="ALL"):
         datadir = get_data_dir(policy)
@@ -1377,21 +1509,22 @@ class BaseDiskFileManager(object):
             self, audit_location.path, dev_path,
             audit_location.partition, policy=audit_location.policy)
 
-    def get_diskfile_from_hash(self, device, partition, object_hash,
-                               policy, **kwargs):
+    def get_diskfile_and_filenames_from_hash(self, device, partition,
+                                             object_hash, policy, **kwargs):
         """
-        Returns a DiskFile instance for an object at the given
-        object_hash. Just in case someone thinks of refactoring, be
-        sure DiskFileDeleted is *not* raised, but the DiskFile
-        instance representing the tombstoned object is returned
-        instead.
+        Returns a tuple of (a DiskFile instance for an object at the given
+        object_hash, the basenames of the files in the object's hash dir).
+        Just in case someone thinks of refactoring, be sure DiskFileDeleted is
+        *not* raised, but the DiskFile instance representing the tombstoned
+        object is returned instead.
 
         :param device: name of target device
         :param partition: partition on the device in which the object lives
         :param object_hash: the hash of an object path
         :param policy: the StoragePolicy instance
         :raises DiskFileNotExist: if the object does not exist
-        :returns: an instance of BaseDiskFile
+        :returns: a tuple comprising (an instance of BaseDiskFile, a list of
+            file basenames)
         """
         dev_path = self.get_dev_path(device)
         if not dev_path:
@@ -1403,11 +1536,36 @@ class BaseDiskFileManager(object):
             filenames = self.cleanup_ondisk_files(object_path)['files']
         except OSError as err:
             if err.errno == errno.ENOTDIR:
-                quar_path = self.quarantine_renamer(dev_path, object_path)
+                # The made-up filename is so that the eventual dirpath()
+                # will result in this object directory that we care about.
+                # Some failures will result in an object directory
+                # becoming a file, thus causing the parent directory to
+                # be qarantined.
+                quar_path = self.quarantine_renamer(dev_path,
+                                                    join(object_path,
+                                                         "made-up-filename"))
                 logging.exception(
-                    _('Quarantined %(object_path)s to %(quar_path)s because '
-                      'it is not a directory'), {'object_path': object_path,
-                                                 'quar_path': quar_path})
+                    'Quarantined %(object_path)s to %(quar_path)s because '
+                    'it is not a directory', {'object_path': object_path,
+                                              'quar_path': quar_path})
+                raise DiskFileNotExist()
+            elif err.errno == errno.ENODATA:
+                try:
+                    # We've seen cases where bad sectors lead to ENODATA here;
+                    # use a similar hack as above
+                    quar_path = self.quarantine_renamer(
+                        dev_path,
+                        join(object_path, "made-up-filename"))
+                    orig_path = object_path
+                except (OSError, IOError):
+                    # We've *also* seen the bad sectors lead to us needing to
+                    # quarantine the whole suffix, not just the hash dir
+                    quar_path = self.quarantine_renamer(dev_path, object_path)
+                    orig_path = os.path.dirname(object_path)
+                logging.exception(
+                    'Quarantined %(orig_path)s to %(quar_path)s because '
+                    'it could not be listed', {'orig_path': orig_path,
+                                               'quar_path': quar_path})
                 raise DiskFileNotExist()
             if err.errno != errno.ENOENT:
                 raise
@@ -1423,27 +1581,55 @@ class BaseDiskFileManager(object):
                 metadata.get('name', ''), 3, 3, True)
         except ValueError:
             raise DiskFileNotExist()
-        return self.diskfile_cls(self, dev_path,
-                                 partition, account, container, obj,
-                                 policy=policy, **kwargs)
+        df = self.diskfile_cls(self, dev_path, partition, account, container,
+                               obj, policy=policy, **kwargs)
+        return df, filenames
 
-    def get_hashes(self, device, partition, suffixes, policy):
+    def get_diskfile_from_hash(self, device, partition, object_hash, policy,
+                               **kwargs):
+        """
+        Returns a DiskFile instance for an object at the given object_hash.
+        Just in case someone thinks of refactoring, be sure DiskFileDeleted is
+        *not* raised, but the DiskFile instance representing the tombstoned
+        object is returned instead.
+
+        :param device: name of target device
+        :param partition: partition on the device in which the object lives
+        :param object_hash: the hash of an object path
+        :param policy: the StoragePolicy instance
+        :raises DiskFileNotExist: if the object does not exist
+        :returns: an instance of BaseDiskFile
+        """
+        return self.get_diskfile_and_filenames_from_hash(
+            device, partition, object_hash, policy, **kwargs)[0]
+
+    def get_hashes(self, device, partition, suffixes, policy,
+                   skip_rehash=False):
         """
 
         :param device: name of target device
         :param partition: partition name
         :param suffixes: a list of suffix directories to be recalculated
         :param policy: the StoragePolicy instance
+        :param skip_rehash: just mark the suffixes dirty; return None
         :returns: a dictionary that maps suffix directories
         """
         dev_path = self.get_dev_path(device)
         if not dev_path:
             raise DiskFileDeviceUnavailable()
         partition_path = get_part_path(dev_path, policy, partition)
-        if not os.path.exists(partition_path):
-            mkdirs(partition_path)
-        _junk, hashes = tpool.execute(
-            self._get_hashes, device, partition, policy, recalculate=suffixes)
+        suffixes = [suf for suf in suffixes or [] if valid_suffix(suf)]
+
+        if skip_rehash:
+            for suffix in suffixes:
+                self.invalidate_hash(os.path.join(partition_path, suffix))
+            hashes = None
+        elif not os.path.exists(partition_path):
+            hashes = {}
+        else:
+            _junk, hashes = tpool.execute(
+                self._get_hashes, device, partition, policy,
+                recalculate=suffixes)
         return hashes
 
     def _listdir(self, path):
@@ -1497,6 +1683,7 @@ class BaseDiskFileManager(object):
         - ts_meta -> timestamp of meta file, if one exists
         - ts_ctype -> timestamp of meta file containing most recent
                       content-type value, if one exists
+        - durable -> True if data file at ts_data is durable, False otherwise
 
         where timestamps are instances of
         :class:`~swift.common.utils.Timestamp`
@@ -1513,44 +1700,48 @@ class BaseDiskFileManager(object):
         partition_path = get_part_path(dev_path, policy, partition)
         if suffixes is None:
             suffixes = self.yield_suffixes(device, partition, policy)
-            considering_all_suffixes = True
         else:
             suffixes = (
                 (os.path.join(partition_path, suffix), suffix)
                 for suffix in suffixes)
-            considering_all_suffixes = False
 
-        key_preference = (
+        # define keys that we need to extract the result from the on disk info
+        # data:
+        #   (x, y, z) -> result[x] should take the value of y[z]
+        key_map = (
             ('ts_meta', 'meta_info', 'timestamp'),
             ('ts_data', 'data_info', 'timestamp'),
             ('ts_data', 'ts_info', 'timestamp'),
             ('ts_ctype', 'ctype_info', 'ctype_timestamp'),
+            ('durable', 'data_info', 'durable'),
         )
 
-        # We delete as many empty directories as we can.
-        # cleanup_ondisk_files() takes care of the hash dirs, and we take
-        # care of the suffix dirs and possibly even the partition dir.
-        have_nonempty_suffix = False
+        # cleanup_ondisk_files() will remove empty hash dirs, and we'll
+        # invalidate any empty suffix dirs so they'll get cleaned up on
+        # the next rehash
         for suffix_path, suffix in suffixes:
-            have_nonempty_hashdir = False
+            found_files = False
             for object_hash in self._listdir(suffix_path):
                 object_path = os.path.join(suffix_path, object_hash)
                 try:
-                    results = self.cleanup_ondisk_files(
+                    diskfile_info = self.cleanup_ondisk_files(
                         object_path, **kwargs)
-                    if results['files']:
-                        have_nonempty_hashdir = True
-                    timestamps = {}
-                    for ts_key, info_key, info_ts_key in key_preference:
-                        if info_key not in results:
+                    if diskfile_info['files']:
+                        found_files = True
+                    result = {}
+                    for result_key, diskfile_info_key, info_key in key_map:
+                        if diskfile_info_key not in diskfile_info:
                             continue
-                        timestamps[ts_key] = results[info_key][info_ts_key]
-                    if 'ts_data' not in timestamps:
+                        info = diskfile_info[diskfile_info_key]
+                        if info_key in info:
+                            # durable key not returned from replicated Diskfile
+                            result[result_key] = info[info_key]
+                    if 'ts_data' not in result:
                         # file sets that do not include a .data or .ts
                         # file cannot be opened and therefore cannot
                         # be ssync'd
                         continue
-                    yield (object_hash, timestamps)
+                    yield object_hash, result
                 except AssertionError as err:
                     self.logger.debug('Invalid file set in %s (%s)' % (
                         object_path, err))
@@ -1559,36 +1750,8 @@ class BaseDiskFileManager(object):
                         'Invalid diskfile filename in %r (%s)' % (
                             object_path, err))
 
-            if have_nonempty_hashdir:
-                have_nonempty_suffix = True
-            else:
-                try:
-                    os.rmdir(suffix_path)
-                except OSError as err:
-                    if err.errno not in (errno.ENOENT, errno.ENOTEMPTY):
-                        self.logger.debug(
-                            'Error cleaning up empty suffix directory %s: %s',
-                            suffix_path, err)
-                    # cleanup_ondisk_files tries to remove empty hash dirs,
-                    # but if it fails, so will we. An empty directory
-                    # structure won't cause errors (just slowdown), so we
-                    # ignore the exception.
-        if considering_all_suffixes and not have_nonempty_suffix:
-            # There's nothing of interest in the partition, so delete it
-            try:
-                # Remove hashes.pkl *then* hashes.invalid; otherwise, if we
-                # remove hashes.invalid but leave hashes.pkl, that makes it
-                # look as though the invalidations in hashes.invalid never
-                # occurred.
-                _unlink_if_present(os.path.join(partition_path, HASH_FILE))
-                _unlink_if_present(os.path.join(partition_path,
-                                                HASH_INVALIDATIONS_FILE))
-                # This lock is only held by people dealing with the hashes
-                # or the hash invalidations, and we've just removed those.
-                _unlink_if_present(os.path.join(partition_path, ".lock"))
-                os.rmdir(partition_path)
-            except OSError as err:
-                self.logger.debug("Error cleaning up empty partition: %s", err)
+            if not found_files:
+                self.invalidate_hash(suffix_path)
 
 
 class BaseDiskFileWriter(object):
@@ -1619,13 +1782,15 @@ class BaseDiskFileWriter(object):
     :param next_part_power: the next partition power to be used
     """
 
-    def __init__(self, name, datadir, fd, tmppath, bytes_per_sync, diskfile,
+    def __init__(self, name, datadir, size, bytes_per_sync, diskfile,
                  next_part_power):
         # Parameter tracking
         self._name = name
         self._datadir = datadir
-        self._fd = fd
-        self._tmppath = tmppath
+        self._fd = None
+        self._tmppath = None
+        self._size = size
+        self._chunks_etag = md5(usedforsecurity=False)
         self._bytes_per_sync = bytes_per_sync
         self._diskfile = diskfile
         self.next_part_power = next_part_power
@@ -1641,8 +1806,71 @@ class BaseDiskFileWriter(object):
         return self._diskfile.manager
 
     @property
-    def put_succeeded(self):
-        return self._put_succeeded
+    def logger(self):
+        return self.manager.logger
+
+    def _get_tempfile(self):
+        tmppath = None
+        if self.manager.use_linkat:
+            self._dirs_created = makedirs_count(self._datadir)
+            try:
+                fd = os.open(self._datadir, O_TMPFILE | os.O_WRONLY)
+            except OSError as err:
+                if err.errno in (errno.EOPNOTSUPP, errno.EISDIR, errno.EINVAL):
+                    msg = 'open(%s, O_TMPFILE | O_WRONLY) failed: %s \
+                           Falling back to using mkstemp()' \
+                           % (self._datadir, os.strerror(err.errno))
+                    self.logger.debug(msg)
+                    self.manager.use_linkat = False
+                else:
+                    raise
+        if not self.manager.use_linkat:
+            tmpdir = join(self._diskfile._device_path,
+                          get_tmp_dir(self._diskfile.policy))
+            if not exists(tmpdir):
+                mkdirs(tmpdir)
+            fd, tmppath = mkstemp(dir=tmpdir)
+        return fd, tmppath
+
+    def open(self):
+        if self._fd is not None:
+            raise ValueError('DiskFileWriter is already open')
+
+        try:
+            self._fd, self._tmppath = self._get_tempfile()
+        except OSError as err:
+            if err.errno in (errno.ENOSPC, errno.EDQUOT):
+                # No more inodes in filesystem
+                raise DiskFileNoSpace()
+            raise
+        if self._size is not None and self._size > 0:
+            try:
+                fallocate(self._fd, self._size)
+            except OSError as err:
+                if err.errno in (errno.ENOSPC, errno.EDQUOT):
+                    raise DiskFileNoSpace()
+                raise
+        return self
+
+    def close(self):
+        if self._fd:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
+        if self._tmppath and not self._put_succeeded:
+            # Try removing the temp file only if put did NOT succeed.
+            #
+            # dfw.put_succeeded is set to True after renamer() succeeds in
+            # DiskFileWriter._finalize_put()
+            try:
+                # when mkstemp() was used
+                os.unlink(self._tmppath)
+            except OSError:
+                self.logger.exception('Error removing tempfile: %s' %
+                                      self._tmppath)
+            self._tmppath = None
 
     def write(self, chunk):
         """
@@ -1652,10 +1880,10 @@ class BaseDiskFileWriter(object):
         For this implementation, the data is written into a temporary file.
 
         :param chunk: the chunk of data to write as a string object
-
-        :returns: the total number of bytes written to an object
         """
-
+        if not self._fd:
+            raise ValueError('Writer is not open')
+        self._chunks_etag.update(chunk)
         while chunk:
             written = os.write(self._fd, chunk)
             self._upload_size += written
@@ -1668,9 +1896,18 @@ class BaseDiskFileWriter(object):
             drop_buffer_cache(self._fd, self._last_sync, diff)
             self._last_sync = self._upload_size
 
-        return self._upload_size
+    def chunks_finished(self):
+        """
+        Expose internal stats about written chunks.
 
-    def _finalize_put(self, metadata, target_path, cleanup):
+        :returns: a tuple, (upload_size, etag)
+        """
+        return self._upload_size, self._chunks_etag.hexdigest()
+
+    def _finalize_put(self, metadata, target_path, cleanup,
+                      logger_thread_locals):
+        if logger_thread_locals is not None:
+            self.logger.thread_locals = logger_thread_locals
         # Write the metadata before calling fsync() so that both data and
         # metadata are flushed to disk.
         write_metadata(self._fd, metadata)
@@ -1697,10 +1934,13 @@ class BaseDiskFileWriter(object):
         new_target_path = None
         if self.next_part_power:
             new_target_path = replace_partition_in_path(
-                target_path, self.next_part_power)
+                self.manager.devices, target_path, self.next_part_power)
             if target_path != new_target_path:
                 try:
                     fsync_dir(os.path.dirname(target_path))
+                    self.manager.logger.debug(
+                        'Relinking %s to %s due to next_part_power set',
+                        target_path, new_target_path)
                     relink_paths(target_path, new_target_path)
                 except OSError as exc:
                     self.manager.logger.exception(
@@ -1715,7 +1955,7 @@ class BaseDiskFileWriter(object):
             try:
                 self.manager.cleanup_ondisk_files(self._datadir)
             except OSError:
-                logging.exception(_('Problem cleaning up %s'), self._datadir)
+                logging.exception('Problem cleaning up %s', self._datadir)
 
             self._part_power_cleanup(target_path, new_target_path)
 
@@ -1744,7 +1984,9 @@ class BaseDiskFileWriter(object):
         metadata['name'] = self._name
         target_path = join(self._datadir, filename)
 
-        tpool.execute(self._finalize_put, metadata, target_path, cleanup)
+        tpool.execute(
+            self._finalize_put, metadata, target_path, cleanup,
+            logger_thread_locals=getattr(self.logger, 'thread_locals', None))
 
     def put(self, metadata):
         """
@@ -1788,19 +2030,19 @@ class BaseDiskFileWriter(object):
                 self.manager.cleanup_ondisk_files(new_target_dir)
             except OSError:
                 logging.exception(
-                    _('Problem cleaning up %s'), new_target_dir)
+                    'Problem cleaning up %s', new_target_dir)
 
         # Partition power has been increased, cleanup not yet finished
         else:
             prev_part_power = int(self.next_part_power) - 1
             old_target_path = replace_partition_in_path(
-                cur_path, prev_part_power)
+                self.manager.devices, cur_path, prev_part_power)
             old_target_dir = os.path.dirname(old_target_path)
             try:
                 self.manager.cleanup_ondisk_files(old_target_dir)
             except OSError:
                 logging.exception(
-                    _('Problem cleaning up %s'), old_target_dir)
+                    'Problem cleaning up %s', old_target_dir)
 
 
 class BaseDiskFileReader(object):
@@ -1873,7 +2115,7 @@ class BaseDiskFileReader(object):
     def _init_checks(self):
         if self._fp.tell() == 0:
             self._started_at_0 = True
-            self._iter_etag = hashlib.md5()
+            self._iter_etag = md5(usedforsecurity=False)
 
     def _update_checks(self, chunk):
         if self._iter_etag:
@@ -1888,7 +2130,15 @@ class BaseDiskFileReader(object):
             self._read_to_eof = False
             self._init_checks()
             while True:
-                chunk = self._fp.read(self._disk_chunk_size)
+                try:
+                    chunk = self._fp.read(self._disk_chunk_size)
+                except IOError as e:
+                    if e.errno == errno.EIO:
+                        # Note that if there's no quarantine hook set up,
+                        # this won't raise any exception
+                        self._quarantine(str(e))
+                    # ... so it's significant that this is not in an else
+                    raise
                 if chunk:
                     self._update_checks(chunk)
                     self._bytes_read += len(chunk)
@@ -2000,7 +2250,7 @@ class BaseDiskFileReader(object):
             # returning the correct value.
             if self._bytes_read > 0:
                 bin_checksum = os.read(md5_sockfd, 16)
-                hex_checksum = ''.join("%02x" % ord(c) for c in bin_checksum)
+                hex_checksum = binascii.hexlify(bin_checksum).decode('ascii')
             else:
                 hex_checksum = MD5_OF_EMPTY_STRING
             self._md5_of_sent_bytes = hex_checksum
@@ -2042,8 +2292,12 @@ class BaseDiskFileReader(object):
 
         """
         if not ranges:
-            yield ''
+            yield b''
         else:
+            if not isinstance(content_type, bytes):
+                content_type = content_type.encode('utf8')
+            if not isinstance(boundary, bytes):
+                boundary = boundary.encode('ascii')
             try:
                 self._suppress_file_closing = True
                 for chunk in multi_range_iterator(
@@ -2100,9 +2354,9 @@ class BaseDiskFileReader(object):
             except DiskFileQuarantined:
                 raise
             except (Exception, Timeout) as e:
-                self._logger.error(_(
+                self._logger.error(
                     'ERROR DiskFile %(data_file)s'
-                    ' close failure: %(exc)s : %(stack)s'),
+                    ' close failure: %(exc)s : %(stack)s',
                     {'exc': e, 'stack': ''.join(traceback.format_stack()),
                      'data_file': self._data_file})
             finally:
@@ -2137,7 +2391,6 @@ class BaseDiskFile(object):
     :param policy: the StoragePolicy instance
     :param use_splice: if true, use zero-copy splice() to send data
     :param pipe_size: size of pipe buffer used in zero-copy operations
-    :param use_linkat: if True, use open() with linkat() to create obj file
     :param open_expired: if True, open() will not raise a DiskFileExpired if
                          object is expired
     :param next_part_power: the next partition power to be used
@@ -2148,8 +2401,7 @@ class BaseDiskFile(object):
     def __init__(self, mgr, device_path, partition,
                  account=None, container=None, obj=None, _datadir=None,
                  policy=None, use_splice=False, pipe_size=None,
-                 use_linkat=False, open_expired=False, next_part_power=None,
-                 **kwargs):
+                 open_expired=False, next_part_power=None, **kwargs):
         self._manager = mgr
         self._device_path = device_path
         self._logger = mgr.logger
@@ -2157,7 +2409,6 @@ class BaseDiskFile(object):
         self._bytes_per_sync = mgr.bytes_per_sync
         self._use_splice = use_splice
         self._pipe_size = pipe_size
-        self._use_linkat = use_linkat
         self._open_expired = open_expired
         # This might look a lttle hacky i.e tracking number of newly created
         # dirs to fsync only those many later. If there is a better way,
@@ -2173,6 +2424,10 @@ class BaseDiskFile(object):
             self._account = account
             self._container = container
             self._obj = obj
+        elif account or container or obj:
+            raise ValueError(
+                'Received a/c/o args %r, %r, and %r. Either none or all must '
+                'be provided.' % (account, container, obj))
         else:
             # gets populated when we read the metadata
             self._name = None
@@ -2195,6 +2450,9 @@ class BaseDiskFile(object):
             self._datadir = join(
                 device_path, storage_directory(get_data_dir(policy),
                                                partition, name_hash))
+
+    def __repr__(self):
+        return '<%s datadir=%r>' % (self.__class__.__name__, self._datadir)
 
     @property
     def manager(self):
@@ -2266,7 +2524,7 @@ class BaseDiskFile(object):
 
     @classmethod
     def from_hash_dir(cls, mgr, hash_dir_path, device_path, partition, policy):
-        return cls(mgr, device_path, None, partition, _datadir=hash_dir_path,
+        return cls(mgr, device_path, partition, _datadir=hash_dir_path,
                    policy=policy)
 
     def open(self, modernize=False, current_time=None):
@@ -2310,6 +2568,20 @@ class BaseDiskFile(object):
                     # want this one file and not its parent.
                     os.path.join(self._datadir, "made-up-filename"),
                     "Expected directory, found file at %s" % self._datadir)
+            elif err.errno == errno.ENODATA:
+                try:
+                    # We've seen cases where bad sectors lead to ENODATA here
+                    raise self._quarantine(
+                        # similar hack to above
+                        os.path.join(self._datadir, "made-up-filename"),
+                        "Failed to list directory at %s" % self._datadir)
+                except (OSError, IOError):
+                    # We've *also* seen the bad sectors lead to us needing to
+                    # quarantine the whole suffix, not just the hash dir
+                    raise self._quarantine(
+                        # skip the above hack to rename the suffix
+                        self._datadir,
+                        "Failed to list directory at %s" % self._datadir)
             elif err.errno != errno.ENOENT:
                 raise DiskFileError(
                     "Error listing directory %s: %s" % (self._datadir, err))
@@ -2317,13 +2589,19 @@ class BaseDiskFile(object):
             files = []
 
         # gather info about the valid files to use to open the DiskFile
-        file_info = self._get_ondisk_files(files)
+        file_info = self._get_ondisk_files(files, self.policy)
 
         self._data_file = file_info.get('data_file')
         if not self._data_file:
             raise self._construct_exception_from_ts_file(**file_info)
-        self._fp = self._construct_from_data_file(
-            current_time=current_time, modernize=modernize, **file_info)
+        try:
+            self._fp = self._construct_from_data_file(
+                current_time=current_time, modernize=modernize, **file_info)
+        except IOError as e:
+            if e.errno == errno.ENODATA:
+                raise self._quarantine(
+                    file_info['data_file'],
+                    "Failed to open %s: %s" % (file_info['data_file'], e))
         # This method must populate the internal _metadata attribute.
         self._metadata = self._metadata or {}
         return self
@@ -2372,11 +2650,12 @@ class BaseDiskFile(object):
         self._logger.increment('quarantines')
         return DiskFileQuarantined(msg)
 
-    def _get_ondisk_files(self, files):
+    def _get_ondisk_files(self, files, policy=None):
         """
         Determine the on-disk files to use.
 
         :param files: a list of files in the object's dir
+        :param policy: storage policy used to store the files
         :returns: dict of files to use having keys 'data_file', 'ts_file',
                  'meta_file'
         """
@@ -2409,6 +2688,9 @@ class BaseDiskFile(object):
                 # tombstone's timestamp.
                 exc = DiskFileDeleted(metadata=metadata)
         return exc
+
+    def validate_metadata(self):
+        return ('Content-Length' in self._datafile_metadata)
 
     def _verify_name_matches_hash(self, data_file):
         """
@@ -2446,8 +2728,8 @@ class BaseDiskFile(object):
         else:
             if mname != self._name:
                 self._logger.error(
-                    _('Client path %(client)s does not match '
-                      'path stored in object metadata %(meta)s'),
+                    'Client path %(client)s does not match '
+                    'path stored in object metadata %(meta)s',
                     {'client': self._name, 'meta': mname})
                 raise DiskFileCollision('Client path does not match path '
                                         'stored in object metadata')
@@ -2528,9 +2810,9 @@ class BaseDiskFile(object):
         ctypefile_metadata = self._failsafe_read_metadata(
             ctype_file, ctype_file)
         if ('Content-Type' in ctypefile_metadata
-            and (ctypefile_metadata.get('Content-Type-Timestamp') >
-                 self._metafile_metadata.get('Content-Type-Timestamp'))
-            and (ctypefile_metadata.get('Content-Type-Timestamp') >
+            and (ctypefile_metadata.get('Content-Type-Timestamp', '') >
+                 self._metafile_metadata.get('Content-Type-Timestamp', ''))
+            and (ctypefile_metadata.get('Content-Type-Timestamp', '') >
                  self.data_timestamp)):
             self._metafile_metadata['Content-Type'] = \
                 ctypefile_metadata['Content-Type']
@@ -2687,27 +2969,10 @@ class BaseDiskFile(object):
         self._fp = None
         return dr
 
-    def _get_tempfile(self):
-        fallback_to_mkstemp = False
-        tmppath = None
-        if self._use_linkat:
-            self._dirs_created = makedirs_count(self._datadir)
-            try:
-                fd = os.open(self._datadir, O_TMPFILE | os.O_WRONLY)
-            except OSError as err:
-                if err.errno in (errno.EOPNOTSUPP, errno.EISDIR, errno.EINVAL):
-                    msg = 'open(%s, O_TMPFILE | O_WRONLY) failed: %s \
-                           Falling back to using mkstemp()' \
-                           % (self._datadir, os.strerror(err.errno))
-                    self._logger.warning(msg)
-                    fallback_to_mkstemp = True
-                else:
-                    raise
-        if not self._use_linkat or fallback_to_mkstemp:
-            if not exists(self._tmpdir):
-                mkdirs(self._tmpdir)
-            fd, tmppath = mkstemp(dir=self._tmpdir)
-        return fd, tmppath
+    def writer(self, size=None):
+        return self.writer_cls(self._name, self._datadir, size,
+                               self._bytes_per_sync, self,
+                               self.next_part_power)
 
     @contextmanager
     def create(self, size=None):
@@ -2725,44 +2990,11 @@ class BaseDiskFile(object):
                      disk
         :raises DiskFileNoSpace: if a size is specified and allocation fails
         """
+        dfw = self.writer(size)
         try:
-            fd, tmppath = self._get_tempfile()
-        except OSError as err:
-            if err.errno in (errno.ENOSPC, errno.EDQUOT):
-                # No more inodes in filesystem
-                raise DiskFileNoSpace()
-            raise
-        dfw = None
-        try:
-            if size is not None and size > 0:
-                try:
-                    fallocate(fd, size)
-                except OSError as err:
-                    if err.errno in (errno.ENOSPC, errno.EDQUOT):
-                        raise DiskFileNoSpace()
-                    raise
-            dfw = self.writer_cls(self._name, self._datadir, fd, tmppath,
-                                  bytes_per_sync=self._bytes_per_sync,
-                                  diskfile=self,
-                                  next_part_power=self.next_part_power)
-            yield dfw
+            yield dfw.open()
         finally:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-            if (dfw is None) or (not dfw.put_succeeded):
-                # Try removing the temp file only if put did NOT succeed.
-                #
-                # dfw.put_succeeded is set to True after renamer() succeeds in
-                # DiskFileWriter._finalize_put()
-                try:
-                    if tmppath:
-                        # when mkstemp() was used
-                        os.unlink(tmppath)
-                except OSError:
-                    self._logger.exception('Error removing tempfile: %s' %
-                                           tmppath)
+            dfw.close()
 
     def write_metadata(self, metadata):
         """
@@ -2821,14 +3053,15 @@ class DiskFile(BaseDiskFile):
     reader_cls = DiskFileReader
     writer_cls = DiskFileWriter
 
-    def _get_ondisk_files(self, files):
-        self._ondisk_info = self.manager.get_ondisk_files(files, self._datadir)
+    def _get_ondisk_files(self, files, policy=None):
+        self._ondisk_info = self.manager.get_ondisk_files(
+            files, self._datadir, policy=policy)
         return self._ondisk_info
 
 
-@DiskFileRouter.register(REPL_POLICY)
 class DiskFileManager(BaseDiskFileManager):
     diskfile_cls = DiskFile
+    policy = REPL_POLICY
 
     def _process_ondisk_files(self, exts, results, **kwargs):
         """
@@ -2872,16 +3105,17 @@ class DiskFileManager(BaseDiskFileManager):
             hashes[None].update(
                 file_info['timestamp'].internal + file_info['ext'])
 
-    def _hash_suffix(self, path):
+    def _hash_suffix(self, path, policy=None):
         """
         Performs reclamation and returns an md5 of all (remaining) files.
 
         :param path: full path to directory
+        :param policy: storage policy used to store the files
         :raises PathNotDir: if given path is not a valid directory
         :raises OSError: for non-ENOTDIR errors
         :returns: md5 of files in suffix
         """
-        hashes = self._hash_suffix_dir(path)
+        hashes = self._hash_suffix_dir(path, policy)
         return hashes[None].hexdigest()
 
 
@@ -2905,7 +3139,7 @@ class ECDiskFileReader(BaseDiskFileReader):
         # TODO: reset frag buf to '' if tell() shows that start is on a frag
         # boundary so that we check frags selected by a range not starting at 0
         if self._started_at_0:
-            self.frag_buf = ''
+            self.frag_buf = b''
         else:
             self.frag_buf = None
 
@@ -2917,8 +3151,8 @@ class ECDiskFileReader(BaseDiskFileReader):
             # format so for safety, check the input chunk if it's binary to
             # avoid quarantining a valid fragment archive.
             self._diskfile._logger.warn(
-                _('Unexpected fragment data type (not quarantined)'
-                  '%(datadir)s: %(type)s at offset 0x%(offset)x'),
+                'Unexpected fragment data type (not quarantined) '
+                '%(datadir)s: %(type)s at offset 0x%(offset)x',
                 {'datadir': self._diskfile._datadir,
                  'type': type(frag),
                  'offset': self.frag_offset})
@@ -2941,7 +3175,7 @@ class ECDiskFileReader(BaseDiskFileReader):
             raise DiskFileQuarantined(msg)
         except ECDriverError as err:
             self._diskfile._logger.warn(
-                _('Problem checking EC fragment %(datadir)s: %(err)s'),
+                'Problem checking EC fragment %(datadir)s: %(err)s',
                 {'datadir': self._diskfile._datadir, 'err': err})
 
     def _update_checks(self, chunk):
@@ -2963,14 +3197,16 @@ class ECDiskFileReader(BaseDiskFileReader):
 
 class ECDiskFileWriter(BaseDiskFileWriter):
 
-    def _finalize_durable(self, data_file_path, durable_data_file_path):
+    def _finalize_durable(self, data_file_path, durable_data_file_path,
+                          timestamp):
         exc = None
         new_data_file_path = new_durable_data_file_path = None
         if self.next_part_power:
             new_data_file_path = replace_partition_in_path(
-                data_file_path, self.next_part_power)
+                self.manager.devices, data_file_path, self.next_part_power)
             new_durable_data_file_path = replace_partition_in_path(
-                durable_data_file_path, self.next_part_power)
+                self.manager.devices, durable_data_file_path,
+                self.next_part_power)
         try:
             try:
                 os.rename(data_file_path, durable_data_file_path)
@@ -2987,12 +3223,27 @@ class ECDiskFileWriter(BaseDiskFileWriter):
                             exc)
 
             except (OSError, IOError) as err:
+                if err.errno == errno.ENOENT:
+                    files = os.listdir(self._datadir)
+                    results = self.manager.get_ondisk_files(
+                        files, self._datadir,
+                        frag_index=self._diskfile._frag_index,
+                        policy=self._diskfile.policy)
+                    # We "succeeded" if another writer cleaned up our data
+                    ts_info = results.get('ts_info')
+                    durables = results.get('durable_frag_set', [])
+                    if ts_info and ts_info['timestamp'] > timestamp:
+                        return
+                    elif any(frag['timestamp'] >= timestamp
+                             for frag in durables):
+                        return
+
                 if err.errno not in (errno.ENOSPC, errno.EDQUOT):
                     # re-raise to catch all handler
                     raise
                 params = {'file': durable_data_file_path, 'err': err}
                 self.manager.logger.exception(
-                    _('No space left on device for %(file)s (%(err)s)'),
+                    'No space left on device for %(file)s (%(err)s)',
                     params)
                 exc = DiskFileNoSpace(
                     'No space left on device for %(file)s (%(err)s)' % params)
@@ -3001,7 +3252,7 @@ class ECDiskFileWriter(BaseDiskFileWriter):
                     self.manager.cleanup_ondisk_files(self._datadir)
                 except OSError as os_err:
                     self.manager.logger.exception(
-                        _('Problem cleaning up %(datadir)s (%(err)s)'),
+                        'Problem cleaning up %(datadir)s (%(err)s)',
                         {'datadir': self._datadir, 'err': os_err})
                 self._part_power_cleanup(
                     durable_data_file_path, new_durable_data_file_path)
@@ -3009,7 +3260,7 @@ class ECDiskFileWriter(BaseDiskFileWriter):
         except Exception as err:
             params = {'file': durable_data_file_path, 'err': err}
             self.manager.logger.exception(
-                _('Problem making data file durable %(file)s (%(err)s)'),
+                'Problem making data file durable %(file)s (%(err)s)',
                 params)
             exc = DiskFileError(
                 'Problem making data file durable %(file)s (%(err)s)' % params)
@@ -3034,7 +3285,8 @@ class ECDiskFileWriter(BaseDiskFileWriter):
             self._datadir, self.manager.make_on_disk_filename(
                 timestamp, '.data', self._diskfile._frag_index, durable=True))
         tpool.execute(
-            self._finalize_durable, data_file_path, durable_data_file_path)
+            self._finalize_durable, data_file_path, durable_data_file_path,
+            timestamp)
 
     def put(self, metadata):
         """
@@ -3052,7 +3304,8 @@ class ECDiskFileWriter(BaseDiskFileWriter):
             # sure that the fragment index is included in object sysmeta.
             fi = metadata.setdefault('X-Object-Sysmeta-Ec-Frag-Index',
                                      self._diskfile._frag_index)
-            fi = self.manager.validate_fragment_index(fi)
+            fi = self.manager.validate_fragment_index(
+                fi, self._diskfile.policy)
             self._diskfile._frag_index = fi
             # defer cleanup until commit() writes makes diskfile durable
             cleanup = False
@@ -3069,7 +3322,8 @@ class ECDiskFile(BaseDiskFile):
         frag_index = kwargs.get('frag_index')
         self._frag_index = None
         if frag_index is not None:
-            self._frag_index = self.manager.validate_fragment_index(frag_index)
+            self._frag_index = self.manager.validate_fragment_index(
+                frag_index, self.policy)
         self._frag_prefs = self._validate_frag_prefs(kwargs.get('frag_prefs'))
         self._durable_frag_set = None
 
@@ -3106,6 +3360,17 @@ class ECDiskFile(BaseDiskFile):
             raise DiskFileError(
                 'Bad frag_prefs: %r: %s' % (frag_prefs, e))
 
+    def validate_metadata(self):
+        required_metadata = [
+            'Content-Length',
+            'X-Object-Sysmeta-Ec-Frag-Index',
+            'X-Object-Sysmeta-Ec-Etag',
+        ]
+        for header in required_metadata:
+            if not self._datafile_metadata.get(header):
+                return False
+        return True
+
     @property
     def durable_timestamp(self):
         """
@@ -3138,20 +3403,22 @@ class ECDiskFile(BaseDiskFile):
             return dict([(ts, [info['frag_index'] for info in frag_set])
                          for ts, frag_set in frag_sets.items()])
 
-    def _get_ondisk_files(self, files):
+    def _get_ondisk_files(self, files, policy=None):
         """
         The only difference between this method and the replication policy
         DiskFile method is passing in the frag_index and frag_prefs kwargs to
         our manager's get_ondisk_files method.
 
         :param files: list of file names
+        :param policy: storage policy used to store the files
         """
         self._ondisk_info = self.manager.get_ondisk_files(
             files, self._datadir, frag_index=self._frag_index,
-            frag_prefs=self._frag_prefs)
+            frag_prefs=self._frag_prefs, policy=policy)
         return self._ondisk_info
 
-    def purge(self, timestamp, frag_index):
+    def purge(self, timestamp, frag_index, nondurable_purge_delay=0,
+              meta_timestamp=None):
         """
         Remove a tombstone file matching the specified timestamp or
         datafile matching the specified timestamp and fragment index
@@ -3161,39 +3428,58 @@ class ECDiskFile(BaseDiskFile):
         remove a tombstone or fragment from a handoff node after
         reverting it to its primary node.
 
-        The hash will be invalidated, and if empty or invalid the
-        hsh_path will be removed on next cleanup_ondisk_files.
+        The hash will be invalidated, and if empty the hsh_path will
+        be removed immediately.
 
         :param timestamp: the object timestamp, an instance of
                           :class:`~swift.common.utils.Timestamp`
         :param frag_index: fragment archive index, must be
                            a whole number or None.
+        :param nondurable_purge_delay: only remove a non-durable data file if
+            it's been on disk longer than this many seconds.
+        :param meta_timestamp: if not None then remove any meta file with this
+            timestamp
         """
         purge_file = self.manager.make_on_disk_filename(
             timestamp, ext='.ts')
-        remove_file(os.path.join(self._datadir, purge_file))
+        purge_path = os.path.join(self._datadir, purge_file)
+        remove_file(purge_path)
+
+        if meta_timestamp is not None:
+            purge_file = self.manager.make_on_disk_filename(
+                meta_timestamp, ext='.meta')
+            purge_path = os.path.join(self._datadir, purge_file)
+            remove_file(purge_path)
+
         if frag_index is not None:
             # data file may or may not be durable so try removing both filename
             # possibilities
             purge_file = self.manager.make_on_disk_filename(
                 timestamp, ext='.data', frag_index=frag_index)
-            remove_file(os.path.join(self._datadir, purge_file))
+            purge_path = os.path.join(self._datadir, purge_file)
+            if is_file_older(purge_path, nondurable_purge_delay):
+                remove_file(purge_path)
+
             purge_file = self.manager.make_on_disk_filename(
                 timestamp, ext='.data', frag_index=frag_index, durable=True)
-            remove_file(os.path.join(self._datadir, purge_file))
+            purge_path = os.path.join(self._datadir, purge_file)
+            remove_file(purge_path)
+
+            remove_directory(self._datadir)
         self.manager.invalidate_hash(dirname(self._datadir))
 
 
-@DiskFileRouter.register(EC_POLICY)
 class ECDiskFileManager(BaseDiskFileManager):
     diskfile_cls = ECDiskFile
+    policy = EC_POLICY
 
-    def validate_fragment_index(self, frag_index):
+    def validate_fragment_index(self, frag_index, policy=None):
         """
         Return int representation of frag_index, or raise a DiskFileError if
         frag_index is not a whole number.
 
         :param frag_index: a fragment archive index
+        :param policy: storage policy used to validate the index against
         """
         try:
             frag_index = int(str(frag_index))
@@ -3203,6 +3489,11 @@ class ECDiskFileManager(BaseDiskFileManager):
         if frag_index < 0:
             raise DiskFileError(
                 'Fragment index must not be negative: %s' % frag_index)
+        if policy and frag_index >= policy.ec_ndata + policy.ec_nparity:
+            msg = 'Fragment index must be less than %d for a %d+%d policy: %s'
+            raise DiskFileError(msg % (
+                policy.ec_ndata + policy.ec_nparity,
+                policy.ec_ndata, policy.ec_nparity, frag_index))
         return frag_index
 
     def make_on_disk_filename(self, timestamp, ext=None, frag_index=None,
@@ -3235,11 +3526,11 @@ class ECDiskFileManager(BaseDiskFileManager):
         return super(ECDiskFileManager, self).make_on_disk_filename(
             timestamp, ext, ctype_timestamp, *a, **kw)
 
-    def parse_on_disk_filename(self, filename):
+    def parse_on_disk_filename(self, filename, policy):
         """
         Returns timestamp(s) and other info extracted from a policy specific
         file name. For EC policy the data file name includes a fragment index
-        and possibly a durable marker, both of which which must be stripped off
+        and possibly a durable marker, both of which must be stripped off
         to retrieve the timestamp.
 
         :param filename: the file name including extension
@@ -3274,7 +3565,7 @@ class ECDiskFileManager(BaseDiskFileManager):
             except IndexError:
                 # expect validate_fragment_index raise DiskFileError
                 pass
-            frag_index = self.validate_fragment_index(frag_index)
+            frag_index = self.validate_fragment_index(frag_index, policy)
             try:
                 durable = parts[2] == 'd'
             except IndexError:
@@ -3286,7 +3577,8 @@ class ECDiskFileManager(BaseDiskFileManager):
                 'ctype_timestamp': None,
                 'durable': durable
             }
-        rv = super(ECDiskFileManager, self).parse_on_disk_filename(filename)
+        rv = super(ECDiskFileManager, self).parse_on_disk_filename(
+            filename, policy)
         rv['frag_index'] = None
         return rv
 
@@ -3367,6 +3659,11 @@ class ECDiskFileManager(BaseDiskFileManager):
                     break
             if durable_info and durable_info['timestamp'] == timestamp:
                 durable_frag_set = frag_set
+                # a data frag filename may not have the #d part if durability
+                # is defined by a legacy .durable, so always mark all data
+                # frags as durable here
+                for frag in frag_set:
+                    frag['durable'] = True
                 break  # ignore frags that are older than durable timestamp
 
         # Choose which frag set to use
@@ -3444,7 +3741,8 @@ class ECDiskFileManager(BaseDiskFileManager):
             results.setdefault('obsolete', []).extend(exts['.durable'])
             exts.pop('.durable')
 
-        # Fragments *may* be ready for reclaim, unless they are durable
+        # Fragments *may* be ready for reclaim, unless they are most recent
+        # durable
         for frag_set in frag_sets.values():
             if frag_set in (durable_frag_set, chosen_frag_set):
                 continue
@@ -3507,11 +3805,12 @@ class ECDiskFileManager(BaseDiskFileManager):
             file_info = ondisk_info['durable_frag_set'][0]
             hashes[None].update(file_info['timestamp'].internal + '.durable')
 
-    def _hash_suffix(self, path):
+    def _hash_suffix(self, path, policy=None):
         """
         Performs reclamation and returns an md5 of all (remaining) files.
 
         :param path: full path to directory
+        :param policy: storage policy used to store the files
         :raises PathNotDir: if given path is not a valid directory
         :raises OSError: for non-ENOTDIR errors
         :returns: dict of md5 hex digests
@@ -3520,5 +3819,5 @@ class ECDiskFileManager(BaseDiskFileManager):
         # here we flatten out the hashers hexdigest into a dictionary instead
         # of just returning the one hexdigest for the whole suffix
 
-        hash_per_fi = self._hash_suffix_dir(path)
+        hash_per_fi = self._hash_suffix_dir(path, policy)
         return dict((fi, md5.hexdigest()) for fi, md5 in hash_per_fi.items())

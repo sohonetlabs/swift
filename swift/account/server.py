@@ -13,10 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import time
 import traceback
-from swift import gettext_ as _
 
 from eventlet import Timeout
 
@@ -25,11 +25,14 @@ from swift.account.backend import AccountBroker, DATADIR
 from swift.account.utils import account_listing_response, get_response_headers
 from swift.common.db import DatabaseConnectionError, DatabaseAlreadyExists
 from swift.common.request_helpers import get_param, \
-    split_and_validate_path
+    split_and_validate_path, validate_internal_account, \
+    validate_internal_container, constrain_req_limit
 from swift.common.utils import get_logger, hash_path, public, \
     Timestamp, storage_directory, config_true_value, \
-    json, timing_stats, replication, get_log_line
-from swift.common.constraints import valid_timestamp, check_utf8, check_drive
+    timing_stats, replication, get_log_line, \
+    config_fallocate_value, fs_has_free_space
+from swift.common.constraints import valid_timestamp, check_utf8, \
+    check_drive, AUTO_CREATE_ACCOUNT_PREFIX
 from swift.common import constraints
 from swift.common.db_replicator import ReplicatorRpc
 from swift.common.base_storage_server import BaseStorageServer
@@ -38,8 +41,34 @@ from swift.common.swob import HTTPAccepted, HTTPBadRequest, \
     HTTPCreated, HTTPForbidden, HTTPInternalServerError, \
     HTTPMethodNotAllowed, HTTPNoContent, HTTPNotFound, \
     HTTPPreconditionFailed, HTTPConflict, Request, \
-    HTTPInsufficientStorage, HTTPException
+    HTTPInsufficientStorage, HTTPException, wsgi_to_str
 from swift.common.request_helpers import is_sys_or_user_meta
+
+
+def get_account_name_and_placement(req):
+    """
+    Split and validate path for an account.
+
+    :param req: a swob request
+
+    :returns: a tuple of path parts as strings
+    """
+    drive, part, account = split_and_validate_path(req, 3)
+    validate_internal_account(account)
+    return drive, part, account
+
+
+def get_container_name_and_placement(req):
+    """
+    Split and validate path for a container.
+
+    :param req: a swob request
+
+    :returns: a tuple of path parts as strings
+    """
+    drive, part, account, container = split_and_validate_path(req, 3, 4)
+    validate_internal_container(account, container)
+    return drive, part, account, container
 
 
 class AccountController(BaseStorageServer):
@@ -56,10 +85,24 @@ class AccountController(BaseStorageServer):
         self.replicator_rpc = ReplicatorRpc(self.root, DATADIR, AccountBroker,
                                             self.mount_check,
                                             logger=self.logger)
-        self.auto_create_account_prefix = \
-            conf.get('auto_create_account_prefix') or '.'
+        if conf.get('auto_create_account_prefix'):
+            self.logger.warning('Option auto_create_account_prefix is '
+                                'deprecated. Configure '
+                                'auto_create_account_prefix under the '
+                                'swift-constraints section of '
+                                'swift.conf. This option will '
+                                'be ignored in a future release.')
+            self.auto_create_account_prefix = \
+                conf['auto_create_account_prefix']
+        else:
+            self.auto_create_account_prefix = AUTO_CREATE_ACCOUNT_PREFIX
+
         swift.common.db.DB_PREALLOCATION = \
             config_true_value(conf.get('db_preallocation', 'f'))
+        swift.common.db.QUERY_LOGGING = \
+            config_true_value(conf.get('db_query_logging', 'f'))
+        self.fallocate_reserve, self.fallocate_is_percent = \
+            config_fallocate_value(conf.get('fallocate_reserve', '1%'))
 
     def _get_account_broker(self, drive, part, account, **kwargs):
         hsh = hash_path(account)
@@ -83,11 +126,16 @@ class AccountController(BaseStorageServer):
             pass
         return resp(request=req, headers=headers, charset='utf-8', body=body)
 
+    def check_free_space(self, drive):
+        drive_root = os.path.join(self.root, drive)
+        return fs_has_free_space(
+            drive_root, self.fallocate_reserve, self.fallocate_is_percent)
+
     @public
     @timing_stats()
     def DELETE(self, req):
         """Handle HTTP DELETE request."""
-        drive, part, account = split_and_validate_path(req, 3)
+        drive, part, account = get_account_name_and_placement(req)
         try:
             check_drive(self.root, drive, self.mount_check)
         except ValueError:
@@ -99,14 +147,24 @@ class AccountController(BaseStorageServer):
         broker.delete_db(req_timestamp.internal)
         return self._deleted_response(broker, req, HTTPNoContent)
 
+    def _update_metadata(self, req, broker, req_timestamp):
+        metadata = {
+            wsgi_to_str(key): (wsgi_to_str(value), req_timestamp.internal)
+            for key, value in req.headers.items()
+            if is_sys_or_user_meta('account', key)}
+        if metadata:
+            broker.update_metadata(metadata, validate_metadata=True)
+
     @public
     @timing_stats()
     def PUT(self, req):
         """Handle HTTP PUT request."""
-        drive, part, account, container = split_and_validate_path(req, 3, 4)
+        drive, part, account, container = get_container_name_and_placement(req)
         try:
             check_drive(self.root, drive, self.mount_check)
         except ValueError:
+            return HTTPInsufficientStorage(drive=drive, request=req)
+        if not self.check_free_space(drive):
             return HTTPInsufficientStorage(drive=drive, request=req)
         if container:   # put account container
             if 'x-timestamp' not in req.headers:
@@ -126,8 +184,9 @@ class AccountController(BaseStorageServer):
                     broker.initialize(timestamp.internal)
                 except DatabaseAlreadyExists:
                     pass
-            if req.headers.get('x-account-override-deleted', 'no').lower() != \
-                    'yes' and broker.is_deleted():
+            if (req.headers.get('x-account-override-deleted', 'no').lower() !=
+                    'yes' and broker.is_deleted()) \
+                    or not os.path.exists(broker.db_file):
                 return HTTPNotFound(request=req)
             broker.put_container(container, req.headers['x-put-timestamp'],
                                  req.headers['x-delete-timestamp'],
@@ -156,12 +215,7 @@ class AccountController(BaseStorageServer):
                 broker.update_put_timestamp(timestamp.internal)
                 if broker.is_deleted():
                     return HTTPConflict(request=req)
-            metadata = {}
-            metadata.update((key, (value, timestamp.internal))
-                            for key, value in req.headers.items()
-                            if is_sys_or_user_meta('account', key))
-            if metadata:
-                broker.update_metadata(metadata, validate_metadata=True)
+            self._update_metadata(req, broker, timestamp)
             if created:
                 return HTTPCreated(request=req)
             else:
@@ -171,7 +225,7 @@ class AccountController(BaseStorageServer):
     @timing_stats()
     def HEAD(self, req):
         """Handle HTTP HEAD request."""
-        drive, part, account = split_and_validate_path(req, 3)
+        drive, part, account = get_account_name_and_placement(req)
         out_content_type = listing_formats.get_listing_content_type(req)
         try:
             check_drive(self.root, drive, self.mount_check)
@@ -190,22 +244,11 @@ class AccountController(BaseStorageServer):
     @timing_stats()
     def GET(self, req):
         """Handle HTTP GET request."""
-        drive, part, account = split_and_validate_path(req, 3)
+        drive, part, account = get_account_name_and_placement(req)
         prefix = get_param(req, 'prefix')
         delimiter = get_param(req, 'delimiter')
-        if delimiter and (len(delimiter) > 1 or ord(delimiter) > 254):
-            # delimiters can be made more flexible later
-            return HTTPPreconditionFailed(body='Bad delimiter')
-        limit = constraints.ACCOUNT_LISTING_LIMIT
-        given_limit = get_param(req, 'limit')
         reverse = config_true_value(get_param(req, 'reverse'))
-        if given_limit and given_limit.isdigit():
-            limit = int(given_limit)
-            if limit > constraints.ACCOUNT_LISTING_LIMIT:
-                return HTTPPreconditionFailed(
-                    request=req,
-                    body='Maximum limit is %d' %
-                    constraints.ACCOUNT_LISTING_LIMIT)
+        limit = constrain_req_limit(req, constraints.ACCOUNT_LISTING_LIMIT)
         marker = get_param(req, 'marker', '')
         end_marker = get_param(req, 'end_marker')
         out_content_type = listing_formats.get_listing_content_type(req)
@@ -237,6 +280,8 @@ class AccountController(BaseStorageServer):
             check_drive(self.root, drive, self.mount_check)
         except ValueError:
             return HTTPInsufficientStorage(drive=drive, request=req)
+        if not self.check_free_space(drive):
+            return HTTPInsufficientStorage(drive=drive, request=req)
         try:
             args = json.load(req.environ['wsgi.input'])
         except ValueError as err:
@@ -249,29 +294,26 @@ class AccountController(BaseStorageServer):
     @timing_stats()
     def POST(self, req):
         """Handle HTTP POST request."""
-        drive, part, account = split_and_validate_path(req, 3)
+        drive, part, account = get_account_name_and_placement(req)
         req_timestamp = valid_timestamp(req)
         try:
             check_drive(self.root, drive, self.mount_check)
         except ValueError:
             return HTTPInsufficientStorage(drive=drive, request=req)
+        if not self.check_free_space(drive):
+            return HTTPInsufficientStorage(drive=drive, request=req)
         broker = self._get_account_broker(drive, part, account)
         if broker.is_deleted():
             return self._deleted_response(broker, req, HTTPNotFound)
-        metadata = {}
-        metadata.update((key, (value, req_timestamp.internal))
-                        for key, value in req.headers.items()
-                        if is_sys_or_user_meta('account', key))
-        if metadata:
-            broker.update_metadata(metadata, validate_metadata=True)
+        self._update_metadata(req, broker, req_timestamp)
         return HTTPNoContent(request=req)
 
     def __call__(self, env, start_response):
         start_time = time.time()
         req = Request(env)
         self.logger.txn_id = req.headers.get('x-trans-id', None)
-        if not check_utf8(req.path_info):
-            res = HTTPPreconditionFailed(body='Invalid UTF8 or contains NULL')
+        if not check_utf8(wsgi_to_str(req.path_info), internal=True):
+            res = HTTPPreconditionFailed(body='Invalid UTF8')
         else:
             try:
                 # disallow methods which are not publicly accessible
@@ -282,8 +324,8 @@ class AccountController(BaseStorageServer):
             except HTTPException as error_response:
                 res = error_response
             except (Exception, Timeout):
-                self.logger.exception(_('ERROR __call__ error with %(method)s'
-                                        ' %(path)s '),
+                self.logger.exception('ERROR __call__ error with %(method)s'
+                                      ' %(path)s ',
                                       {'method': req.method, 'path': req.path})
                 res = HTTPInternalServerError(body=traceback.format_exc())
         if self.log_requests:
@@ -292,7 +334,9 @@ class AccountController(BaseStorageServer):
             if res.headers.get('x-container-timestamp') is not None:
                 additional_info += 'x-container-timestamp: %s' % \
                     res.headers['x-container-timestamp']
-            log_msg = get_log_line(req, res, trans_time, additional_info)
+            log_msg = get_log_line(req, res, trans_time, additional_info,
+                                   self.log_format, self.anonymization_method,
+                                   self.anonymization_salt)
             if req.method.upper() == 'REPLICATE':
                 self.logger.debug(log_msg)
             else:

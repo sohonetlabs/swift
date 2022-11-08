@@ -15,18 +15,18 @@
 
 """ In-Memory Disk File Interface for Swift Object Server"""
 
+import io
 import time
-import hashlib
 from contextlib import contextmanager
 
 from eventlet import Timeout
-from six import moves
 
 from swift.common.utils import Timestamp
 from swift.common.exceptions import DiskFileQuarantined, DiskFileNotExist, \
     DiskFileCollision, DiskFileDeleted, DiskFileNotOpen
 from swift.common.request_helpers import is_sys_meta
 from swift.common.swob import multi_range_iterator
+from swift.common.utils import md5
 from swift.obj.diskfile import DATAFILE_SYSTEM_META, RESERVED_DATAFILE_META
 
 
@@ -35,7 +35,7 @@ class InMemoryFileSystem(object):
     A very simplistic in-memory file system scheme.
 
     There is one dictionary mapping a given object name to a tuple. The first
-    entry in the tuple is the cStringIO buffer representing the file contents,
+    entry in the tuple is the BytesIO buffer representing the file contents,
     the second entry is the metadata dictionary.
     """
 
@@ -47,7 +47,7 @@ class InMemoryFileSystem(object):
         Return back an file-like object and its metadata
 
         :param name: standard object name
-        :return: (fp, metadata) fp is `StringIO` in-memory representation
+        :return: (fp, metadata) fp is ``BytesIO`` in-memory representation
                                 object (or None). metadata is a dictionary
                                 of metadata (or None)
         """
@@ -63,7 +63,7 @@ class InMemoryFileSystem(object):
         Store object into memory
 
         :param name: standard object name
-        :param fp: `StringIO` in-memory representation object
+        :param fp: ``BytesIO`` in-memory representation object
         :param metadata: dictionary of metadata to be written
         """
         self._filesystem[name] = (fp, metadata)
@@ -97,28 +97,54 @@ class DiskFileWriter(object):
 
     :param fs: internal file system object to use
     :param name: standard object name
-    :param fp: `StringIO` in-memory representation object
     """
-    def __init__(self, fs, name, fp):
+    def __init__(self, fs, name):
         self._filesystem = fs
         self._name = name
-        self._fp = fp
+        self._fp = None
         self._upload_size = 0
+        self._chunks_etag = md5(usedforsecurity=False)
+
+    def open(self):
+        """
+        Prepare to accept writes.
+
+        Create a new ``BytesIO`` object for a started-but-not-yet-finished
+        PUT.
+        """
+        self._fp = io.BytesIO()
+        return self
+
+    def close(self):
+        """
+        Clean up resources following an ``open()``.
+
+        Note: If ``put()`` has not been called, the data written will be lost.
+        """
+        self._fp = None
 
     def write(self, chunk):
         """
-        Write a chunk of data into the `StringIO` object.
+        Write a chunk of data into the ``BytesIO`` object.
 
         :param chunk: the chunk of data to write as a string object
         """
         self._fp.write(chunk)
         self._upload_size += len(chunk)
-        return self._upload_size
+        self._chunks_etag.update(chunk)
+
+    def chunks_finished(self):
+        """
+        Expose internal stats about written chunks.
+
+        :returns: a tuple, (upload_size, etag)
+        """
+        return self._upload_size, self._chunks_etag.hexdigest()
 
     def put(self, metadata):
         """
         Make the final association in the in-memory file system for this name
-        with the `StringIO` object.
+        with the ``BytesIO`` object.
 
         :param metadata: dictionary of metadata to be written
         """
@@ -171,7 +197,7 @@ class DiskFileReader(object):
             self._read_to_eof = False
             if self._fp.tell() == 0:
                 self._started_at_0 = True
-                self._iter_etag = hashlib.md5()
+                self._iter_etag = md5(usedforsecurity=False)
             while True:
                 chunk = self._fp.read()
                 if chunk:
@@ -386,6 +412,9 @@ class DiskFile(object):
             raise DiskFileNotOpen()
         return self._metadata
 
+    get_datafile_metadata = get_metadata
+    get_metafile_metadata = get_metadata
+
     def read_metadata(self, current_time=None):
         """
         Return the metadata for an object.
@@ -413,6 +442,9 @@ class DiskFile(object):
         self._fp = None
         return dr
 
+    def writer(self, size=None):
+        return DiskFileWriter(self._filesystem, self._name)
+
     @contextmanager
     def create(self, size=None):
         """
@@ -423,11 +455,11 @@ class DiskFile(object):
                      disk
         :raises DiskFileNoSpace: if a size is specified and allocation fails
         """
-        fp = moves.cStringIO()
+        writer = self.writer(size)
         try:
-            yield DiskFileWriter(self._filesystem, self._name, fp)
+            yield writer.open()
         finally:
-            del fp
+            writer.close()
 
     def write_metadata(self, metadata):
         """

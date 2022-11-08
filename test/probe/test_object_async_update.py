@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from io import StringIO
+from io import BytesIO
 from unittest import main, SkipTest
 from uuid import uuid4
 
@@ -23,6 +23,7 @@ from swiftclient.exceptions import ClientException
 
 from swift.common import direct_client
 from swift.common.manager import Manager
+from swift.common.swob import normalize_etag
 from test.probe.common import kill_nonprimary_server, \
     kill_server, ReplProbeTest, start_server, ECProbeTest
 
@@ -82,7 +83,7 @@ class TestObjectAsyncUpdate(ReplProbeTest):
             self.assertEqual(err.http_status, 503)
 
         # Assert handoff device has a container replica
-        another_cnode = self.container_ring.get_more_nodes(cpart).next()
+        another_cnode = next(self.container_ring.get_more_nodes(cpart))
         direct_client.direct_get_container(
             another_cnode, cpart, self.account, container)
 
@@ -143,7 +144,7 @@ class TestUpdateOverrides(ReplProbeTest):
                                       self.policy.name})
 
         int_client.upload_object(
-            StringIO(u'stuff'), self.account, 'c1', 'o1', headers)
+            BytesIO(b'stuff'), self.account, 'c1', 'o1', headers)
 
         # Run the object-updaters to be sure updates are done
         Manager(['object-updater']).once()
@@ -210,7 +211,7 @@ class TestUpdateOverridesEC(ECProbeTest):
         self.assertEqual(1, len(listing))
         self.assertEqual('o1', listing[0]['name'])
         self.assertEqual(len(content), listing[0]['bytes'])
-        self.assertEqual(meta['etag'], listing[0]['hash'])
+        self.assertEqual(normalize_etag(meta['etag']), listing[0]['hash'])
         self.assertEqual('test/ctype', listing[0]['content_type'])
 
     def test_update_during_POST_only(self):
@@ -261,7 +262,7 @@ class TestUpdateOverridesEC(ECProbeTest):
         self.assertEqual(1, len(listing))
         self.assertEqual('o1', listing[0]['name'])
         self.assertEqual(len(content), listing[0]['bytes'])
-        self.assertEqual(meta['etag'], listing[0]['hash'])
+        self.assertEqual(normalize_etag(meta['etag']), listing[0]['hash'])
         self.assertEqual('test/ctype', listing[0]['content_type'])
 
         # Run the object-updaters to send the async pending from the PUT
@@ -328,7 +329,7 @@ class TestUpdateOverridesEC(ECProbeTest):
         self.assertEqual(1, len(listing))
         self.assertEqual('o1', listing[0]['name'])
         self.assertEqual(len(content), listing[0]['bytes'])
-        self.assertEqual(meta['etag'], listing[0]['hash'])
+        self.assertEqual(normalize_etag(meta['etag']), listing[0]['hash'])
         self.assertEqual('test/ctype', listing[0]['content_type'])
 
 

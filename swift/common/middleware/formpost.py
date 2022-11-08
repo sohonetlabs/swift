@@ -38,6 +38,16 @@ form input::
     <input type="hidden" name="x_delete_at" value="<unix-timestamp>" />
     <input type="hidden" name="x_delete_after" value="<seconds>" />
 
+If you want to specify the content type or content encoding of the files you
+can set content-encoding or content-type by adding them to the form input::
+
+    <input type="hidden" name="content-type" value="text/html" />
+    <input type="hidden" name="content-encoding" value="gzip" />
+
+The above example applies these parameters to all uploaded files. You can also
+set the content-type and content-encoding on a per-file basis by adding the
+parameters to each part of the upload.
+
 The <swift-url> is the URL of the Swift destination, such as::
 
     https://swift-cluster.example.com/v1/AUTH_account/container/object_prefix
@@ -74,11 +84,11 @@ desired.
 The expires attribute is the Unix timestamp before which the form
 must be submitted before it is invalidated.
 
-The signature attribute is the HMAC-SHA1 signature of the form. Here is
+The signature attribute is the HMAC signature of the form. Here is
 sample code for computing the signature::
 
     import hmac
-    from hashlib import sha1
+    from hashlib import sha512
     from time import time
     path = '/v1/account/container/object_prefix'
     redirect = 'https://srv.com/some-page'  # set to '' if redirect not in form
@@ -88,7 +98,7 @@ sample code for computing the signature::
     key = 'mykey'
     hmac_body = '%s\n%s\n%s\n%s\n%s' % (path, redirect,
         max_file_size, max_file_count, expires)
-    signature = hmac.new(key, hmac_body, sha1).hexdigest()
+    signature = hmac.new(key, hmac_body, sha512).hexdigest()
 
 The key is the value of either the account (X-Account-Meta-Temp-URL-Key,
 X-Account-Meta-Temp-Url-Key-2) or the container
@@ -113,17 +123,24 @@ the file are simply ignored).
 __all__ = ['FormPost', 'filter_factory', 'READ_CHUNK_SIZE', 'MAX_VALUE_LENGTH']
 
 import hmac
-from hashlib import sha1
+import hashlib
 from time import time
 
+import six
 from six.moves.urllib.parse import quote
+
+from swift.common.constraints import valid_api_version
 from swift.common.exceptions import MimeInvalid
 from swift.common.middleware.tempurl import get_tempurl_keys_from_metadata
-from swift.common.utils import streq_const_time, register_swift_info, \
-    parse_content_disposition, parse_mime_headers, \
-    iter_multipart_mime_documents, reiterate, close_if_possible
+from swift.common.digest import get_allowed_digests, \
+    extract_digest_and_algorithm, DEFAULT_ALLOWED_DIGESTS
+from swift.common.utils import streq_const_time, parse_content_disposition, \
+    parse_mime_headers, iter_multipart_mime_documents, reiterate, \
+    closing_if_possible, get_logger
+from swift.common.registry import register_swift_info
 from swift.common.wsgi import make_pre_authed_env
-from swift.common.swob import HTTPUnauthorized
+from swift.common.swob import HTTPUnauthorized, wsgi_to_str, str_to_wsgi
+from swift.common.http import is_success
 from swift.proxy.controllers.base import get_account_info, get_container_info
 
 
@@ -191,11 +208,17 @@ class FormPost(object):
     :param conf: The configuration dict for the middleware.
     """
 
-    def __init__(self, app, conf):
+    def __init__(self, app, conf, logger=None):
         #: The next WSGI application/filter in the paste.deploy pipeline.
         self.app = app
         #: The filter configuration dict.
         self.conf = conf
+        self.logger = logger or get_logger(conf, log_route='formpost')
+        # Defaulting to SUPPORTED_DIGESTS just so we don't completely
+        # deprecate sha1 yet. We'll change this to DEFAULT_ALLOWED_DIGESTS
+        # later.
+        self.allowed_digests = conf.get(
+            'allowed_digests', DEFAULT_ALLOWED_DIGESTS.split())
 
     def __call__(self, env, start_response):
         """
@@ -219,7 +242,7 @@ class FormPost(object):
                     start_response(status, headers)
                     return [body]
             except MimeInvalid:
-                body = 'FormPost: invalid starting boundary'
+                body = b'FormPost: invalid starting boundary'
                 start_response(
                     '400 Bad Request',
                     (('Content-Type', 'text/plain'),
@@ -227,6 +250,8 @@ class FormPost(object):
                 return [body]
             except (FormInvalid, EOFError) as err:
                 body = 'FormPost: %s' % err
+                if six.PY3:
+                    body = body.encode('utf-8')
                 start_response(
                     '400 Bad Request',
                     (('Content-Type', 'text/plain'),
@@ -248,9 +273,13 @@ class FormPost(object):
         :returns: status_line, headers_list, body
         """
         keys = self._get_keys(env)
+        if six.PY3:
+            boundary = boundary.encode('utf-8')
         status = message = ''
         attributes = {}
+        file_attributes = {}
         subheaders = []
+        resp_body = None
         file_count = 0
         for fp in iter_multipart_mime_documents(
                 env['wsgi.input'], boundary, read_chunk_size=READ_CHUNK_SIZE):
@@ -266,16 +295,22 @@ class FormPost(object):
                         break
                 except ValueError:
                     raise FormInvalid('max_file_count not an integer')
-                attributes['filename'] = attrs['filename'] or 'filename'
+                file_attributes = attributes.copy()
+                file_attributes['filename'] = attrs['filename'] or 'filename'
                 if 'content-type' not in attributes and 'content-type' in hdrs:
-                    attributes['content-type'] = \
+                    file_attributes['content-type'] = \
                         hdrs['Content-Type'] or 'application/octet-stream'
-                status, subheaders = \
-                    self._perform_subrequest(env, attributes, fp, keys)
-                if not status.startswith('2'):
+                if 'content-encoding' not in attributes and \
+                        'content-encoding' in hdrs:
+                    file_attributes['content-encoding'] = \
+                        hdrs['Content-Encoding']
+                status, subheaders, resp_body = \
+                    self._perform_subrequest(env, file_attributes, fp, keys)
+                status_code = int(status.split(' ', 1)[0])
+                if not is_success(status_code):
                     break
             else:
-                data = ''
+                data = b''
                 mxln = MAX_VALUE_LENGTH
                 while mxln:
                     chunk = fp.read(mxln)
@@ -285,12 +320,15 @@ class FormPost(object):
                     data += chunk
                 while fp.read(READ_CHUNK_SIZE):
                     pass
+                if six.PY3:
+                    data = data.decode('utf-8')
                 if 'name' in attrs:
                     attributes[attrs['name'].lower()] = data.rstrip('\r\n--')
         if not status:
             status = '400 Bad Request'
             message = 'no files to process'
 
+        status_code = int(status.split(' ', 1)[0])
         headers = [(k, v) for k, v in subheaders
                    if k.lower().startswith('access-control')]
 
@@ -299,17 +337,23 @@ class FormPost(object):
             body = status
             if message:
                 body = status + '\r\nFormPost: ' + message.title()
+            if six.PY3:
+                body = body.encode('utf-8')
+            if not is_success(status_code) and resp_body:
+                body = resp_body
             headers.extend([('Content-Type', 'text/plain'),
                             ('Content-Length', len(body))])
             return status, headers, body
-        status = status.split(' ', 1)[0]
         if '?' in redirect:
             redirect += '&'
         else:
             redirect += '?'
-        redirect += 'status=%s&message=%s' % (quote(status), quote(message))
+        redirect += 'status=%s&message=%s' % (quote(str(status_code)),
+                                              quote(message))
         body = '<html><body><p><a href="%s">' \
                'Click to continue...</a></p></body></html>' % redirect
+        if six.PY3:
+            body = body.encode('utf-8')
         headers.extend(
             [('Location', redirect), ('Content-Length', str(len(body)))])
         return '303 See Other', headers, body
@@ -340,7 +384,8 @@ class FormPost(object):
         if not subenv['PATH_INFO'].endswith('/') and \
                 subenv['PATH_INFO'].count('/') < 4:
             subenv['PATH_INFO'] += '/'
-        subenv['PATH_INFO'] += attributes['filename'] or 'filename'
+        subenv['PATH_INFO'] += str_to_wsgi(
+            attributes['filename'] or 'filename')
         if 'x_delete_at' in attributes:
             try:
                 subenv['HTTP_X_DELETE_AT'] = int(attributes['x_delete_at'])
@@ -357,26 +402,42 @@ class FormPost(object):
         if 'content-type' in attributes:
             subenv['CONTENT_TYPE'] = \
                 attributes['content-type'] or 'application/octet-stream'
+        if 'content-encoding' in attributes:
+            subenv['HTTP_CONTENT_ENCODING'] = attributes['content-encoding']
         try:
             if int(attributes.get('expires') or 0) < time():
                 raise FormUnauthorized('form expired')
         except ValueError:
             raise FormInvalid('expired not an integer')
         hmac_body = '%s\n%s\n%s\n%s\n%s' % (
-            orig_env['PATH_INFO'],
+            wsgi_to_str(orig_env['PATH_INFO']),
             attributes.get('redirect') or '',
             attributes.get('max_file_size') or '0',
             attributes.get('max_file_count') or '0',
             attributes.get('expires') or '0')
+        if six.PY3:
+            hmac_body = hmac_body.encode('utf-8')
 
         has_valid_sig = False
+        signature = attributes.get('signature', '')
+        try:
+            hash_name, signature = extract_digest_and_algorithm(signature)
+        except ValueError:
+            raise FormUnauthorized('invalid signature')
+        if hash_name not in self.allowed_digests:
+            raise FormUnauthorized('invalid signature')
+        hash_algorithm = getattr(hashlib, hash_name) if six.PY2 else hash_name
+
         for key in keys:
-            sig = hmac.new(key, hmac_body, sha1).hexdigest()
-            if streq_const_time(sig, (attributes.get('signature') or
-                                      'invalid')):
+            # Encode key like in swift.common.utls.get_hmac.
+            if not isinstance(key, six.binary_type):
+                key = key.encode('utf8')
+            sig = hmac.new(key, hmac_body, hash_algorithm).hexdigest()
+            if streq_const_time(sig, signature):
                 has_valid_sig = True
         if not has_valid_sig:
             raise FormUnauthorized('invalid signature')
+        self.logger.increment('formpost.digests.%s' % hash_name)
 
         substatus = [None]
         subheaders = [None]
@@ -392,8 +453,10 @@ class FormPost(object):
 
         # reiterate to ensure the response started,
         # but drop any data on the floor
-        close_if_possible(reiterate(self.app(subenv, _start_response)))
-        return substatus[0], subheaders[0]
+        resp = self.app(subenv, _start_response)
+        with closing_if_possible(reiterate(resp)):
+            body = b''.join(resp)
+        return substatus[0], subheaders[0], body
 
     def _get_keys(self, env):
         """
@@ -410,8 +473,8 @@ class FormPost(object):
         :returns: list of tempurl keys
         """
         parts = env['PATH_INFO'].split('/', 4)
-        if len(parts) < 4 or parts[0] or parts[1] != 'v1' or not parts[2] or \
-                not parts[3]:
+        if len(parts) < 4 or parts[0] or not valid_api_version(parts[1]) \
+                or not parts[2] or not parts[3]:
             return []
 
         account_info = get_account_info(env, self.app, swift_source='FP')
@@ -429,6 +492,12 @@ def filter_factory(global_conf, **local_conf):
     conf = global_conf.copy()
     conf.update(local_conf)
 
-    register_swift_info('formpost')
-
+    logger = get_logger(conf, log_route='formpost')
+    allowed_digests, deprecated_digests = get_allowed_digests(
+        conf.get('allowed_digests', '').split(), logger)
+    info = {'allowed_digests': sorted(allowed_digests)}
+    if deprecated_digests:
+        info['deprecated_digests'] = sorted(deprecated_digests)
+    register_swift_info('formpost', **info)
+    conf.update(info)
     return lambda app: FormPost(app, conf)

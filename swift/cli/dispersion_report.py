@@ -26,14 +26,11 @@ from eventlet import GreenPool, hubs, patcher, Timeout
 from eventlet.pools import Pool
 
 from swift.common import direct_client
-try:
-    from swiftclient import get_auth
-except ImportError:
-    from swift.common.internal_client import get_auth
 from swift.common.internal_client import SimpleClient
 from swift.common.ring import Ring
 from swift.common.exceptions import ClientException
-from swift.common.utils import compute_eta, get_time_units, config_true_value
+from swift.common.utils import compute_eta, get_time_units, \
+    config_true_value, node_to_string
 from swift.common.storage_policy import POLICIES
 
 
@@ -93,7 +90,7 @@ def container_dispersion_report(coropool, connpool, account, container_ring,
     def direct(container, part, nodes):
         found_count = 0
         for node in nodes:
-            error_log = get_error_log('%(ip)s:%(port)s/%(device)s' % node)
+            error_log = get_error_log(node_to_string(node))
             try:
                 attempts, _junk = direct_client.retry(
                     direct_client.direct_head_container, node, part, account,
@@ -205,7 +202,7 @@ def object_dispersion_report(coropool, connpool, account, object_ring,
     def direct(obj, part, nodes):
         found_count = 0
         for node in nodes:
-            error_log = get_error_log('%(ip)s:%(port)s/%(device)s' % node)
+            error_log = get_error_log(node_to_string(node))
             try:
                 attempts, _junk = direct_client.retry(
                     direct_client.direct_head_object, node, part, account,
@@ -365,6 +362,11 @@ Usage: %%prog [options] [conf_file]
 
 
 def generate_report(conf, policy_name=None):
+    try:
+        # Delay importing so urllib3 will import monkey-patched modules
+        from swiftclient import get_auth
+    except ImportError:
+        from swift.common.internal_client import get_auth
     global json_output
     json_output = config_true_value(conf.get('dump_json', 'no'))
     if policy_name is None:

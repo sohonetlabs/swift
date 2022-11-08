@@ -15,19 +15,16 @@
 # limitations under the License.
 
 import mock
-import shutil
-import tempfile
 import unittest
-from hashlib import md5
 from six.moves import urllib
-from textwrap import dedent
 
 from swift.common import swob
 from swift.common.middleware import copy
 from swift.common.storage_policy import POLICIES
 from swift.common.swob import Request, HTTPException
-from swift.common.utils import closing_if_possible
-from test.unit import patch_policies, debug_logger, FakeMemcache, FakeRing
+from swift.common.utils import closing_if_possible, md5
+from test.debug_logger import debug_logger
+from test.unit import patch_policies, FakeRing
 from test.unit.common.middleware.helpers import FakeSwift
 from test.unit.proxy.controllers.test_obj import set_http_connect, \
     PatchedObjControllerApp
@@ -120,7 +117,7 @@ class TestServerSideCopyMiddleware(unittest.TestCase):
             headers[0] = h
 
         body_iter = app(req.environ, start_response)
-        body = ''
+        body = b''
         caught_exc = None
         try:
             # appease the close-checker
@@ -338,8 +335,31 @@ class TestServerSideCopyMiddleware(unittest.TestCase):
         self.assertEqual('PUT', self.authorized[1].method)
         self.assertEqual('/v1/a/c/o', self.authorized[1].path)
 
+    def test_copy_with_unicode(self):
+        self.app.register('GET', '/v1/a/c/\xF0\x9F\x8C\xB4', swob.HTTPOk,
+                          {}, 'passed')
+        self.app.register('PUT', '/v1/a/c/\xE2\x98\x83', swob.HTTPCreated, {})
+        # Just for fun, let's have a mix of properly encoded and not
+        req = Request.blank('/v1/a/c/%F0\x9F%8C%B4',
+                            environ={'REQUEST_METHOD': 'COPY'},
+                            headers={'Content-Length': '0',
+                                     'Destination': 'c/%E2\x98%83'})
+        status, headers, body = self.call_ssc(req)
+        self.assertEqual(status, '201 Created')
+        calls = self.app.calls_with_headers
+        method, path, req_headers = calls[0]
+        self.assertEqual('GET', method)
+        self.assertEqual('/v1/a/c/\xF0\x9F\x8C\xB4', path)
+        self.assertIn(('X-Copied-From', 'c/%F0%9F%8C%B4'), headers)
+
+        self.assertEqual(len(self.authorized), 2)
+        self.assertEqual('GET', self.authorized[0].method)
+        self.assertEqual('/v1/a/c/%F0%9F%8C%B4', self.authorized[0].path)
+        self.assertEqual('PUT', self.authorized[1].method)
+        self.assertEqual('/v1/a/c/%E2%98%83', self.authorized[1].path)
+
     def test_copy_with_spaces_in_x_copy_from_and_account(self):
-        self.app.register('GET', '/v1/a/c/o o2', swob.HTTPOk, {}, 'passed')
+        self.app.register('GET', '/v1/a/c/o o2', swob.HTTPOk, {}, b'passed')
         self.app.register('PUT', '/v1/a1/c1/o', swob.HTTPCreated, {})
         # space in soure path
         req = Request.blank('/v1/a1/c1/o', environ={'REQUEST_METHOD': 'PUT'},
@@ -646,7 +666,7 @@ class TestServerSideCopyMiddleware(unittest.TestCase):
         get_resp_headers['etag'] = 'source etag'
         self.app.register(
             'GET', '/v1/a/c/o', swob.HTTPOk,
-            headers=get_resp_headers, body='passed')
+            headers=get_resp_headers, body=b'passed')
 
         def verify_headers(expected_headers, unexpected_headers,
                            actual_headers):
@@ -1278,53 +1298,7 @@ class TestServerSideCopyMiddleware(unittest.TestCase):
         self.assertEqual('6', req_headers['content-length'])
         req = swob.Request.blank('/v1/a/c1/o', method='GET')
         status, headers, body = self.call_ssc(req)
-        self.assertEqual('fghijk', body)
-
-
-class TestServerSideCopyConfiguration(unittest.TestCase):
-
-    def setUp(self):
-        self.tmpdir = tempfile.mkdtemp()
-
-    def tearDown(self):
-        shutil.rmtree(self.tmpdir)
-
-    def _test_post_as_copy_emits_warning(self, conf):
-        with mock.patch('swift.common.middleware.copy.get_logger',
-                        return_value=debug_logger('copy')):
-            ssc = copy.filter_factory(conf)("no app here")
-
-        self.assertEqual(ssc.object_post_as_copy, True)
-        log_lines = ssc.logger.get_lines_for_level('warning')
-        self.assertEqual(1, len(log_lines))
-        self.assertIn('object_post_as_copy=true is deprecated', log_lines[0])
-
-    def test_post_as_copy_emits_warning(self):
-        self._test_post_as_copy_emits_warning({'object_post_as_copy': 'yes'})
-
-        proxy_conf = dedent("""
-        [DEFAULT]
-        bind_ip = 10.4.5.6
-
-        [pipeline:main]
-        pipeline = catch_errors copy ye-olde-proxy-server
-
-        [filter:catch_errors]
-        use = egg:swift#catch_errors
-
-        [filter:copy]
-        use = egg:swift#copy
-
-        [app:ye-olde-proxy-server]
-        use = egg:swift#proxy
-        object_post_as_copy = yes
-        """)
-
-        conffile = tempfile.NamedTemporaryFile()
-        conffile.write(proxy_conf)
-        conffile.flush()
-
-        self._test_post_as_copy_emits_warning({'__file__': conffile.name})
+        self.assertEqual(b'fghijk', body)
 
 
 @patch_policies(with_ec_default=True)
@@ -1342,7 +1316,7 @@ class TestServerSideCopyMiddlewareWithEC(unittest.TestCase):
         self.logger = debug_logger('proxy-server')
         self.logger.thread_locals = ('txn1', '127.0.0.2')
         self.app = PatchedObjControllerApp(
-            None, FakeMemcache(), account_ring=FakeRing(),
+            None, account_ring=FakeRing(),
             container_ring=FakeRing(), logger=self.logger)
         self.ssc = copy.filter_factory({})(self.app)
         self.ssc.logger = self.app.logger
@@ -1356,7 +1330,7 @@ class TestServerSideCopyMiddlewareWithEC(unittest.TestCase):
                      'Range': 'bytes=5-10'})
         # turn a real body into fragments
         segment_size = self.policy.ec_segment_size
-        real_body = ('asdf' * segment_size)[:-10]
+        real_body = (b'asdf' * segment_size)[:-10]
 
         # split it up into chunks
         chunks = [real_body[x:x + segment_size]
@@ -1367,13 +1341,13 @@ class TestServerSideCopyMiddlewareWithEC(unittest.TestCase):
         fragment_payloads = []
         fragment_payloads.append(fragments)
 
-        node_fragments = zip(*fragment_payloads)
+        node_fragments = list(zip(*fragment_payloads))
         self.assertEqual(len(node_fragments),
                          self.policy.object_ring.replicas)  # sanity
         headers = {'X-Object-Sysmeta-Ec-Content-Length': str(len(real_body))}
-        responses = [(200, ''.join(node_fragments[i]), headers)
+        responses = [(200, b''.join(node_fragments[i]), headers)
                      for i in range(POLICIES.default.ec_ndata)]
-        responses += [(201, '', {})] * self.policy.object_ring.replicas
+        responses += [(201, b'', {})] * self.policy.object_ring.replicas
         status_codes, body_iter, headers = zip(*responses)
         expect_headers = {
             'X-Obj-Metadata-Footer': 'yes',
@@ -1401,7 +1375,7 @@ class TestServerSideCopyMiddlewareWithEC(unittest.TestCase):
     def test_COPY_with_invalid_ranges(self):
         # real body size is segment_size - 10 (just 1 segment)
         segment_size = self.policy.ec_segment_size
-        real_body = ('a' * segment_size)[:-10]
+        real_body = (b'a' * segment_size)[:-10]
 
         # range is out of real body but in segment size
         self._test_invalid_ranges('COPY', real_body,
@@ -1412,7 +1386,7 @@ class TestServerSideCopyMiddlewareWithEC(unittest.TestCase):
 
     def _test_invalid_ranges(self, method, real_body, segment_size, req_range):
         # make a request with range starts from more than real size.
-        body_etag = md5(real_body).hexdigest()
+        body_etag = md5(real_body, usedforsecurity=False).hexdigest()
         req = swob.Request.blank(
             '/v1/a/c/o', method=method,
             headers={'Destination': 'c1/o',
@@ -1421,7 +1395,7 @@ class TestServerSideCopyMiddlewareWithEC(unittest.TestCase):
         fragments = self.policy.pyeclib_driver.encode(real_body)
         fragment_payloads = [fragments]
 
-        node_fragments = zip(*fragment_payloads)
+        node_fragments = list(zip(*fragment_payloads))
         self.assertEqual(len(node_fragments),
                          self.policy.object_ring.replicas)  # sanity
         headers = {'X-Object-Sysmeta-Ec-Content-Length': str(len(real_body)),
@@ -1431,11 +1405,12 @@ class TestServerSideCopyMiddlewareWithEC(unittest.TestCase):
         title, exp = swob.RESPONSE_REASONS[416]
         range_not_satisfiable_body = \
             '<html><h1>%s</h1><p>%s</p></html>' % (title, exp)
+        range_not_satisfiable_body = range_not_satisfiable_body.encode('ascii')
         if start >= segment_size:
             responses = [(416, range_not_satisfiable_body, headers)
                          for i in range(POLICIES.default.ec_ndata)]
         else:
-            responses = [(200, ''.join(node_fragments[i]), headers)
+            responses = [(200, b''.join(node_fragments[i]), headers)
                          for i in range(POLICIES.default.ec_ndata)]
         status_codes, body_iter, headers = zip(*responses)
         expect_headers = {

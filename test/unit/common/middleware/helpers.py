@@ -16,32 +16,58 @@
 # This stuff can't live in test/unit/__init__.py due to its swob dependency.
 
 from collections import defaultdict, namedtuple
-from hashlib import md5
+from six.moves.urllib import parse
 from swift.common import swob
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.request_helpers import is_user_meta, \
     is_object_transient_sysmeta, resolve_etag_is_at_header
 from swift.common.swob import HTTPNotImplemented
-from swift.common.utils import split_path
+from swift.common.utils import split_path, md5
 
-from test.unit import FakeLogger, FakeRing
+from test.debug_logger import debug_logger
+from test.unit import FakeRing
 
 
 class LeakTrackingIter(object):
-    def __init__(self, inner_iter, mark_closed, path):
-        self.inner_iter = inner_iter
+    def __init__(self, inner_iter, mark_closed, mark_read, key):
+        if isinstance(inner_iter, bytes):
+            inner_iter = (inner_iter, )
+        self.inner_iter = iter(inner_iter)
         self.mark_closed = mark_closed
-        self.path = path
+        self.mark_read = mark_read
+        self.key = key
 
     def __iter__(self):
-        for x in self.inner_iter:
-            yield x
+        return self
+
+    def __next__(self):
+        try:
+            return next(self.inner_iter)
+        except StopIteration:
+            self.mark_read(self.key)
+            raise
+
+    next = __next__  # for py2
 
     def close(self):
-        self.mark_closed(self.path)
+        self.mark_closed(self.key)
 
 
 FakeSwiftCall = namedtuple('FakeSwiftCall', ['method', 'path', 'headers'])
+
+
+def normalize_query_string(qs):
+    if qs.startswith('?'):
+        qs = qs[1:]
+    if not qs:
+        return ''
+    else:
+        return '?%s' % parse.urlencode(sorted(parse.parse_qsl(qs)))
+
+
+def normalize_path(path):
+    parsed = parse.urlparse(path)
+    return parsed.path + normalize_query_string(parsed.query)
 
 
 class FakeSwift(object):
@@ -49,23 +75,36 @@ class FakeSwift(object):
     A good-enough fake Swift proxy server to use in testing middleware.
     """
     ALLOWED_METHODS = [
-        'PUT', 'POST', 'DELETE', 'GET', 'HEAD', 'OPTIONS', 'REPLICATE']
+        'PUT', 'POST', 'DELETE', 'GET', 'HEAD', 'OPTIONS', 'REPLICATE',
+        'SSYNC', 'UPDATE']
+    container_existence_skip_cache = 0.0
+    account_existence_skip_cache = 0.0
 
     def __init__(self):
         self._calls = []
-        self._unclosed_req_paths = defaultdict(int)
+        self.req_bodies = []
+        self._unclosed_req_keys = defaultdict(int)
+        self._unread_req_paths = defaultdict(int)
         self.req_method_paths = []
         self.swift_sources = []
         self.txn_ids = []
         self.uploaded = {}
         # mapping of (method, path) --> (response class, headers, body)
         self._responses = {}
-        self.logger = FakeLogger('fake-swift')
+        self.logger = debug_logger('fake-swift')
         self.account_ring = FakeRing()
         self.container_ring = FakeRing()
         self.get_object_ring = lambda policy_index: FakeRing()
+        self.auto_create_account_prefix = '.'
+        self.backend_user_agent = "fake_swift"
+        self._pipeline_final_app = self
+        # some tests want to opt in to mimicking the
+        # X-Backend-Ignore-Range-If-Metadata-Present header behavior,
+        # but default to old-swift behavior
+        self.can_ignore_range = False
 
     def _find_response(self, method, path):
+        path = normalize_path(path)
         resp = self._responses[(method, path)]
         if isinstance(resp, list):
             try:
@@ -77,6 +116,9 @@ class FakeSwift(object):
         return resp
 
     def __call__(self, env, start_response):
+        if self.can_ignore_range:
+            # we might pop off the Range header
+            env = dict(env)
         method = env['REQUEST_METHOD']
         if method not in self.ALLOWED_METHODS:
             raise HTTPNotImplemented()
@@ -86,6 +128,7 @@ class FakeSwift(object):
                                        rest_with_last=True)
         if env.get('QUERY_STRING'):
             path += '?' + env['QUERY_STRING']
+        path = normalize_path(path)
 
         if 'swift.authorize' in env:
             resp = env['swift.authorize'](swob.Request(env))
@@ -117,19 +160,29 @@ class FakeSwift(object):
                 raise KeyError("Didn't find %r in allowed responses" % (
                     (method, path),))
 
+        ignore_range_meta = req.headers.get(
+            'x-backend-ignore-range-if-metadata-present')
+        if self.can_ignore_range and ignore_range_meta and set(
+                ignore_range_meta.split(',')).intersection(headers.keys()):
+            req.headers.pop('range', None)
+
+        req_body = None  # generally, we don't care and let eventlet discard()
+        if (cont and not obj and method == 'UPDATE') or (
+                obj and method == 'PUT'):
+            req_body = b''.join(iter(env['wsgi.input'].read, b''))
+
         # simulate object PUT
         if method == 'PUT' and obj:
-            put_body = ''.join(iter(env['wsgi.input'].read, ''))
             if 'swift.callback.update_footers' in env:
                 footers = HeaderKeyDict()
                 env['swift.callback.update_footers'](footers)
                 req.headers.update(footers)
-            etag = md5(put_body).hexdigest()
+            etag = md5(req_body, usedforsecurity=False).hexdigest()
             headers.setdefault('Etag', etag)
-            headers.setdefault('Content-Length', len(put_body))
+            headers.setdefault('Content-Length', len(req_body))
 
             # keep it for subsequent GET requests later
-            self.uploaded[path] = (dict(req.headers), put_body)
+            self.uploaded[path] = (dict(req.headers), req_body)
             if "CONTENT_TYPE" in env:
                 self.uploaded[path][0]['Content-Type'] = env["CONTENT_TYPE"]
 
@@ -149,10 +202,16 @@ class FakeSwift(object):
                          k.lower == 'content-type')))
             self.uploaded[path] = new_metadata, data
 
+        # simulate object GET/HEAD
+        elif method in ('GET', 'HEAD') and obj:
+            req.headers['X-Backend-Storage-Policy-Index'] = headers.get(
+                'x-backend-storage-policy-index', '2')
+
         # note: tests may assume this copy of req_headers is case insensitive
         # so we deliberately use a HeaderKeyDict
         self._calls.append(
             FakeSwiftCall(method, path, HeaderKeyDict(req.headers)))
+        self.req_bodies.append(req_body)
 
         # Apply conditional etag overrides
         conditional_etag = resolve_etag_is_at_header(req, headers)
@@ -169,19 +228,30 @@ class FakeSwift(object):
                 conditional_response=req.method in ('GET', 'HEAD'),
                 conditional_etag=conditional_etag)
         wsgi_iter = resp(env, start_response)
-        self.mark_opened(path)
-        return LeakTrackingIter(wsgi_iter, self.mark_closed, path)
+        self.mark_opened((method, path))
+        return LeakTrackingIter(wsgi_iter, self.mark_closed,
+                                self.mark_read, (method, path))
 
-    def mark_opened(self, path):
-        self._unclosed_req_paths[path] += 1
+    def mark_opened(self, key):
+        self._unclosed_req_keys[key] += 1
+        self._unread_req_paths[key] += 1
 
-    def mark_closed(self, path):
-        self._unclosed_req_paths[path] -= 1
+    def mark_closed(self, key):
+        self._unclosed_req_keys[key] -= 1
+
+    def mark_read(self, key):
+        self._unread_req_paths[key] -= 1
 
     @property
     def unclosed_requests(self):
+        return {key: count
+                for key, count in self._unclosed_req_keys.items()
+                if count > 0}
+
+    @property
+    def unread_requests(self):
         return {path: count
-                for path, count in self._unclosed_req_paths.items()
+                for path, count in self._unread_req_paths.items()
                 if count > 0}
 
     @property
@@ -200,15 +270,17 @@ class FakeSwift(object):
     def call_count(self):
         return len(self._calls)
 
-    def register(self, method, path, response_class, headers, body=''):
+    def register(self, method, path, response_class, headers, body=b''):
+        path = normalize_path(path)
         self._responses[(method, path)] = (response_class, headers, body)
 
     def register_responses(self, method, path, responses):
+        path = normalize_path(path)
         self._responses[(method, path)] = list(responses)
 
 
 class FakeAppThatExcepts(object):
-    MESSAGE = "We take exception to that!"
+    MESSAGE = b"We take exception to that!"
 
     def __init__(self, exception_class=Exception):
         self.exception_class = exception_class

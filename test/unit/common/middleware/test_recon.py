@@ -15,19 +15,25 @@
 
 import array
 from contextlib import contextmanager
+import errno
+import json
 import mock
 import os
 from posix import stat_result, statvfs_result
 from shutil import rmtree
 import tempfile
+import time
 import unittest
 from unittest import TestCase
 
 from swift import __version__ as swiftver
 from swift.common import ring, utils
+from swift.common.recon import RECON_RELINKER_FILE, RECON_DRIVE_FILE, \
+    DEFAULT_RECON_CACHE_PATH, server_type_to_recon_file
 from swift.common.swob import Request
 from swift.common.middleware import recon
 from swift.common.storage_policy import StoragePolicy
+from test.debug_logger import debug_logger
 from test.unit import patch_policies
 
 
@@ -45,7 +51,7 @@ def fail_io_open(file_path, open_mode):
 
 class FakeApp(object):
     def __call__(self, env, start_response):
-        return "FAKE APP"
+        return b"FAKE APP"
 
 
 def start_response(*args):
@@ -76,13 +82,15 @@ class OpenAndReadTester(object):
     def __iter__(self):
         return self
 
-    def next(self):
+    def __next__(self):
         if self.index == self.out_len:
             raise StopIteration
         else:
             line = self.data[self.index]
             self.index += 1
         return line
+
+    next = __next__
 
     def read(self, *args, **kwargs):
         self.read_calls.append((args, kwargs))
@@ -154,6 +162,15 @@ class FakeRecon(object):
         self.fake_replication_rtype = recon_type
         return {'replicationtest': "1"}
 
+    def fake_sharding(self):
+        return {"sharding_stats": "1"}
+
+    def fake_relinker(self):
+        return {"relinktest": "1"}
+
+    def fake_reconstruction(self):
+        return {'reconstructiontest': "1"}
+
     def fake_updater(self, recon_type):
         self.fake_updater_rtype = recon_type
         return {'updatertest': "1"}
@@ -199,8 +216,10 @@ class FakeRecon(object):
     def nocontent(self):
         return None
 
-    def raise_IOError(self, *args, **kwargs):
-        raise IOError
+    def raise_IOError(self, errno=None):
+        mock_obj = mock.MagicMock()
+        mock_obj.side_effect = IOError(errno, str(errno))
+        return mock_obj
 
     def raise_ValueError(self, *args, **kwargs):
         raise ValueError
@@ -229,6 +248,7 @@ class TestReconSuccess(TestCase):
         self.real_from_cache = self.app._from_recon_cache
         self.app._from_recon_cache = self.fakecache.fake_from_recon_cache
         self.frecon = FakeRecon()
+        self.app.logger = debug_logger()
 
         # replace hash md5 implementation of the md5_hash_for_file function
         mock_hash_for_file = mock.patch(
@@ -300,6 +320,11 @@ class TestReconSuccess(TestCase):
             ringpath = os.path.join(self.tempdir, ringfn)
             self._create_ring(ringpath, replica_map, self.ring_devs,
                               self.ring_part_shift)
+
+    def _full_recon_path(self, server_type, recon_file=None):
+        if server_type:
+            recon_file = server_type_to_recon_file(server_type)
+        return os.path.join(DEFAULT_RECON_CACHE_PATH, recon_file)
 
     @patch_policies([
         StoragePolicy(0, 'stagecoach'),
@@ -470,11 +495,29 @@ class TestReconSuccess(TestCase):
         self.app._from_recon_cache = self.fakecache.fake_from_recon_cache
 
     def test_from_recon_cache_ioerror(self):
-        oart = self.frecon.raise_IOError
+        oart = self.frecon.raise_IOError()
         self.app._from_recon_cache = self.real_from_cache
         rv = self.app._from_recon_cache(['testkey1', 'notpresentkey'],
                                         'test.cache', openr=oart)
         self.assertEqual(rv, {'notpresentkey': None, 'testkey1': None})
+        self.assertIn('Error reading recon cache file: ',
+                      self.app.logger.get_lines_for_level('error'))
+        # Now try with ignore_missing but not ENOENT
+        self.app.logger.clear()
+        rv = self.app._from_recon_cache(['testkey1', 'notpresentkey'],
+                                        'test.cache', openr=oart,
+                                        ignore_missing=True)
+        self.assertEqual(rv, {'notpresentkey': None, 'testkey1': None})
+        self.assertIn('Error reading recon cache file: ',
+                      self.app.logger.get_lines_for_level('error'))
+        # Now try again with ignore_missing with ENOENT
+        self.app.logger.clear()
+        oart = self.frecon.raise_IOError(errno.ENOENT)
+        rv = self.app._from_recon_cache(['testkey1', 'notpresentkey'],
+                                        'test.cache', openr=oart,
+                                        ignore_missing=True)
+        self.assertEqual(rv, {'notpresentkey': None, 'testkey1': None})
+        self.assertEqual(self.app.logger.get_lines_for_level('error'), [])
         self.app._from_recon_cache = self.fakecache.fake_from_recon_cache
 
     def test_from_recon_cache_valueerror(self):
@@ -483,6 +526,8 @@ class TestReconSuccess(TestCase):
         rv = self.app._from_recon_cache(['testkey1', 'notpresentkey'],
                                         'test.cache', openr=oart)
         self.assertEqual(rv, {'notpresentkey': None, 'testkey1': None})
+        self.assertIn('Error parsing recon cache file: ',
+                      self.app.logger.get_lines_for_level('error'))
         self.app._from_recon_cache = self.fakecache.fake_from_recon_cache
 
     def test_from_recon_cache_exception(self):
@@ -491,6 +536,8 @@ class TestReconSuccess(TestCase):
         rv = self.app._from_recon_cache(['testkey1', 'notpresentkey'],
                                         'test.cache', openr=oart)
         self.assertEqual(rv, {'notpresentkey': None, 'testkey1': None})
+        self.assertIn('Error retrieving recon data: ',
+                      self.app.logger.get_lines_for_level('error'))
         self.app._from_recon_cache = self.fakecache.fake_from_recon_cache
 
     def test_get_mounted(self):
@@ -511,7 +558,7 @@ class TestReconSuccess(TestCase):
             'none /var/run tmpfs rw,nosuid,relatime,mode=755 0 0',
             'none /var/lock tmpfs rw,nosuid,nodev,noexec,relatime 0 0',
             'none /lib/init/rw tmpfs rw,nosuid,relatime,mode=755 0 0',
-            '/dev/loop0 /mnt/sdb1 xfs rw,noatime,nodiratime,attr2,nobarrier,'
+            '/dev/loop0 /mnt/sdb1 xfs rw,noatime,nodiratime,attr2,'
             'logbufs=8,noquota 0 0',
             'rpc_pipefs /var/lib/nfs/rpc_pipefs rpc_pipefs rw,relatime 0 0',
             'nfsd /proc/fs/nfsd nfsd rw,relatime 0 0',
@@ -640,13 +687,14 @@ class TestReconSuccess(TestCase):
         self.assertEqual(rv, meminfo_resp)
 
     def test_get_async_info(self):
-        from_cache_response = {'async_pending': 5}
+        now = time.time()
+        from_cache_response = {'async_pending': 5, 'async_pending_last': now}
         self.fakecache.fakeout = from_cache_response
         rv = self.app.get_async_info()
         self.assertEqual(self.fakecache.fakeout_calls,
-                         [((['async_pending'],
-                             '/var/cache/swift/object.recon'), {})])
-        self.assertEqual(rv, {'async_pending': 5})
+                         [((['async_pending', 'async_pending_last'],
+                             self._full_recon_path('object')), {})])
+        self.assertEqual(rv, {'async_pending': 5, 'async_pending_last': now})
 
     def test_get_replication_info_account(self):
         from_cache_response = {
@@ -668,7 +716,7 @@ class TestReconSuccess(TestCase):
         self.assertEqual(self.fakecache.fakeout_calls,
                          [((['replication_time', 'replication_stats',
                              'replication_last'],
-                             '/var/cache/swift/account.recon'), {})])
+                             self._full_recon_path('account')), {})])
         self.assertEqual(rv, {
             "replication_stats": {
                 "attempted": 1, "diff": 0,
@@ -705,7 +753,8 @@ class TestReconSuccess(TestCase):
         self.assertEqual(self.fakecache.fakeout_calls,
                          [((['replication_time', 'replication_stats',
                              'replication_last'],
-                             '/var/cache/swift/container.recon'), {})])
+                             self._full_recon_path('container')),
+                           {})])
         self.assertEqual(rv, {
             "replication_time": 200.0,
             "replication_stats": {
@@ -742,7 +791,7 @@ class TestReconSuccess(TestCase):
                          [((['replication_time', 'replication_stats',
                              'replication_last', 'object_replication_time',
                              'object_replication_last'],
-                             '/var/cache/swift/object.recon'), {})])
+                             self._full_recon_path('object')), {})])
         self.assertEqual(rv, {
             "replication_time": 0.2615511417388916,
             "replication_stats": {
@@ -761,6 +810,21 @@ class TestReconSuccess(TestCase):
         rv = self.app.get_replication_info('unrecognized_recon_type')
         self.assertIsNone(rv)
 
+    def test_get_reconstruction(self):
+        from_cache_response = {
+            "object_reconstruction_time": 0.2615511417388916,
+            "object_reconstruction_last": 1357969645.25}
+        self.fakecache.fakeout_calls = []
+        self.fakecache.fakeout = from_cache_response
+        rv = self.app.get_reconstruction_info()
+        self.assertEqual(self.fakecache.fakeout_calls,
+                         [((['object_reconstruction_last',
+                             'object_reconstruction_time'],
+                             '/var/cache/swift/object.recon'), {})])
+        self.assertEqual(rv, {
+            "object_reconstruction_time": 0.2615511417388916,
+            "object_reconstruction_last": 1357969645.25})
+
     def test_get_updater_info_container(self):
         from_cache_response = {"container_updater_sweep": 18.476239919662476}
         self.fakecache.fakeout_calls = []
@@ -768,7 +832,7 @@ class TestReconSuccess(TestCase):
         rv = self.app.get_updater_info('container')
         self.assertEqual(self.fakecache.fakeout_calls,
                          [((['container_updater_sweep'],
-                            '/var/cache/swift/container.recon'), {})])
+                            self._full_recon_path('container')), {})])
         self.assertEqual(rv, {"container_updater_sweep": 18.476239919662476})
 
     def test_get_updater_info_object(self):
@@ -778,7 +842,7 @@ class TestReconSuccess(TestCase):
         rv = self.app.get_updater_info('object')
         self.assertEqual(self.fakecache.fakeout_calls,
                          [((['object_updater_sweep'],
-                            '/var/cache/swift/object.recon'), {})])
+                            self._full_recon_path('object')), {})])
         self.assertEqual(rv, {"object_updater_sweep": 0.79848217964172363})
 
     def test_get_updater_info_unrecognized(self):
@@ -793,7 +857,7 @@ class TestReconSuccess(TestCase):
         rv = self.app.get_expirer_info('object')
         self.assertEqual(self.fakecache.fakeout_calls,
                          [((['object_expiration_pass', 'expired_last_pass'],
-                            '/var/cache/swift/object.recon'), {})])
+                            self._full_recon_path('object')), {})])
         self.assertEqual(rv, from_cache_response)
 
     def test_get_auditor_info_account(self):
@@ -809,7 +873,7 @@ class TestReconSuccess(TestCase):
                              'account_auditor_pass_completed',
                              'account_audits_since',
                              'account_audits_failed'],
-                             '/var/cache/swift/account.recon'), {})])
+                             self._full_recon_path('account')), {})])
         self.assertEqual(rv, {"account_auditor_pass_completed": 0.24,
                               "account_audits_failed": 0,
                               "account_audits_passed": 6,
@@ -828,7 +892,7 @@ class TestReconSuccess(TestCase):
                              'container_auditor_pass_completed',
                              'container_audits_since',
                              'container_audits_failed'],
-                             '/var/cache/swift/container.recon'), {})])
+                             self._full_recon_path('container')), {})])
         self.assertEqual(rv, {"container_auditor_pass_completed": 0.24,
                               "container_audits_failed": 0,
                               "container_audits_passed": 6,
@@ -856,7 +920,7 @@ class TestReconSuccess(TestCase):
         self.assertEqual(self.fakecache.fakeout_calls,
                          [((['object_auditor_stats_ALL',
                              'object_auditor_stats_ZBF'],
-                             '/var/cache/swift/object.recon'), {})])
+                             self._full_recon_path('object')), {})])
         self.assertEqual(rv, {
             "object_auditor_stats_ALL": {
                 "audit_time": 115.14418768882751,
@@ -903,7 +967,7 @@ class TestReconSuccess(TestCase):
         self.assertEqual(self.fakecache.fakeout_calls,
                          [((['object_auditor_stats_ALL',
                              'object_auditor_stats_ZBF'],
-                             '/var/cache/swift/object.recon'), {})])
+                             self._full_recon_path('object')), {})])
         self.assertEqual(rv, {
             "object_auditor_stats_ALL": {
                 'disk1': {
@@ -1092,7 +1156,8 @@ class TestReconSuccess(TestCase):
         rv = self.app.get_driveaudit_error()
         self.assertEqual(self.fakecache.fakeout_calls,
                          [((['drive_audit_errors'],
-                            '/var/cache/swift/drive.recon'), {})])
+                            self._full_recon_path(
+                                None, recon_file=RECON_DRIVE_FILE)), {})])
         self.assertEqual(rv, {'drive_audit_errors': 7})
 
     def test_get_time(self):
@@ -1103,6 +1168,168 @@ class TestReconSuccess(TestCase):
             now = fake_time()
             rv = self.app.get_time()
             self.assertEqual(rv, now)
+
+    def test_get_sharding_info(self):
+        from_cache_response = {
+            "sharding_stats": {
+                "attempted": 0,
+                "deferred": 0,
+                "diff": 0,
+                "diff_capped": 0,
+                "empty": 0,
+                "failure": 0,
+                "hashmatch": 0,
+                "no_change": 0,
+                "remote_merge": 0,
+                "remove": 0,
+                "rsync": 0,
+                "start": 1614136398.5729735,
+                "success": 0,
+                "ts_repl": 0,
+                "sharding": {
+                    "audit_root": {
+                        "attempted": 0,
+                        "failure": 0,
+                        "success": 0,
+                    },
+                    "audit_shard": {
+                        "attempted": 0,
+                        "failure": 0,
+                        "success": 0,
+                    },
+                    "cleaved": {
+                        "attempted": 0,
+                        "failure": 0,
+                        "max_time": 0,
+                        "min_time": 0,
+                        "success": 0,
+                    },
+                    "created": {
+                        "attempted": 0,
+                        "failure": 0,
+                        "success": 0,
+                    },
+                    "misplaced": {
+                        "attempted": 0,
+                        "failure": 0,
+                        "found": 0,
+                        "placed": 0,
+                        "success": 0,
+                        "unplaced": 0,
+                    },
+                    "scanned": {
+                        "attempted": 0,
+                        "failure": 0,
+                        "found": 0,
+                        "max_time": 0,
+                        "min_time": 0,
+                        "success": 0,
+                    },
+                    "sharding_candidates": {
+                        "found": 0,
+                        "top": [],
+                    },
+                    "visited": {
+                        "attempted": 0,
+                        "completed": 0,
+                        "failure": 0,
+                        "skipped": 6,
+                        "success": 0,
+                    }
+                },
+            },
+            "sharding_time": 600,
+            "sharding_last": 1614136398.6680582}
+        self.fakecache.fakeout_calls = []
+        self.fakecache.fakeout = from_cache_response
+        rv = self.app.get_sharding_info()
+        self.assertEqual(self.fakecache.fakeout_calls, [
+            ((['sharding_stats', 'sharding_time', 'sharding_last'],
+              self._full_recon_path('container')), {})])
+        self.assertEqual(rv, from_cache_response)
+
+    def test_get_relinker_info(self):
+        from_cache_response = {
+            "devices": {
+                "sdb3": {
+                    "parts_done": 523,
+                    "policies": {
+                        "1": {
+                            "next_part_power": 11,
+                            "start_time": 1618998724.845616,
+                            "stats": {
+                                "errors": 0,
+                                "files": 1630,
+                                "hash_dirs": 1630,
+                                "linked": 1630,
+                                "policies": 1,
+                                "removed": 0
+                            },
+                            "timestamp": 1618998730.24672,
+                            "total_parts": 1029,
+                            "total_time": 5.400741815567017
+                        }},
+                    "start_time": 1618998724.845946,
+                    "stats": {
+                        "errors": 0,
+                        "files": 836,
+                        "hash_dirs": 836,
+                        "linked": 836,
+                        "removed": 0
+                    },
+                    "timestamp": 1618998730.24672,
+                    "total_parts": 523,
+                    "total_time": 5.400741815567017
+                },
+                "sdb7": {
+                    "parts_done": 506,
+                    "policies": {
+                        "1": {
+                            "next_part_power": 11,
+                            "part_power": 10,
+                            "parts_done": 506,
+                            "start_time": 1618998724.845616,
+                            "stats": {
+                                "errors": 0,
+                                "files": 794,
+                                "hash_dirs": 794,
+                                "linked": 794,
+                                "removed": 0
+                            },
+                            "step": "relink",
+                            "timestamp": 1618998730.166175,
+                            "total_parts": 506,
+                            "total_time": 5.320528984069824
+                        }
+                    },
+                    "start_time": 1618998724.845616,
+                    "stats": {
+                        "errors": 0,
+                        "files": 794,
+                        "hash_dirs": 794,
+                        "linked": 794,
+                        "removed": 0
+                    },
+                    "timestamp": 1618998730.166175,
+                    "total_parts": 506,
+                    "total_time": 5.320528984069824
+                }
+            },
+            "workers": {
+                "100": {
+                    "drives": ["sda1"],
+                    "return_code": 0,
+                    "timestamp": 1618998730.166175}
+            }}
+        self.fakecache.fakeout_calls = []
+        self.fakecache.fakeout = from_cache_response
+        rv = self.app.get_relinker_info()
+        self.assertEqual(self.fakecache.fakeout_calls,
+                         [((['devices', 'workers'],
+                            self._full_recon_path(
+                                None, recon_file=RECON_RELINKER_FILE)),
+                           {'ignore_missing': True})])
+        self.assertEqual(rv, from_cache_response)
 
 
 class TestReconMiddleware(unittest.TestCase):
@@ -1124,6 +1351,7 @@ class TestReconMiddleware(unittest.TestCase):
         self.app.get_async_info = self.frecon.fake_async
         self.app.get_device_info = self.frecon.fake_get_device_info
         self.app.get_replication_info = self.frecon.fake_replication
+        self.app.get_reconstruction_info = self.frecon.fake_reconstruction
         self.app.get_auditor_info = self.frecon.fake_auditor
         self.app.get_updater_info = self.frecon.fake_updater
         self.app.get_expirer_info = self.frecon.fake_expirer
@@ -1136,9 +1364,11 @@ class TestReconMiddleware(unittest.TestCase):
         self.app.get_socket_info = self.frecon.fake_sockstat
         self.app.get_driveaudit_error = self.frecon.fake_driveaudit
         self.app.get_time = self.frecon.fake_time
+        self.app.get_sharding_info = self.frecon.fake_sharding
+        self.app.get_relinker_info = self.frecon.fake_relinker
 
     def test_recon_get_mem(self):
-        get_mem_resp = ['{"memtest": "1"}']
+        get_mem_resp = [b'{"memtest": "1"}']
         req = Request.blank('/recon/mem', environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_mem_resp)
@@ -1147,29 +1377,37 @@ class TestReconMiddleware(unittest.TestCase):
         req = Request.blank('/recon/version',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
-        self.assertEqual(resp, [utils.json.dumps({'version': swiftver})])
+        self.assertEqual(resp, [json.dumps({
+            'version': swiftver}).encode('ascii')])
 
     def test_recon_get_load(self):
-        get_load_resp = ['{"loadtest": "1"}']
+        get_load_resp = [b'{"loadtest": "1"}']
         req = Request.blank('/recon/load', environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_load_resp)
 
     def test_recon_get_async(self):
-        get_async_resp = ['{"asynctest": "1"}']
+        get_async_resp = [b'{"asynctest": "1"}']
         req = Request.blank('/recon/async', environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_async_resp)
 
     def test_get_device_info(self):
-        get_device_resp = ['{"/srv/1/node": ["sdb1"]}']
+        get_device_resp = [b'{"/srv/1/node": ["sdb1"]}']
         req = Request.blank('/recon/devices',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_device_resp)
 
+    def test_reconstruction_info(self):
+        get_reconstruction_resp = [b'{"reconstructiontest": "1"}']
+        req = Request.blank('/recon/reconstruction/object',
+                            environ={'REQUEST_METHOD': 'GET'})
+        resp = self.app(req.environ, start_response)
+        self.assertEqual(resp, get_reconstruction_resp)
+
     def test_recon_get_replication_notype(self):
-        get_replication_resp = ['{"replicationtest": "1"}']
+        get_replication_resp = [b'{"replicationtest": "1"}']
         req = Request.blank('/recon/replication',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
@@ -1178,7 +1416,7 @@ class TestReconMiddleware(unittest.TestCase):
         self.frecon.fake_replication_rtype = None
 
     def test_recon_get_replication_all(self):
-        get_replication_resp = ['{"replicationtest": "1"}']
+        get_replication_resp = [b'{"replicationtest": "1"}']
         # test account
         req = Request.blank('/recon/replication/account',
                             environ={'REQUEST_METHOD': 'GET'})
@@ -1202,21 +1440,21 @@ class TestReconMiddleware(unittest.TestCase):
         self.frecon.fake_replication_rtype = None
 
     def test_recon_get_auditor_invalid(self):
-        get_auditor_resp = ['Invalid path: /recon/auditor/invalid']
+        get_auditor_resp = [b'Invalid path: /recon/auditor/invalid']
         req = Request.blank('/recon/auditor/invalid',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_auditor_resp)
 
     def test_recon_get_auditor_notype(self):
-        get_auditor_resp = ['Invalid path: /recon/auditor']
+        get_auditor_resp = [b'Invalid path: /recon/auditor']
         req = Request.blank('/recon/auditor',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_auditor_resp)
 
     def test_recon_get_auditor_all(self):
-        get_auditor_resp = ['{"auditortest": "1"}']
+        get_auditor_resp = [b'{"auditortest": "1"}']
         req = Request.blank('/recon/auditor/account',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
@@ -1237,21 +1475,21 @@ class TestReconMiddleware(unittest.TestCase):
         self.frecon.fake_auditor_rtype = None
 
     def test_recon_get_updater_invalid(self):
-        get_updater_resp = ['Invalid path: /recon/updater/invalid']
+        get_updater_resp = [b'Invalid path: /recon/updater/invalid']
         req = Request.blank('/recon/updater/invalid',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_updater_resp)
 
     def test_recon_get_updater_notype(self):
-        get_updater_resp = ['Invalid path: /recon/updater']
+        get_updater_resp = [b'Invalid path: /recon/updater']
         req = Request.blank('/recon/updater',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_updater_resp)
 
     def test_recon_get_updater(self):
-        get_updater_resp = ['{"updatertest": "1"}']
+        get_updater_resp = [b'{"updatertest": "1"}']
         req = Request.blank('/recon/updater/container',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
@@ -1266,21 +1504,21 @@ class TestReconMiddleware(unittest.TestCase):
         self.frecon.fake_updater_rtype = None
 
     def test_recon_get_expirer_invalid(self):
-        get_updater_resp = ['Invalid path: /recon/expirer/invalid']
+        get_updater_resp = [b'Invalid path: /recon/expirer/invalid']
         req = Request.blank('/recon/expirer/invalid',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_updater_resp)
 
     def test_recon_get_expirer_notype(self):
-        get_updater_resp = ['Invalid path: /recon/expirer']
+        get_updater_resp = [b'Invalid path: /recon/expirer']
         req = Request.blank('/recon/expirer',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_updater_resp)
 
     def test_recon_get_expirer_object(self):
-        get_expirer_resp = ['{"expirertest": "1"}']
+        get_expirer_resp = [b'{"expirertest": "1"}']
         req = Request.blank('/recon/expirer/object',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
@@ -1289,14 +1527,14 @@ class TestReconMiddleware(unittest.TestCase):
         self.frecon.fake_updater_rtype = None
 
     def test_recon_get_mounted(self):
-        get_mounted_resp = ['{"mountedtest": "1"}']
+        get_mounted_resp = [b'{"mountedtest": "1"}']
         req = Request.blank('/recon/mounted',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_mounted_resp)
 
     def test_recon_get_unmounted(self):
-        get_unmounted_resp = ['{"unmountedtest": "1"}']
+        get_unmounted_resp = [b'{"unmountedtest": "1"}']
         self.app.get_unmounted = self.frecon.fake_unmounted
         req = Request.blank('/recon/unmounted',
                             environ={'REQUEST_METHOD': 'GET'})
@@ -1304,43 +1542,43 @@ class TestReconMiddleware(unittest.TestCase):
         self.assertEqual(resp, get_unmounted_resp)
 
     def test_recon_get_unmounted_empty(self):
-        get_unmounted_resp = '[]'
+        get_unmounted_resp = b'[]'
         self.app.get_unmounted = self.frecon.fake_unmounted_empty
         req = Request.blank('/recon/unmounted',
                             environ={'REQUEST_METHOD': 'GET'})
-        resp = ''.join(self.app(req.environ, start_response))
+        resp = b''.join(self.app(req.environ, start_response))
         self.assertEqual(resp, get_unmounted_resp)
 
     def test_recon_get_diskusage(self):
-        get_diskusage_resp = ['{"diskusagetest": "1"}']
+        get_diskusage_resp = [b'{"diskusagetest": "1"}']
         req = Request.blank('/recon/diskusage',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_diskusage_resp)
 
     def test_recon_get_ringmd5(self):
-        get_ringmd5_resp = ['{"ringmd5test": "1"}']
+        get_ringmd5_resp = [b'{"ringmd5test": "1"}']
         req = Request.blank('/recon/ringmd5',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_ringmd5_resp)
 
     def test_recon_get_swiftconfmd5(self):
-        get_swiftconfmd5_resp = ['{"/etc/swift/swift.conf": "abcdef"}']
+        get_swiftconfmd5_resp = [b'{"/etc/swift/swift.conf": "abcdef"}']
         req = Request.blank('/recon/swiftconfmd5',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_swiftconfmd5_resp)
 
     def test_recon_get_quarantined(self):
-        get_quarantined_resp = ['{"quarantinedtest": "1"}']
+        get_quarantined_resp = [b'{"quarantinedtest": "1"}']
         req = Request.blank('/recon/quarantined',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_quarantined_resp)
 
     def test_recon_get_sockstat(self):
-        get_sockstat_resp = ['{"sockstattest": "1"}']
+        get_sockstat_resp = [b'{"sockstattest": "1"}']
         req = Request.blank('/recon/sockstat',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
@@ -1350,28 +1588,28 @@ class TestReconMiddleware(unittest.TestCase):
         req = Request.blank('/recon/invalid',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
-        self.assertEqual(resp, ['Invalid path: /recon/invalid'])
+        self.assertEqual(resp, [b'Invalid path: /recon/invalid'])
 
     def test_no_content(self):
         self.app.get_load = self.frecon.nocontent
         req = Request.blank('/recon/load', environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
-        self.assertEqual(resp, ['Internal server error.'])
+        self.assertEqual(resp, [b'Internal server error.'])
 
     def test_recon_pass(self):
         req = Request.blank('/', environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
-        self.assertEqual(resp, 'FAKE APP')
+        self.assertEqual(resp, b'FAKE APP')
 
     def test_recon_get_driveaudit(self):
-        get_driveaudit_resp = ['{"driveaudittest": "1"}']
+        get_driveaudit_resp = [b'{"driveaudittest": "1"}']
         req = Request.blank('/recon/driveaudit',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
         self.assertEqual(resp, get_driveaudit_resp)
 
     def test_recon_get_time(self):
-        get_time_resp = ['{"timetest": "1"}']
+        get_time_resp = [b'{"timetest": "1"}']
         req = Request.blank('/recon/time',
                             environ={'REQUEST_METHOD': 'GET'})
         resp = self.app(req.environ, start_response)
@@ -1401,6 +1639,22 @@ class TestReconMiddleware(unittest.TestCase):
                         side_effect=IOError):
             resp = self.real_app_get_swift_conf_md5()
         self.assertIsNone(resp['/etc/swift/swift.conf'])
+
+    def test_recon_get_sharding(self):
+        get_sharding_resp = [
+            b'{"sharding_stats": "1"}']
+        req = Request.blank('/recon/sharding',
+                            environ={'REQUEST_METHOD': 'GET'})
+        resp = self.app(req.environ, start_response)
+        self.assertEqual(resp, get_sharding_resp)
+
+    def test_recon_get_relink(self):
+        get_recon_resp = [
+            b'{"relinktest": "1"}']
+        req = Request.blank('/recon/relinker',
+                            environ={'REQUEST_METHOD': 'GET'})
+        resp = self.app(req.environ, start_response)
+        self.assertEqual(resp, get_recon_resp)
 
 
 if __name__ == '__main__':

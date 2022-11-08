@@ -1,4 +1,5 @@
-# Copyright (c) 2015 OpenStack Foundation
+# -*- coding: utf-8 -*-
+# Copyright (c) 2015-2021 OpenStack Foundation
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import unittest2
+import unittest
 import os
 import boto
 
@@ -21,15 +22,17 @@ import boto
 # pylint: disable-msg=E0611,F0401
 from distutils.version import StrictVersion
 
+import calendar
 import email.parser
 from email.utils import formatdate, parsedate
 from time import mktime
-from hashlib import md5
-from urllib import quote
+import six
 
 import test.functional as tf
 
 from swift.common.middleware.s3api.etree import fromstring
+from swift.common.middleware.s3api.utils import S3Timestamp
+from swift.common.utils import md5, quote
 
 from test.functional.s3api import S3ApiBase
 from test.functional.s3api.s3_test_client import Connection
@@ -58,9 +61,9 @@ class TestS3ApiObject(S3ApiBase):
         self.assertCommonResponseHeaders(headers, etag)
 
     def test_object(self):
-        obj = 'object name with %-sign'
-        content = 'abc123'
-        etag = md5(content).hexdigest()
+        obj = u'object name with %-sign 🙂'
+        content = b'abc123'
+        etag = md5(content, usedforsecurity=False).hexdigest()
 
         # PUT Object
         status, headers, body = \
@@ -97,21 +100,32 @@ class TestS3ApiObject(S3ApiBase):
 
         elem = fromstring(body, 'CopyObjectResult')
         self.assertTrue(elem.find('LastModified').text is not None)
-        last_modified_xml = elem.find('LastModified').text
+        copy_resp_last_modified_xml = elem.find('LastModified').text
         self.assertTrue(elem.find('ETag').text is not None)
         self.assertEqual(etag, elem.find('ETag').text.strip('"'))
         self._assertObjectEtag(dst_bucket, dst_obj, etag)
 
-        # Check timestamp on Copy:
+        # Check timestamp on Copy in listing:
         status, headers, body = \
             self.conn.make_request('GET', dst_bucket)
         self.assertEqual(status, 200)
         elem = fromstring(body, 'ListBucketResult')
-
-        # FIXME: COPY result drops milli/microseconds but GET doesn't
         self.assertEqual(
-            elem.find('Contents').find("LastModified").text.rsplit('.', 1)[0],
-            last_modified_xml.rsplit('.', 1)[0])
+            elem.find('Contents').find("LastModified").text,
+            copy_resp_last_modified_xml)
+
+        # GET Object copy
+        status, headers, body = \
+            self.conn.make_request('GET', dst_bucket, dst_obj)
+        self.assertEqual(status, 200)
+
+        self.assertCommonResponseHeaders(headers, etag)
+        self.assertTrue(headers['last-modified'] is not None)
+        self.assertEqual(
+            float(S3Timestamp.from_s3xmlformat(copy_resp_last_modified_xml)),
+            calendar.timegm(parsedate(headers['last-modified'])))
+        self.assertTrue(headers['content-type'] is not None)
+        self.assertEqual(headers['content-length'], str(len(content)))
 
         # GET Object
         status, headers, body = \
@@ -139,8 +153,14 @@ class TestS3ApiObject(S3ApiBase):
         self.assertEqual(status, 204)
         self.assertCommonResponseHeaders(headers)
 
+        # DELETE Non-Existent Object
+        status, headers, body = \
+            self.conn.make_request('DELETE', self.bucket, 'does-not-exist')
+        self.assertEqual(status, 204)
+        self.assertCommonResponseHeaders(headers)
+
     def test_put_object_error(self):
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('PUT', self.bucket, 'object')
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
@@ -151,6 +171,13 @@ class TestS3ApiObject(S3ApiBase):
         self.assertEqual(get_error_code(body), 'NoSuchBucket')
         self.assertEqual(headers['content-type'], 'application/xml')
 
+    def test_put_object_name_too_long(self):
+        status, headers, body = self.conn.make_request(
+            'PUT', self.bucket,
+            'x' * (tf.cluster_info['swift']['max_object_name_length'] + 1))
+        self.assertEqual(get_error_code(body), 'KeyTooLongError')
+        self.assertEqual(headers['content-type'], 'application/xml')
+
     def test_put_object_copy_error(self):
         obj = 'object'
         self.conn.make_request('PUT', self.bucket, obj)
@@ -159,7 +186,7 @@ class TestS3ApiObject(S3ApiBase):
         dst_obj = 'dst_object'
 
         headers = {'x-amz-copy-source': '/%s/%s' % (self.bucket, obj)}
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('PUT', dst_bucket, dst_obj, headers)
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
@@ -190,7 +217,7 @@ class TestS3ApiObject(S3ApiBase):
         obj = 'object'
         self.conn.make_request('PUT', self.bucket, obj)
 
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('GET', self.bucket, obj)
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
@@ -209,38 +236,33 @@ class TestS3ApiObject(S3ApiBase):
         obj = 'object'
         self.conn.make_request('PUT', self.bucket, obj)
 
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('HEAD', self.bucket, obj)
         self.assertEqual(status, 403)
-        self.assertEqual(body, '')  # sanity
+        self.assertEqual(body, b'')  # sanity
         self.assertEqual(headers['content-type'], 'application/xml')
 
         status, headers, body = \
             self.conn.make_request('HEAD', self.bucket, 'invalid')
         self.assertEqual(status, 404)
-        self.assertEqual(body, '')  # sanity
+        self.assertEqual(body, b'')  # sanity
         self.assertEqual(headers['content-type'], 'application/xml')
 
         status, headers, body = \
             self.conn.make_request('HEAD', 'invalid', obj)
         self.assertEqual(status, 404)
-        self.assertEqual(body, '')  # sanity
+        self.assertEqual(body, b'')  # sanity
         self.assertEqual(headers['content-type'], 'application/xml')
 
     def test_delete_object_error(self):
         obj = 'object'
         self.conn.make_request('PUT', self.bucket, obj)
 
-        auth_error_conn = Connection(aws_secret_key='invalid')
+        auth_error_conn = Connection(tf.config['s3_access_key'], 'invalid')
         status, headers, body = \
             auth_error_conn.make_request('DELETE', self.bucket, obj)
         self.assertEqual(get_error_code(body), 'SignatureDoesNotMatch')
-        self.assertEqual(headers['content-type'], 'application/xml')
-
-        status, headers, body = \
-            self.conn.make_request('DELETE', self.bucket, 'invalid')
-        self.assertEqual(get_error_code(body), 'NoSuchKey')
         self.assertEqual(headers['content-type'], 'application/xml')
 
         status, headers, body = \
@@ -250,7 +272,7 @@ class TestS3ApiObject(S3ApiBase):
 
     def test_put_object_content_encoding(self):
         obj = 'object'
-        etag = md5().hexdigest()
+        etag = md5(usedforsecurity=False).hexdigest()
         headers = {'Content-Encoding': 'gzip'}
         status, headers, body = \
             self.conn.make_request('PUT', self.bucket, obj, headers)
@@ -264,8 +286,8 @@ class TestS3ApiObject(S3ApiBase):
 
     def test_put_object_content_md5(self):
         obj = 'object'
-        content = 'abcdefghij'
-        etag = md5(content).hexdigest()
+        content = b'abcdefghij'
+        etag = md5(content, usedforsecurity=False).hexdigest()
         headers = {'Content-MD5': calculate_md5(content)}
         status, headers, body = \
             self.conn.make_request('PUT', self.bucket, obj, headers, content)
@@ -275,8 +297,8 @@ class TestS3ApiObject(S3ApiBase):
 
     def test_put_object_content_type(self):
         obj = 'object'
-        content = 'abcdefghij'
-        etag = md5(content).hexdigest()
+        content = b'abcdefghij'
+        etag = md5(content, usedforsecurity=False).hexdigest()
         headers = {'Content-Type': 'text/plain'}
         status, headers, body = \
             self.conn.make_request('PUT', self.bucket, obj, headers, content)
@@ -289,7 +311,7 @@ class TestS3ApiObject(S3ApiBase):
 
     def test_put_object_conditional_requests(self):
         obj = 'object'
-        content = 'abcdefghij'
+        content = b'abcdefghij'
         headers = {'If-None-Match': '*'}
         status, headers, body = \
             self.conn.make_request('PUT', self.bucket, obj, headers, content)
@@ -317,8 +339,8 @@ class TestS3ApiObject(S3ApiBase):
 
     def test_put_object_expect(self):
         obj = 'object'
-        content = 'abcdefghij'
-        etag = md5(content).hexdigest()
+        content = b'abcdefghij'
+        etag = md5(content, usedforsecurity=False).hexdigest()
         headers = {'Expect': '100-continue'}
         status, headers, body = \
             self.conn.make_request('PUT', self.bucket, obj, headers, content)
@@ -330,8 +352,8 @@ class TestS3ApiObject(S3ApiBase):
         if expected_headers is None:
             expected_headers = req_headers
         obj = 'object'
-        content = 'abcdefghij'
-        etag = md5(content).hexdigest()
+        content = b'abcdefghij'
+        etag = md5(content, usedforsecurity=False).hexdigest()
         status, headers, body = \
             self.conn.make_request('PUT', self.bucket, obj,
                                    req_headers, content)
@@ -386,8 +408,8 @@ class TestS3ApiObject(S3ApiBase):
 
     def test_put_object_storage_class(self):
         obj = 'object'
-        content = 'abcdefghij'
-        etag = md5(content).hexdigest()
+        content = b'abcdefghij'
+        etag = md5(content, usedforsecurity=False).hexdigest()
         headers = {'X-Amz-Storage-Class': 'STANDARD'}
         status, headers, body = \
             self.conn.make_request('PUT', self.bucket, obj, headers, content)
@@ -398,7 +420,7 @@ class TestS3ApiObject(S3ApiBase):
     def test_put_object_copy_source_params(self):
         obj = 'object'
         src_headers = {'X-Amz-Meta-Test': 'src'}
-        src_body = 'some content'
+        src_body = b'some content'
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
         self.conn.make_request('PUT', self.bucket, obj, src_headers, src_body)
@@ -432,8 +454,8 @@ class TestS3ApiObject(S3ApiBase):
 
     def test_put_object_copy_source(self):
         obj = 'object'
-        content = 'abcdefghij'
-        etag = md5(content).hexdigest()
+        content = b'abcdefghij'
+        etag = md5(content, usedforsecurity=False).hexdigest()
         self.conn.make_request('PUT', self.bucket, obj, body=content)
 
         dst_bucket = 'dst-bucket'
@@ -486,11 +508,40 @@ class TestS3ApiObject(S3ApiBase):
             self.conn.make_request('HEAD', dst_bucket, dst_obj)
         self.assertEqual(headers['x-amz-meta-test'], 'dst')
 
+        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj),
+                   'X-Amz-Metadata-Directive': 'COPY',
+                   'X-Amz-Meta-Test': 'dst'}
+        status, headers, body = \
+            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
+        self.assertEqual(status, 200)
+        self.assertCommonResponseHeaders(headers)
+        status, headers, body = \
+            self.conn.make_request('HEAD', dst_bucket, dst_obj)
+        self.assertEqual(headers['x-amz-meta-test'], 'src')
+
+        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj),
+                   'X-Amz-Meta-Test2': 'dst',
+                   'X-Amz-Metadata-Directive': 'REPLACE'}
+        status, headers, body = \
+            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
+        self.assertEqual(status, 200)
+        self.assertCommonResponseHeaders(headers)
+        status, headers, body = \
+            self.conn.make_request('HEAD', dst_bucket, dst_obj)
+        self.assertNotIn('x-amz-meta-test', headers)
+        self.assertEqual(headers['x-amz-meta-test2'], 'dst')
+
+        headers = {'X-Amz-Copy-Source': '/%s/%s' % (self.bucket, obj),
+                   'X-Amz-Metadata-Directive': 'BAD'}
+        status, headers, body = \
+            self.conn.make_request('PUT', dst_bucket, dst_obj, headers)
+        self.assertEqual(status, 400)
+
     def test_put_object_copy_source_if_modified_since(self):
         obj = 'object'
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
-        etag = md5().hexdigest()
+        etag = md5(usedforsecurity=False).hexdigest()
         self.conn.make_request('PUT', self.bucket, obj)
         self.conn.make_request('PUT', dst_bucket)
 
@@ -510,7 +561,7 @@ class TestS3ApiObject(S3ApiBase):
         obj = 'object'
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
-        etag = md5().hexdigest()
+        etag = md5(usedforsecurity=False).hexdigest()
         self.conn.make_request('PUT', self.bucket, obj)
         self.conn.make_request('PUT', dst_bucket)
 
@@ -530,7 +581,7 @@ class TestS3ApiObject(S3ApiBase):
         obj = 'object'
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
-        etag = md5().hexdigest()
+        etag = md5(usedforsecurity=False).hexdigest()
         self.conn.make_request('PUT', self.bucket, obj)
         self.conn.make_request('PUT', dst_bucket)
 
@@ -549,7 +600,7 @@ class TestS3ApiObject(S3ApiBase):
         obj = 'object'
         dst_bucket = 'dst-bucket'
         dst_obj = 'dst_object'
-        etag = md5().hexdigest()
+        etag = md5(usedforsecurity=False).hexdigest()
         self.conn.make_request('PUT', self.bucket, obj)
         self.conn.make_request('PUT', dst_bucket)
 
@@ -618,8 +669,9 @@ class TestS3ApiObject(S3ApiBase):
 
     def test_get_object_range(self):
         obj = 'object'
-        content = 'abcdefghij'
-        headers = {'x-amz-meta-test': 'swift'}
+        content = b'abcdefghij'
+        headers = {'x-amz-meta-test': 'swift',
+                   'content-type': 'application/octet-stream'}
         self.conn.make_request(
             'PUT', self.bucket, obj, headers=headers, body=content)
 
@@ -632,7 +684,8 @@ class TestS3ApiObject(S3ApiBase):
         self.assertEqual(headers['content-length'], '5')
         self.assertTrue('x-amz-meta-test' in headers)
         self.assertEqual('swift', headers['x-amz-meta-test'])
-        self.assertEqual(body, 'bcdef')
+        self.assertEqual(body, b'bcdef')
+        self.assertEqual('application/octet-stream', headers['content-type'])
 
         headers = {'Range': 'bytes=5-'}
         status, headers, body = \
@@ -643,7 +696,7 @@ class TestS3ApiObject(S3ApiBase):
         self.assertEqual(headers['content-length'], '5')
         self.assertTrue('x-amz-meta-test' in headers)
         self.assertEqual('swift', headers['x-amz-meta-test'])
-        self.assertEqual(body, 'fghij')
+        self.assertEqual(body, b'fghij')
 
         headers = {'Range': 'bytes=-5'}
         status, headers, body = \
@@ -654,7 +707,7 @@ class TestS3ApiObject(S3ApiBase):
         self.assertEqual(headers['content-length'], '5')
         self.assertTrue('x-amz-meta-test' in headers)
         self.assertEqual('swift', headers['x-amz-meta-test'])
-        self.assertEqual(body, 'fghij')
+        self.assertEqual(body, b'fghij')
 
         ranges = ['1-2', '4-5']
 
@@ -663,9 +716,9 @@ class TestS3ApiObject(S3ApiBase):
             self.conn.make_request('GET', self.bucket, obj, headers=headers)
         self.assertEqual(status, 206)
         self.assertCommonResponseHeaders(headers)
-        self.assertTrue('content-length' in headers)
+        self.assertIn('content-length', headers)
 
-        self.assertTrue('content-type' in headers)  # sanity
+        self.assertIn('content-type', headers)  # sanity
         content_type, boundary = headers['content-type'].split(';')
 
         self.assertEqual('multipart/byteranges', content_type)
@@ -674,10 +727,13 @@ class TestS3ApiObject(S3ApiBase):
 
         # TODO: Using swift.common.utils.multipart_byteranges_to_document_iters
         #       could be easy enough.
-        parser = email.parser.FeedParser()
+        if six.PY2:
+            parser = email.parser.FeedParser()
+        else:
+            parser = email.parser.BytesFeedParser()
         parser.feed(
-            "Content-Type: multipart/byterange; boundary=%s\r\n\r\n" %
-            boundary_str)
+            b"Content-Type: multipart/byterange; boundary=%s\r\n\r\n" %
+            boundary_str.encode('ascii'))
         parser.feed(body)
         message = parser.close()
 
@@ -697,7 +753,7 @@ class TestS3ApiObject(S3ApiBase):
             self.assertEqual(
                 expected_range, part.get('Content-Range'))
             # rest
-            payload = part.get_payload().strip()
+            payload = part.get_payload(decode=True).strip()
             self.assertEqual(content[start:end + 1], payload)
 
     def test_get_object_if_modified_since(self):
@@ -727,6 +783,28 @@ class TestS3ApiObject(S3ApiBase):
         self.assertEqual(status, 200)
         self.assertCommonResponseHeaders(headers)
 
+        # check we can use the last modified time from the listing...
+        status, headers, body = \
+            self.conn.make_request('GET', self.bucket)
+        elem = fromstring(body, 'ListBucketResult')
+        last_modified = elem.find('./Contents/LastModified').text
+        listing_datetime = S3Timestamp.from_s3xmlformat(last_modified)
+        # Make sure there's no fractions of a second
+        self.assertEqual(int(listing_datetime), float(listing_datetime))
+        header_datetime = formatdate(int(listing_datetime))
+
+        headers = {'If-Unmodified-Since': header_datetime}
+        status, headers, body = \
+            self.conn.make_request('GET', self.bucket, obj, headers=headers)
+        self.assertEqual(status, 200)
+        self.assertCommonResponseHeaders(headers)
+
+        headers = {'If-Modified-Since': header_datetime}
+        status, headers, body = \
+            self.conn.make_request('GET', self.bucket, obj, headers=headers)
+        self.assertEqual(status, 304)
+        self.assertCommonResponseHeaders(headers)
+
     def test_get_object_if_match(self):
         obj = 'object'
         self.conn.make_request('PUT', self.bucket, obj)
@@ -753,7 +831,7 @@ class TestS3ApiObject(S3ApiBase):
 
     def test_head_object_range(self):
         obj = 'object'
-        content = 'abcdefghij'
+        content = b'abcdefghij'
         self.conn.make_request('PUT', self.bucket, obj, body=content)
 
         headers = {'Range': 'bytes=1-5'}
@@ -839,35 +917,35 @@ class TestS3ApiObjectSigV4(TestS3ApiObject):
     def setUp(self):
         super(TestS3ApiObjectSigV4, self).setUp()
 
-    @unittest2.skipIf(StrictVersion(boto.__version__) < StrictVersion('3.0'),
-                      'This stuff got the signing issue of boto<=2.x')
+    @unittest.skipIf(StrictVersion(boto.__version__) < StrictVersion('3.0'),
+                     'This stuff got the signing issue of boto<=2.x')
     def test_put_object_metadata(self):
         super(TestS3ApiObjectSigV4, self).test_put_object_metadata()
 
-    @unittest2.skipIf(StrictVersion(boto.__version__) < StrictVersion('3.0'),
-                      'This stuff got the signing issue of boto<=2.x')
+    @unittest.skipIf(StrictVersion(boto.__version__) < StrictVersion('3.0'),
+                     'This stuff got the signing issue of boto<=2.x')
     def test_put_object_copy_source_if_modified_since(self):
         super(TestS3ApiObjectSigV4, self).\
             test_put_object_copy_source_if_modified_since()
 
-    @unittest2.skipIf(StrictVersion(boto.__version__) < StrictVersion('3.0'),
-                      'This stuff got the signing issue of boto<=2.x')
+    @unittest.skipIf(StrictVersion(boto.__version__) < StrictVersion('3.0'),
+                     'This stuff got the signing issue of boto<=2.x')
     def test_put_object_copy_source_if_unmodified_since(self):
         super(TestS3ApiObjectSigV4, self).\
             test_put_object_copy_source_if_unmodified_since()
 
-    @unittest2.skipIf(StrictVersion(boto.__version__) < StrictVersion('3.0'),
-                      'This stuff got the signing issue of boto<=2.x')
+    @unittest.skipIf(StrictVersion(boto.__version__) < StrictVersion('3.0'),
+                     'This stuff got the signing issue of boto<=2.x')
     def test_put_object_copy_source_if_match(self):
         super(TestS3ApiObjectSigV4,
               self).test_put_object_copy_source_if_match()
 
-    @unittest2.skipIf(StrictVersion(boto.__version__) < StrictVersion('3.0'),
-                      'This stuff got the signing issue of boto<=2.x')
+    @unittest.skipIf(StrictVersion(boto.__version__) < StrictVersion('3.0'),
+                     'This stuff got the signing issue of boto<=2.x')
     def test_put_object_copy_source_if_none_match(self):
         super(TestS3ApiObjectSigV4,
               self).test_put_object_copy_source_if_none_match()
 
 
 if __name__ == '__main__':
-    unittest2.main()
+    unittest.main()

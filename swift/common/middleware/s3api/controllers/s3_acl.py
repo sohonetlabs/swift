@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from urllib import quote
+from six.moves.urllib.parse import quote
 from swift.common.utils import public
 
 from swift.common.middleware.s3api.controllers.base import Controller
@@ -37,7 +37,7 @@ class S3AclController(Controller):
         """
         Handles GET Bucket acl and GET Object acl.
         """
-        resp = req.get_response(self.app)
+        resp = req.get_response(self.app, method='HEAD')
 
         acl = resp.object_acl if req.is_object_request else resp.bucket_acl
 

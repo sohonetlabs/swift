@@ -13,7 +13,7 @@
 # implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from io import StringIO
+from io import BytesIO
 import unittest
 
 import os
@@ -22,6 +22,7 @@ import uuid
 from swift.common.direct_client import direct_get_suffix_hashes
 from swift.common.exceptions import DiskFileDeleted
 from swift.common.internal_client import UnexpectedResponse
+from swift.common.swob import normalize_etag
 from swift.container.backend import ContainerBroker
 from swift.common import utils
 from swiftclient import client
@@ -129,14 +130,14 @@ class Test(ReplProbeTest):
 
     def _assert_object_metadata_matches_listing(self, listing, metadata):
         self.assertEqual(listing['bytes'], int(metadata['content-length']))
-        self.assertEqual(listing['hash'], metadata['etag'])
+        self.assertEqual(listing['hash'], normalize_etag(metadata['etag']))
         self.assertEqual(listing['content_type'], metadata['content-type'])
         modified = Timestamp(metadata['x-timestamp']).isoformat
         self.assertEqual(listing['last_modified'], modified)
 
-    def _put_object(self, headers=None, body=u'stuff'):
+    def _put_object(self, headers=None, body=b'stuff'):
         headers = headers or {}
-        self.int_client.upload_object(StringIO(body), self.account,
+        self.int_client.upload_object(BytesIO(body), self.account,
                                       self.container_name,
                                       self.object_name, headers)
 
@@ -232,12 +233,12 @@ class Test(ReplProbeTest):
         self.brain.put_container()
 
         # put object
-        self._put_object(headers={'Content-Type': 'foo'}, body=u'older')
+        self._put_object(headers={'Content-Type': 'foo'}, body=b'older')
 
         # put newer object to first server subset
         self.brain.stop_primary_half()
         self.container_brain.stop_primary_half()
-        self._put_object(headers={'Content-Type': 'bar'}, body=u'newer')
+        self._put_object(headers={'Content-Type': 'bar'}, body=b'newer')
         metadata = self._get_object_metadata()
         etag = metadata['etag']
         self.brain.start_primary_half()

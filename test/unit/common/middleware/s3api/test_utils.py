@@ -81,21 +81,6 @@ class TestS3ApiUtils(unittest.TestCase):
         self.assertFalse(utils.validate_bucket_name('bucket.', False))
         self.assertFalse(utils.validate_bucket_name('a' * 256, False))
 
-    def test_s3timestamp(self):
-        expected = '1970-01-01T00:00:01.000Z'
-        # integer
-        ts = utils.S3Timestamp(1)
-        self.assertEqual(expected, ts.s3xmlformat)
-        # milliseconds unit should be floored
-        ts = utils.S3Timestamp(1.1)
-        self.assertEqual(expected, ts.s3xmlformat)
-        # float (microseconds) should be floored too
-        ts = utils.S3Timestamp(1.000001)
-        self.assertEqual(expected, ts.s3xmlformat)
-        # Bigger float (milliseconds) should be floored too
-        ts = utils.S3Timestamp(1.9)
-        self.assertEqual(expected, ts.s3xmlformat)
-
     def test_mktime(self):
         date_headers = [
             'Thu, 01 Jan 1970 00:00:00 -0000',
@@ -128,6 +113,94 @@ class TestS3ApiUtils(unittest.TestCase):
         finally:
             os.environ['TZ'] = orig_tz
             time.tzset()
+
+
+class TestS3Timestamp(unittest.TestCase):
+    def test_s3xmlformat(self):
+        expected = '1970-01-01T00:00:01.000Z'
+        # integer
+        ts = utils.S3Timestamp(1)
+        self.assertEqual(expected, ts.s3xmlformat)
+        # milliseconds unit should be rounded up
+        expected = '1970-01-01T00:00:02.000Z'
+        ts = utils.S3Timestamp(1.1)
+        self.assertEqual(expected, ts.s3xmlformat)
+        # float (microseconds) should be floored too
+        ts = utils.S3Timestamp(1.000001)
+        self.assertEqual(expected, ts.s3xmlformat)
+        # Bigger float (milliseconds) should be floored too
+        ts = utils.S3Timestamp(1.9)
+        self.assertEqual(expected, ts.s3xmlformat)
+
+    def test_from_s3xmlformat(self):
+        ts = utils.S3Timestamp.from_s3xmlformat('2014-06-10T22:47:32.000Z')
+        self.assertIsInstance(ts, utils.S3Timestamp)
+        self.assertEqual(1402440452, float(ts))
+        self.assertEqual('2014-06-10T22:47:32.000000', ts.isoformat)
+
+        ts = utils.S3Timestamp.from_s3xmlformat('1970-01-01T00:00:00.000Z')
+        self.assertIsInstance(ts, utils.S3Timestamp)
+        self.assertEqual(0.0, float(ts))
+        self.assertEqual('1970-01-01T00:00:00.000000', ts.isoformat)
+
+        ts = utils.S3Timestamp(1402440452.0)
+        self.assertIsInstance(ts, utils.S3Timestamp)
+        ts1 = utils.S3Timestamp.from_s3xmlformat(ts.s3xmlformat)
+        self.assertIsInstance(ts1, utils.S3Timestamp)
+        self.assertEqual(ts, ts1)
+
+    def test_from_isoformat(self):
+        ts = utils.S3Timestamp.from_isoformat('2014-06-10T22:47:32.054580')
+        self.assertIsInstance(ts, utils.S3Timestamp)
+        self.assertEqual(1402440452.05458, float(ts))
+        self.assertEqual('2014-06-10T22:47:32.054580', ts.isoformat)
+        self.assertEqual('2014-06-10T22:47:33.000Z', ts.s3xmlformat)
+
+
+class TestConfig(unittest.TestCase):
+
+    def _assert_defaults(self, conf):
+        self.assertEqual([], conf.storage_domains)
+        self.assertEqual('us-east-1', conf.location)
+        self.assertFalse(conf.force_swift_request_proxy_log)
+        self.assertTrue(conf.dns_compliant_bucket_names)
+        self.assertTrue(conf.allow_multipart_uploads)
+        self.assertFalse(conf.allow_no_owner)
+        self.assertEqual(900, conf.allowable_clock_skew)
+        self.assertFalse(conf.ratelimit_as_client_error)
+
+    def test_defaults(self):
+        # deliberately brittle so new defaults will need to be added to test
+        conf = utils.Config()
+        self._assert_defaults(conf)
+        del conf.storage_domains
+        del conf.location
+        del conf.force_swift_request_proxy_log
+        del conf.dns_compliant_bucket_names
+        del conf.allow_multipart_uploads
+        del conf.allow_no_owner
+        del conf.allowable_clock_skew
+        del conf.ratelimit_as_client_error
+        self.assertEqual({}, conf)
+
+    def test_update(self):
+        conf = utils.Config()
+        conf.update({'key1': 'val1', 'key2': 'val2'})
+        self._assert_defaults(conf)
+        self.assertEqual(conf.key1, 'val1')
+        self.assertEqual(conf.key2, 'val2')
+
+        conf.update({'allow_multipart_uploads': False})
+        self.assertFalse(conf.allow_multipart_uploads)
+
+    def test_set_get_delete(self):
+        conf = utils.Config()
+        self.assertRaises(AttributeError, lambda: conf.new_attr)
+        conf.new_attr = 123
+        self.assertEqual(123, conf.new_attr)
+        del conf.new_attr
+        self.assertRaises(AttributeError, lambda: conf.new_attr)
+
 
 if __name__ == '__main__':
     unittest.main()

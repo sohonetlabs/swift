@@ -57,6 +57,8 @@ IP address the account server should bind to. The default is 0.0.0.0 which will 
 it bind to all available addresses.
 .IP "\fBbind_port\fR"
 TCP port the account server should bind to. The default is 6202.
+.IP "\fBkeep_idle\fR"
+Value to set for socket TCP_KEEPIDLE. The default value is 600.
 .IP "\fBbind_timeout\fR"
 Timeout to bind socket. The default is 30.
 .IP \fBbacklog\fR
@@ -177,8 +179,8 @@ Logging level. The default is INFO.
 Enables request logging. The default is True.
 .IP "\fBset log_address\fR
 Logging address. The default is /dev/log.
-.IP "\fBauto_create_account_prefix\fR
-The default is ".".
+.IP "\fBauto_create_account_prefix [deprecated]\fR"
+The default is ".". Should be configured in swift.conf instead.
 .IP "\fBreplication_server\fR
 Configure parameter for creating specific server.
 To handle all verbs, including replication verbs, do not specify
@@ -392,7 +394,7 @@ reclaim_age. This ensures that once the account-reaper has deleted a
 container there is sufficient time for the container-updater to report to the
 account before the account DB is removed.
 .IP \fBreap_warn_after\fR
-If the account fails to be be reaped due to a persistent error, the
+If the account fails to be reaped due to a persistent error, the
 account reaper will log a message such as:
     Account <name> has not been reaped since <date>
 You can search logs for this message if space is not being reclaimed

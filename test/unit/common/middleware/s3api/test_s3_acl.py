@@ -34,13 +34,16 @@ from test.unit.common.middleware.s3api import FakeSwift
 XMLNS_XSI = 'http://www.w3.org/2001/XMLSchema-instance'
 
 
-def s3acl(func=None, s3acl_only=False):
+def s3acl(func=None, s3acl_only=False, versioning_enabled=True):
     """
     NOTE: s3acl decorator needs an instance of s3api testing framework.
           (i.e. An instance for first argument is necessary)
     """
     if func is None:
-        return functools.partial(s3acl, s3acl_only=s3acl_only)
+        return functools.partial(
+            s3acl,
+            s3acl_only=s3acl_only,
+            versioning_enabled=versioning_enabled)
 
     @functools.wraps(func)
     def s3acl_decorator(*args, **kwargs):
@@ -57,18 +60,24 @@ def s3acl(func=None, s3acl_only=False):
                 #  @patch(xxx)
                 #  def test_xxxx(self)
 
+                fake_info = {'status': 204}
+                if versioning_enabled:
+                    fake_info['sysmeta'] = {
+                        'versions-container': '\x00versions\x00bucket',
+                    }
+
                 with patch('swift.common.middleware.s3api.s3request.'
-                           'get_container_info',
-                           return_value={'status': 204}):
+                           'get_container_info', return_value=fake_info):
                     func(*args, **kwargs)
             except AssertionError:
                 # Make traceback message to clarify the assertion
                 exc_type, exc_instance, exc_traceback = sys.exc_info()
                 formatted_traceback = ''.join(traceback.format_tb(
                     exc_traceback))
-                message = '\n%s\n%s:\n%s' % (formatted_traceback,
-                                             exc_type.__name__,
-                                             exc_instance.message)
+                message = '\n%s\n%s' % (formatted_traceback,
+                                        exc_type.__name__)
+                if exc_instance.args:
+                    message += ':\n%s' % (exc_instance.args[0],)
                 message += failing_point
                 raise exc_type(message)
 
@@ -114,7 +123,7 @@ def generate_s3acl_environ(account, swift, owner):
         account_name = '%s:%s' % (account, permission.lower())
         return Grant(User(account_name), permission)
 
-    grants = map(gen_grant, PERMISSIONS)
+    grants = [gen_grant(perm) for perm in PERMISSIONS]
     container_headers = _gen_test_headers(owner, grants)
     object_headers = _gen_test_headers(owner, grants, 'object')
     object_body = 'hello'
@@ -200,6 +209,7 @@ class TestS3ApiS3Acl(S3ApiTestCase):
                                      'x-amz-acl': 'private'})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '200')
+        self.assertIn('REMOTE_USER', req.environ)
 
     def test_canned_acl_public_read(self):
         req = Request.blank('/bucket/object?acl',
@@ -365,6 +375,17 @@ class TestS3ApiS3Acl(S3ApiTestCase):
                                      'Date': self.get_date_header(),
                                      'x-amz-grant-read':
                                      'uri="http://acs.amazonaws.com/groups/'
+                                     'global/AllUsers"'})
+        status, headers, body = self.call_s3api(req)
+        self.assertEqual(status.split()[0], '200')
+
+    def test_grant_all_users_with_uppercase_type(self):
+        req = Request.blank('/bucket/object?acl',
+                            environ={'REQUEST_METHOD': 'PUT'},
+                            headers={'Authorization': 'AWS test:tester:hmac',
+                                     'Date': self.get_date_header(),
+                                     'x-amz-grant-read':
+                                     'URI="http://acs.amazonaws.com/groups/'
                                      'global/AllUsers"'})
         status, headers, body = self.call_s3api(req)
         self.assertEqual(status.split()[0], '200')
@@ -535,6 +556,7 @@ class TestS3ApiS3Acl(S3ApiTestCase):
         self.assertRaises(AssertionError, fake_class.s3acl_assert_fail)
         self.assertRaises(TypeError, fake_class.s3acl_s3only_error)
         self.assertIsNone(fake_class.s3acl_s3only_no_error())
+
 
 if __name__ == '__main__':
     unittest.main()

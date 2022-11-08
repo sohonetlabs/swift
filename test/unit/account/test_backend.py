@@ -16,7 +16,6 @@
 """ Tests for swift.account.backend """
 
 from collections import defaultdict
-import hashlib
 import json
 import unittest
 import pickle
@@ -31,12 +30,17 @@ from contextlib import contextmanager
 import random
 import mock
 import base64
+import shutil
+
+import six
 
 from swift.account.backend import AccountBroker
 from swift.common.utils import Timestamp
 from test.unit import patch_policies, with_tempdir, make_timestamp_iter
-from swift.common.db import DatabaseConnectionError
+from swift.common.db import DatabaseConnectionError, TombstoneReclaimer
+from swift.common.request_helpers import get_reserved_name
 from swift.common.storage_policy import StoragePolicy, POLICIES
+from swift.common.utils import md5
 
 from test.unit.common import test_db
 
@@ -44,6 +48,10 @@ from test.unit.common import test_db
 @patch_policies
 class TestAccountBroker(unittest.TestCase):
     """Tests for AccountBroker"""
+
+    def setUp(self):
+        # tests seem to assume x-timestamp was set by the proxy before "now"
+        self.ts = make_timestamp_iter(offset=-1)
 
     def test_creation(self):
         # Test AccountBroker.__init__
@@ -173,29 +181,95 @@ class TestAccountBroker(unittest.TestCase):
         broker.delete_db(Timestamp.now().internal)
         broker.reclaim(Timestamp.now().internal, time())
 
+    def test_batched_reclaim(self):
+        num_of_containers = 60
+        container_specs = []
+        now = time()
+        top_of_the_minute = now - (now % 60)
+        c = itertools.cycle([True, False])
+        for m, is_deleted in six.moves.zip(range(num_of_containers), c):
+            offset = top_of_the_minute - (m * 60)
+            container_specs.append((Timestamp(offset), is_deleted))
+        random.seed(now)
+        random.shuffle(container_specs)
+        policy_indexes = list(p.idx for p in POLICIES)
+        broker = AccountBroker(':memory:', account='test_account')
+        broker.initialize(Timestamp('1').internal)
+        for i, container_spec in enumerate(container_specs):
+            # with container12 before container2 and shuffled ts.internal we
+            # shouldn't be able to accidently rely on any implicit ordering
+            name = 'container%s' % i
+            pidx = random.choice(policy_indexes)
+            ts, is_deleted = container_spec
+            if is_deleted:
+                broker.put_container(name, 0, ts.internal, 0, 0, pidx)
+            else:
+                broker.put_container(name, ts.internal, 0, 0, 0, pidx)
+
+        def count_reclaimable(conn, reclaim_age):
+            return conn.execute(
+                "SELECT count(*) FROM container "
+                "WHERE deleted = 1 AND delete_timestamp < ?", (reclaim_age,)
+            ).fetchone()[0]
+
+        # This is intended to divide the set of timestamps exactly in half
+        # regardless of the value of now
+        reclaim_age = top_of_the_minute + 1 - (num_of_containers / 2 * 60)
+        with broker.get() as conn:
+            self.assertEqual(count_reclaimable(conn, reclaim_age),
+                             num_of_containers / 4)
+
+        trace = []
+
+        class TracingReclaimer(TombstoneReclaimer):
+            def _reclaim(self, conn):
+                trace.append(
+                    (self.age_timestamp, self.marker,
+                     count_reclaimable(conn, self.age_timestamp)))
+                return super(TracingReclaimer, self)._reclaim(conn)
+
+        with mock.patch(
+                'swift.common.db.TombstoneReclaimer', TracingReclaimer), \
+                mock.patch('swift.common.db.RECLAIM_PAGE_SIZE', 10):
+            broker.reclaim(reclaim_age, reclaim_age)
+        with broker.get() as conn:
+            self.assertEqual(count_reclaimable(conn, reclaim_age), 0)
+        self.assertEqual(3, len(trace), trace)
+        self.assertEqual([age for age, marker, reclaimable in trace],
+                         [reclaim_age] * 3)
+        # markers are in-order
+        self.assertLess(trace[0][1], trace[1][1])
+        self.assertLess(trace[1][1], trace[2][1])
+        # reclaimable count gradually decreases
+        # generally, count1 > count2 > count3, but because of the randomness
+        # we may occassionally have count1 == count2 or count2 == count3
+        self.assertGreaterEqual(trace[0][2], trace[1][2])
+        self.assertGreaterEqual(trace[1][2], trace[2][2])
+        # technically, this might happen occasionally, but *really* rarely
+        self.assertTrue(trace[0][2] > trace[1][2] or
+                        trace[1][2] > trace[2][2])
+
     def test_delete_db_status(self):
-        ts = (Timestamp(t).internal for t in itertools.count(int(time())))
-        start = next(ts)
+        start = next(self.ts)
         broker = AccountBroker(':memory:', account='a')
-        broker.initialize(start)
+        broker.initialize(start.internal)
         info = broker.get_info()
-        self.assertEqual(info['put_timestamp'], Timestamp(start).internal)
+        self.assertEqual(info['put_timestamp'], start.internal)
         self.assertGreaterEqual(Timestamp(info['created_at']), start)
         self.assertEqual(info['delete_timestamp'], '0')
         if self.__class__ == TestAccountBrokerBeforeMetadata:
             self.assertEqual(info['status_changed_at'], '0')
         else:
-            self.assertEqual(info['status_changed_at'],
-                             Timestamp(start).internal)
+            self.assertEqual(info['status_changed_at'], start.internal)
 
         # delete it
-        delete_timestamp = next(ts)
-        broker.delete_db(delete_timestamp)
+        delete_timestamp = next(self.ts)
+        broker.delete_db(delete_timestamp.internal)
         info = broker.get_info()
-        self.assertEqual(info['put_timestamp'], Timestamp(start).internal)
+        self.assertEqual(info['put_timestamp'], start.internal)
         self.assertGreaterEqual(Timestamp(info['created_at']), start)
-        self.assertEqual(info['delete_timestamp'], delete_timestamp)
-        self.assertEqual(info['status_changed_at'], delete_timestamp)
+        self.assertEqual(info['delete_timestamp'], delete_timestamp.internal)
+        self.assertEqual(info['status_changed_at'], delete_timestamp.internal)
 
     def test_delete_container(self):
         # Test AccountBroker.delete_container
@@ -541,6 +615,35 @@ class TestAccountBroker(unittest.TestCase):
         self.assertEqual([row[0] for row in listing],
                          ['c10', 'c1'])
 
+    def test_list_container_iter_with_reserved_name(self):
+        # Test ContainerBroker.list_objects_iter
+        broker = AccountBroker(':memory:', account='a')
+        broker.initialize(next(self.ts).internal, 0)
+
+        broker.put_container(
+            'foo', next(self.ts).internal, 0, 0, 0, POLICIES.default.idx)
+        broker.put_container(
+            get_reserved_name('foo'), next(self.ts).internal, 0, 0, 0,
+            POLICIES.default.idx)
+
+        listing = broker.list_containers_iter(100, None, None, '', '')
+        self.assertEqual([row[0] for row in listing], ['foo'])
+
+        listing = broker.list_containers_iter(100, None, None, '', '',
+                                              reverse=True)
+        self.assertEqual([row[0] for row in listing], ['foo'])
+
+        listing = broker.list_containers_iter(100, None, None, '', '',
+                                              allow_reserved=True)
+        self.assertEqual([row[0] for row in listing],
+                         [get_reserved_name('foo'), 'foo'])
+
+        listing = broker.list_containers_iter(100, None, None, '', '',
+                                              reverse=True,
+                                              allow_reserved=True)
+        self.assertEqual([row[0] for row in listing],
+                         ['foo', get_reserved_name('foo')])
+
     def test_reverse_prefix_delim(self):
         expectations = [
             {
@@ -642,7 +745,6 @@ class TestAccountBroker(unittest.TestCase):
                 ],
             },
         ]
-        ts = make_timestamp_iter()
         default_listing_params = {
             'limit': 10000,
             'marker': '',
@@ -653,9 +755,9 @@ class TestAccountBroker(unittest.TestCase):
         failures = []
         for expected in expectations:
             broker = AccountBroker(':memory:', account='a')
-            broker.initialize(next(ts).internal, 0)
+            broker.initialize(next(self.ts).internal, 0)
             for name in expected['containers']:
-                broker.put_container(name, next(ts).internal, 0, 0, 0,
+                broker.put_container(name, next(self.ts).internal, 0, 0, 0,
                                      POLICIES.default.idx)
             params = default_listing_params.copy()
             params.update(expected['params'])
@@ -720,26 +822,23 @@ class TestAccountBroker(unittest.TestCase):
         broker.put_container('b', Timestamp(2).internal,
                              Timestamp(0).internal, 0, 0,
                              POLICIES.default.idx)
-        hasha = hashlib.md5(
-            '%s-%s' % ('a', "%s-%s-%s-%s" % (
-                Timestamp(1).internal, Timestamp(0).internal, 0, 0))
-        ).digest()
-        hashb = hashlib.md5(
-            '%s-%s' % ('b', "%s-%s-%s-%s" % (
-                Timestamp(2).internal, Timestamp(0).internal, 0, 0))
-        ).digest()
-        hashc = \
-            ''.join(('%02x' % (ord(a) ^ ord(b)) for a, b in zip(hasha, hashb)))
+        text = '%s-%s' % ('a', "%s-%s-%s-%s" % (
+               Timestamp(1).internal, Timestamp(0).internal, 0, 0))
+        hasha = md5(text.encode('ascii'), usedforsecurity=False).digest()
+        text = '%s-%s' % ('b', "%s-%s-%s-%s" % (
+               Timestamp(2).internal, Timestamp(0).internal, 0, 0))
+        hashb = md5(text.encode('ascii'), usedforsecurity=False).digest()
+        hashc = ''.join(('%02x' % (ord(a) ^ ord(b) if six.PY2 else a ^ b)
+                         for a, b in zip(hasha, hashb)))
         self.assertEqual(broker.get_info()['hash'], hashc)
         broker.put_container('b', Timestamp(3).internal,
                              Timestamp(0).internal, 0, 0,
                              POLICIES.default.idx)
-        hashb = hashlib.md5(
-            '%s-%s' % ('b', "%s-%s-%s-%s" % (
-                Timestamp(3).internal, Timestamp(0).internal, 0, 0))
-        ).digest()
-        hashc = \
-            ''.join(('%02x' % (ord(a) ^ ord(b)) for a, b in zip(hasha, hashb)))
+        text = '%s-%s' % ('b', "%s-%s-%s-%s" % (
+               Timestamp(3).internal, Timestamp(0).internal, 0, 0))
+        hashb = md5(text.encode('ascii'), usedforsecurity=False).digest()
+        hashc = ''.join(('%02x' % (ord(a) ^ ord(b) if six.PY2 else a ^ b)
+                         for a, b in zip(hasha, hashb)))
         self.assertEqual(broker.get_info()['hash'], hashc)
 
     def test_merge_items(self):
@@ -767,7 +866,9 @@ class TestAccountBroker(unittest.TestCase):
                          sorted([rec['name'] for rec in items]))
 
     def test_merge_items_overwrite_unicode(self):
-        snowman = u'\N{SNOWMAN}'.encode('utf-8')
+        snowman = u'\N{SNOWMAN}'
+        if six.PY2:
+            snowman = snowman.encode('utf-8')
         broker1 = AccountBroker(':memory:', account='a')
         broker1.initialize(Timestamp('1').internal, 0)
         id1 = broker1.get_info()['id']
@@ -873,9 +974,8 @@ class TestAccountBroker(unittest.TestCase):
                      StoragePolicy(2, 'two', False),
                      StoragePolicy(3, 'three', False)])
     def test_get_policy_stats(self):
-        ts = (Timestamp(t).internal for t in itertools.count(int(time())))
         broker = AccountBroker(':memory:', account='a')
-        broker.initialize(next(ts))
+        broker.initialize(next(self.ts).internal)
         # check empty policy_stats
         self.assertTrue(broker.empty())
         policy_stats = broker.get_policy_stats()
@@ -884,9 +984,9 @@ class TestAccountBroker(unittest.TestCase):
         # add some empty containers
         for policy in POLICIES:
             container_name = 'c-%s' % policy.name
-            put_timestamp = next(ts)
+            put_timestamp = next(self.ts)
             broker.put_container(container_name,
-                                 put_timestamp, 0,
+                                 put_timestamp.internal, 0,
                                  0, 0,
                                  policy.idx)
             policy_stats = broker.get_policy_stats()
@@ -899,10 +999,10 @@ class TestAccountBroker(unittest.TestCase):
         # update the containers object & byte count
         for policy in POLICIES:
             container_name = 'c-%s' % policy.name
-            put_timestamp = next(ts)
+            put_timestamp = next(self.ts)
             count = policy.idx * 100  # good as any integer
             broker.put_container(container_name,
-                                 put_timestamp, 0,
+                                 put_timestamp.internal, 0,
                                  count, count,
                                  policy.idx)
 
@@ -925,9 +1025,9 @@ class TestAccountBroker(unittest.TestCase):
         # now delete the containers one by one
         for policy in POLICIES:
             container_name = 'c-%s' % policy.name
-            delete_timestamp = next(ts)
+            delete_timestamp = next(self.ts)
             broker.put_container(container_name,
-                                 0, delete_timestamp,
+                                 0, delete_timestamp.internal,
                                  0, 0,
                                  policy.idx)
 
@@ -941,16 +1041,15 @@ class TestAccountBroker(unittest.TestCase):
     @patch_policies([StoragePolicy(0, 'zero', False),
                      StoragePolicy(1, 'one', True)])
     def test_policy_stats_tracking(self):
-        ts = (Timestamp(t).internal for t in itertools.count(int(time())))
         broker = AccountBroker(':memory:', account='a')
-        broker.initialize(next(ts))
+        broker.initialize(next(self.ts).internal)
 
         # policy 0
-        broker.put_container('con1', next(ts), 0, 12, 2798641, 0)
-        broker.put_container('con1', next(ts), 0, 13, 8156441, 0)
+        broker.put_container('con1', next(self.ts).internal, 0, 12, 2798641, 0)
+        broker.put_container('con1', next(self.ts).internal, 0, 13, 8156441, 0)
         # policy 1
-        broker.put_container('con2', next(ts), 0, 7, 5751991, 1)
-        broker.put_container('con2', next(ts), 0, 8, 6085379, 1)
+        broker.put_container('con2', next(self.ts).internal, 0, 7, 5751991, 1)
+        broker.put_container('con2', next(self.ts).internal, 0, 8, 6085379, 1)
 
         stats = broker.get_policy_stats()
         self.assertEqual(len(stats), 2)
@@ -972,6 +1071,40 @@ class TestAccountBroker(unittest.TestCase):
             nrows = conn.execute(
                 "SELECT COUNT(*) FROM policy_stat").fetchall()[0][0]
         self.assertEqual(nrows, 2)
+
+    @with_tempdir
+    def test_newid(self, tempdir):
+        # test DatabaseBroker.newid
+        db_path = os.path.join(
+            tempdir, "d1234", 'accounts', 'part', 'suffix', 'hsh')
+        os.makedirs(db_path)
+        broker = AccountBroker(os.path.join(db_path, 'my.db'),
+                               account='a')
+        broker.initialize(Timestamp('1').internal, 0)
+        id = broker.get_info()['id']
+        broker.newid('someid')
+        self.assertNotEqual(id, broker.get_info()['id'])
+        # ends in the device name (from the path) unless it's an old
+        # container with just a uuid4 (tested in legecy broker
+        # tests e.g *BeforeMetaData)
+        if len(id) > 36:
+            self.assertTrue(id.endswith('d1234'))
+        # But the newid'ed version will now have the decide
+        self.assertTrue(broker.get_info()['id'].endswith('d1234'))
+
+        # if we move the broker (happens after an rsync)
+        new_db_path = os.path.join(
+            tempdir, "d5678", 'contianers', 'part', 'suffix', 'hsh')
+        os.makedirs(new_db_path)
+        shutil.copy(os.path.join(db_path, 'my.db'),
+                    os.path.join(new_db_path, 'my.db'))
+
+        new_broker = AccountBroker(os.path.join(new_db_path, 'my.db'),
+                                   account='a')
+        new_broker.newid(id)
+        # ends in the device name (from the path)
+        self.assertFalse(new_broker.get_info()['id'].endswith('d1234'))
+        self.assertTrue(new_broker.get_info()['id'].endswith('d5678'))
 
 
 def prespi_AccountBroker_initialize(self, conn, put_timestamp, **kwargs):
@@ -1050,6 +1183,8 @@ class TestAccountBrokerBeforeMetadata(TestAccountBroker):
     """
 
     def setUp(self):
+        # tests seem to assume x-timestamp was set by the proxy before "now"
+        self.ts = make_timestamp_iter(offset=-1)
         self._imported_create_account_stat_table = \
             AccountBroker.create_account_stat_table
         AccountBroker.create_account_stat_table = \
@@ -1135,6 +1270,8 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
     """
 
     def setUp(self):
+        # tests seem to assume x-timestamp was set by the proxy before "now"
+        self.ts = make_timestamp_iter(offset=-1)
         self._imported_create_container_table = \
             AccountBroker.create_container_table
         AccountBroker.create_container_table = \
@@ -1347,16 +1484,14 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
     @with_tempdir
     def test_half_upgraded_database(self, tempdir):
         db_path = os.path.join(tempdir, 'account.db')
-        ts = itertools.count()
-        ts = (Timestamp(t).internal for t in itertools.count(int(time())))
 
         broker = AccountBroker(db_path, account='a')
-        broker.initialize(next(ts))
+        broker.initialize(next(self.ts).internal)
 
         self.assertTrue(broker.empty())
 
         # add a container (to pending file)
-        broker.put_container('c', next(ts), 0, 0, 0,
+        broker.put_container('c', next(self.ts).internal, 0, 0, 0,
                              POLICIES.default.idx)
 
         real_get = broker.get
@@ -1409,16 +1544,14 @@ class TestAccountBrokerBeforeSPI(TestAccountBroker):
 
     @with_tempdir
     def test_pre_storage_policy_replication(self, tempdir):
-        ts = make_timestamp_iter()
-
         # make and two account database "replicas"
         old_broker = AccountBroker(os.path.join(tempdir, 'old_account.db'),
                                    account='a')
-        old_broker.initialize(next(ts).internal)
+        old_broker.initialize(next(self.ts).internal)
         new_broker = AccountBroker(os.path.join(tempdir, 'new_account.db'),
                                    account='a')
-        new_broker.initialize(next(ts).internal)
-        timestamp = next(ts).internal
+        new_broker.initialize(next(self.ts).internal)
+        timestamp = next(self.ts).internal
 
         # manually insert an existing row to avoid migration for old database
         with old_broker.get() as conn:
@@ -1580,12 +1713,13 @@ class AccountBrokerPreTrackContainerCountSetup(object):
         self.assertUnmigrated(broker)
 
         self.tempdir = mkdtemp()
-        self.ts = (Timestamp(t).internal for t in itertools.count(int(time())))
+        # tests seem to assume x-timestamp was set by the proxy before "now"
+        self.ts = make_timestamp_iter(offset=-1)
 
         self.db_path = os.path.join(self.tempdir, 'sda', 'accounts',
                                     '0', '0', '0', 'test.db')
         self.broker = AccountBroker(self.db_path, account='a')
-        self.broker.initialize(next(self.ts))
+        self.broker.initialize(next(self.ts).internal)
 
         # Common sanity-check that our starting, pre-migration state correctly
         # does not have the container_count column.
@@ -1629,7 +1763,7 @@ class TestAccountBrokerBeforePerPolicyContainerTrack(
         for i in range(num_containers):
             name = 'test-container-%02d' % i
             policy = next(policies)
-            self.broker.put_container(name, next(self.ts),
+            self.broker.put_container(name, next(self.ts).internal,
                                       0, 0, 0, int(policy))
             per_policy_container_counts[int(policy)] += 1
 
@@ -1716,7 +1850,7 @@ class TestAccountBrokerBeforePerPolicyContainerTrack(
         for i in range(num_containers):
             name = 'test-container-%02d' % i
             policy = next(policies)
-            self.broker.put_container(name, next(self.ts),
+            self.broker.put_container(name, next(self.ts).internal,
                                       0, 0, 0, int(policy))
             # keep track of stub container policies
             container_policy_map[name] = policy
@@ -1725,11 +1859,11 @@ class TestAccountBrokerBeforePerPolicyContainerTrack(
         for i in range(0, num_containers, 2):
             name = 'test-container-%02d' % i
             policy = container_policy_map[name]
-            self.broker.put_container(name, 0, next(self.ts),
+            self.broker.put_container(name, 0, next(self.ts).internal,
                                       0, 0, int(policy))
 
         total_container_count = self.broker.get_info()['container_count']
-        self.assertEqual(total_container_count, num_containers / 2)
+        self.assertEqual(total_container_count, num_containers // 2)
 
         # trigger migration
         policy_info = self.broker.get_policy_stats(do_migrations=True)
@@ -1746,12 +1880,12 @@ class TestAccountBrokerBeforePerPolicyContainerTrack(
             # add a few container entries
             for i in range(num_containers):
                 name = 'test-container-%02d' % i
-                self.broker.put_container(name, next(self.ts),
+                self.broker.put_container(name, next(self.ts).internal,
                                           0, 0, 0, int(policy))
             # delete about half of the containers
             for i in range(0, num_containers, 2):
                 name = 'test-container-%02d' % i
-                self.broker.put_container(name, 0, next(self.ts),
+                self.broker.put_container(name, 0, next(self.ts).internal,
                                           0, 0, int(policy))
 
             total_container_count = self.broker.get_info()['container_count']
@@ -1769,14 +1903,15 @@ class TestAccountBrokerBeforePerPolicyContainerTrack(
         with patch_policies(legacy_only=True):
             # add a container for the legacy policy
             policy = POLICIES[0]
-            self.broker.put_container('test-legacy-container', next(self.ts),
-                                      0, 0, 0, int(policy))
+            self.broker.put_container('test-legacy-container',
+                                      next(self.ts).internal, 0, 0, 0,
+                                      int(policy))
 
             # now create an impossible situation by adding a container for a
             # policy index that doesn't exist
             non_existent_policy_index = int(policy) + 1
             self.broker.put_container('test-non-existent-policy',
-                                      next(self.ts), 0, 0, 0,
+                                      next(self.ts).internal, 0, 0, 0,
                                       non_existent_policy_index)
 
             total_container_count = self.broker.get_info()['container_count']
@@ -1796,7 +1931,7 @@ class TestAccountBrokerBeforePerPolicyContainerTrack(
                 broker, 'create_policy_stat_table',
                 side_effect=sqlite3.OperationalError('foobar')):
             with broker.get() as conn:
-                self.assertRaisesRegexp(
+                self.assertRaisesRegex(
                     sqlite3.OperationalError, '.*foobar.*',
                     broker._migrate_add_storage_policy_index,
                     conn=conn)

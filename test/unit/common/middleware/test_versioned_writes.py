@@ -19,10 +19,10 @@ import os
 import time
 import mock
 import unittest
-from swift.common import swob, utils
+from swift.common import swob, utils, registry
 from swift.common.middleware import versioned_writes, copy
 from swift.common.swob import Request
-from test.unit.common.middleware.helpers import FakeSwift
+from test.unit.common.middleware import helpers
 
 
 class FakeCache(object):
@@ -58,12 +58,14 @@ def local_tz(func):
 
 class VersionedWritesBaseTestCase(unittest.TestCase):
     def setUp(self):
-        self.app = FakeSwift()
+        self.app = helpers.FakeSwift()
         conf = {'allow_versioned_writes': 'true'}
-        self.vw = versioned_writes.filter_factory(conf)(self.app)
+        self.vw = versioned_writes.legacy.VersionedWritesMiddleware(
+            self.app, conf)
 
     def tearDown(self):
         self.assertEqual(self.app.unclosed_requests, {})
+        self.assertEqual(self.app.unread_requests, {})
 
     def call_app(self, req, app=None):
         if app is None:
@@ -417,7 +419,7 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertRequestEqual(req, self.authorized[1])
         self.assertEqual(3, self.app.call_count)
         self.assertEqual([
-            ('GET', '/v1/a/c/o'),
+            ('GET', '/v1/a/c/o?symlink=get'),
             ('PUT', '/v1/a/ver_cont/001o/0000000060.00000'),
             ('PUT', '/v1/a/c/o'),
         ], self.app.calls)
@@ -449,7 +451,7 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertRequestEqual(req, self.authorized[1])
         self.assertEqual(3, self.app.call_count)
         self.assertEqual([
-            ('GET', '/v1/a/c/o'),
+            ('GET', '/v1/a/c/o?symlink=get'),
             ('PUT', '/v1/a/ver_cont/001o/0000003600.00000'),
             ('PUT', '/v1/a/c/o'),
         ], self.app.calls)
@@ -590,8 +592,8 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.app.register(
             'DELETE', '/v1/a/c/o', swob.HTTPOk, {}, 'passed')
         self.app.register(
-            'GET',
-            '/v1/a/ver_cont?prefix=001o/&marker=&reverse=on',
+            'GET', helpers.normalize_path(
+                '/v1/a/ver_cont?prefix=001o/&marker=&reverse=on'),
             swob.HTTPNotFound, {}, None)
 
         cache = FakeCache({'sysmeta': {'versions-location': 'ver_cont'}})
@@ -609,7 +611,8 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
 
         prefix_listing_prefix = '/v1/a/ver_cont?prefix=001o/&'
         self.assertEqual(self.app.calls, [
-            ('GET', prefix_listing_prefix + 'marker=&reverse=on'),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=&reverse=on')),
             ('DELETE', '/v1/a/c/o'),
         ])
 
@@ -617,8 +620,7 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.app.register(
             'DELETE', '/v1/a/c/o', swob.HTTPOk, {}, 'passed')
         self.app.register(
-            'GET',
-            '/v1/a/ver_cont?prefix=001o/&marker=&reverse=on',
+            'GET', '/v1/a/ver_cont?prefix=001o/&marker=&reverse=on',
             swob.HTTPOk, {}, '[]')
 
         cache = FakeCache({'sysmeta': {'versions-location': 'ver_cont'}})
@@ -633,7 +635,8 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
 
         prefix_listing_prefix = '/v1/a/ver_cont?prefix=001o/&'
         self.assertEqual(self.app.calls, [
-            ('GET', prefix_listing_prefix + 'marker=&reverse=on'),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=&reverse=on')),
             ('DELETE', '/v1/a/c/o'),
         ])
 
@@ -681,8 +684,9 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
 
         prefix_listing_prefix = '/v1/a/ver_cont?prefix=001o/&'
         self.assertEqual(self.app.calls, [
-            ('GET', prefix_listing_prefix + 'marker=&reverse=on'),
-            ('GET', '/v1/a/ver_cont/001o/2'),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=&reverse=on')),
+            ('GET', '/v1/a/ver_cont/001o/2?symlink=get'),
             ('PUT', '/v1/a/c/o'),
             ('DELETE', '/v1/a/ver_cont/001o/2'),
         ])
@@ -738,7 +742,8 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         # in the base versioned container.
         self.app.register(
             'GET',
-            '/v1/a/ver_cont?prefix=001o/&marker=&reverse=on',
+            helpers.normalize_path(
+                '/v1/a/ver_cont?prefix=001o/&marker=&reverse=on'),
             swob.HTTPOk, {},
             '[{"hash": "y", '
             '"last_modified": "2014-11-21T14:23:02.206740", '
@@ -775,9 +780,10 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
 
         prefix_listing_prefix = '/v1/a/ver_cont?prefix=001o/&'
         self.assertEqual(self.app.calls, [
-            ('GET', prefix_listing_prefix + 'marker=&reverse=on'),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=&reverse=on')),
             ('HEAD', '/v1/a/c/o'),
-            ('GET', '/v1/a/ver_cont/001o/1'),
+            ('GET', '/v1/a/ver_cont/001o/1?symlink=get'),
             ('PUT', '/v1/a/c/o'),
             ('DELETE', '/v1/a/ver_cont/001o/1'),
             ('DELETE', '/v1/a/ver_cont/001o/2'),
@@ -838,7 +844,7 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertTrue(path.startswith('/v1/a/ver_cont/001o/3'))
         self.assertNotIn('x-if-delete-at', [h.lower() for h in req_headers])
 
-    @mock.patch('swift.common.middleware.versioned_writes.time.time',
+    @mock.patch('swift.common.middleware.versioned_writes.legacy.time.time',
                 return_value=1234)
     def test_history_delete_marker_no_object_success(self, mock_time):
         self.app.register(
@@ -868,7 +874,7 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
         self.assertEqual('application/x-deleted;swift_versions_deleted=1',
                          calls[1].headers.get('Content-Type'))
 
-    @mock.patch('swift.common.middleware.versioned_writes.time.time',
+    @mock.patch('swift.common.middleware.versioned_writes.legacy.time.time',
                 return_value=123456789.54321)
     def test_history_delete_marker_over_object_success(self, mock_time):
         self.app.register(
@@ -891,7 +897,7 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
                      'CONTENT_LENGTH': '0'})
         status, headers, body = self.call_vw(req)
         self.assertEqual(status, '204 No Content')
-        self.assertEqual('', body)
+        self.assertEqual(b'', body)
         self.assertEqual(len(self.authorized), 2)
 
         req.environ['REQUEST_METHOD'] = 'PUT'
@@ -940,8 +946,9 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
 
         prefix_listing_prefix = '/v1/a/ver_cont?prefix=001o/&'
         self.assertEqual(self.app.calls, [
-            ('GET', prefix_listing_prefix + 'marker=&reverse=on'),
-            ('GET', '/v1/a/ver_cont/001o/1'),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=&reverse=on')),
+            ('GET', '/v1/a/ver_cont/001o/1?symlink=get'),
             ('PUT', '/v1/a/c/o'),
             ('DELETE', '/v1/a/ver_cont/001o/1'),
         ])
@@ -988,11 +995,14 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
 
         prefix_listing_prefix = '/v1/a/ver_cont?prefix=001o/&'
         self.assertEqual(self.app.calls, [
-            ('GET', prefix_listing_prefix + 'marker=&reverse=on'),
-            ('GET', '/v1/a/ver_cont/001o/2'),
-            ('GET', '/v1/a/ver_cont/001o/1'),
-            ('PUT', '/v1/a/c/o'),
-            ('DELETE', '/v1/a/ver_cont/001o/1'),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=&reverse=on')),
+            ('GET', helpers.normalize_path(
+                '/v1/a/ver_cont/001o/2?symlink=get')),
+            ('GET', helpers.normalize_path(
+                '/v1/a/ver_cont/001o/1?symlink=get')),
+            ('PUT', helpers.normalize_path('/v1/a/c/o')),
+            ('DELETE', helpers.normalize_path('/v1/a/ver_cont/001o/1')),
         ])
 
     def test_denied_DELETE_of_versioned_object(self):
@@ -1030,7 +1040,8 @@ class VersionedWritesTestCase(VersionedWritesBaseTestCase):
 
         prefix_listing_prefix = '/v1/a/ver_cont?prefix=001o/&'
         self.assertEqual(self.app.calls, [
-            ('GET', prefix_listing_prefix + 'marker=&reverse=on'),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=&reverse=on')),
         ])
 
     def test_denied_PUT_of_versioned_object(self):
@@ -1112,9 +1123,11 @@ class VersionedWritesOldContainersTestCase(VersionedWritesBaseTestCase):
 
         prefix_listing_prefix = '/v1/a/ver_cont?prefix=001o/&'
         self.assertEqual(self.app.calls, [
-            ('GET', prefix_listing_prefix + 'marker=&reverse=on'),
-            ('GET', prefix_listing_prefix + 'marker=001o/2'),
-            ('GET', '/v1/a/ver_cont/001o/2'),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=&reverse=on')),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=001o/2')),
+            ('GET', '/v1/a/ver_cont/001o/2?symlink=get'),
             ('PUT', '/v1/a/c/o'),
             ('DELETE', '/v1/a/ver_cont/001o/2'),
         ])
@@ -1165,10 +1178,12 @@ class VersionedWritesOldContainersTestCase(VersionedWritesBaseTestCase):
 
         prefix_listing_prefix = '/v1/a/ver_cont?prefix=001o/&'
         self.assertEqual(self.app.calls, [
-            ('GET', prefix_listing_prefix + 'marker=&reverse=on'),
-            ('GET', prefix_listing_prefix + 'marker=001o/2'),
-            ('GET', '/v1/a/ver_cont/001o/2'),
-            ('GET', '/v1/a/ver_cont/001o/1'),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=&reverse=on')),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=001o/2')),
+            ('GET', '/v1/a/ver_cont/001o/2?symlink=get'),
+            ('GET', '/v1/a/ver_cont/001o/1?symlink=get'),
             ('PUT', '/v1/a/c/o'),
             ('DELETE', '/v1/a/ver_cont/001o/1'),
         ])
@@ -1215,8 +1230,10 @@ class VersionedWritesOldContainersTestCase(VersionedWritesBaseTestCase):
         self.assertRequestEqual(req, authorize_call[0])
         prefix_listing_prefix = '/v1/a/ver_cont?prefix=001o/&'
         self.assertEqual(self.app.calls, [
-            ('GET', prefix_listing_prefix + 'marker=&reverse=on'),
-            ('GET', prefix_listing_prefix + 'marker=001o/2'),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=&reverse=on')),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=001o/2')),
         ])
 
     def test_partially_upgraded_cluster(self):
@@ -1281,15 +1298,20 @@ class VersionedWritesOldContainersTestCase(VersionedWritesBaseTestCase):
         self.assertEqual(status, '204 No Content')
         prefix_listing_prefix = '/v1/a/ver_cont?prefix=001o/&'
         self.assertEqual(self.app.calls, [
-            ('GET', prefix_listing_prefix + 'marker=&reverse=on'),
-            ('GET', '/v1/a/ver_cont/001o/4'),
-            ('GET', '/v1/a/ver_cont/001o/3'),
-            ('GET', '/v1/a/ver_cont/001o/2'),
-            ('GET', prefix_listing_prefix + 'marker=001o/2&reverse=on'),
-            ('GET', prefix_listing_prefix + 'marker=&end_marker=001o/2'),
-            ('GET', prefix_listing_prefix + 'marker=001o/0&end_marker=001o/2'),
-            ('GET', prefix_listing_prefix + 'marker=001o/1&end_marker=001o/2'),
-            ('GET', '/v1/a/ver_cont/001o/1'),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=&reverse=on')),
+            ('GET', '/v1/a/ver_cont/001o/4?symlink=get'),
+            ('GET', '/v1/a/ver_cont/001o/3?symlink=get'),
+            ('GET', '/v1/a/ver_cont/001o/2?symlink=get'),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=001o/2&reverse=on')),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=&end_marker=001o/2')),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=001o/0&end_marker=001o/2')),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=001o/1&end_marker=001o/2')),
+            ('GET', '/v1/a/ver_cont/001o/1?symlink=get'),
             ('PUT', '/v1/a/c/o'),
             ('DELETE', '/v1/a/ver_cont/001o/1'),
         ])
@@ -1353,14 +1375,19 @@ class VersionedWritesOldContainersTestCase(VersionedWritesBaseTestCase):
         self.assertEqual(status, '204 No Content')
         prefix_listing_prefix = '/v1/a/ver_cont?prefix=001o/&'
         self.assertEqual(self.app.calls, [
-            ('GET', prefix_listing_prefix + 'marker=&reverse=on'),
-            ('GET', '/v1/a/ver_cont/001o/4'),
-            ('GET', '/v1/a/ver_cont/001o/3'),
-            ('GET', prefix_listing_prefix + 'marker=001o/3&reverse=on'),
-            ('GET', prefix_listing_prefix + 'marker=&end_marker=001o/3'),
-            ('GET', prefix_listing_prefix + 'marker=001o/1&end_marker=001o/3'),
-            ('GET', prefix_listing_prefix + 'marker=001o/2&end_marker=001o/3'),
-            ('GET', '/v1/a/ver_cont/001o/2'),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=&reverse=on')),
+            ('GET', '/v1/a/ver_cont/001o/4?symlink=get'),
+            ('GET', '/v1/a/ver_cont/001o/3?symlink=get'),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=001o/3&reverse=on')),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=&end_marker=001o/3')),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=001o/1&end_marker=001o/3')),
+            ('GET', helpers.normalize_path(
+                prefix_listing_prefix + 'marker=001o/2&end_marker=001o/3')),
+            ('GET', '/v1/a/ver_cont/001o/2?symlink=get'),
             ('PUT', '/v1/a/c/o'),
             ('DELETE', '/v1/a/ver_cont/001o/2'),
         ])
@@ -1370,7 +1397,7 @@ class VersionedWritesCopyingTestCase(VersionedWritesBaseTestCase):
     # verify interaction of copy and versioned_writes middlewares
 
     def setUp(self):
-        self.app = FakeSwift()
+        self.app = helpers.FakeSwift()
         conf = {'allow_versioned_writes': 'true'}
         self.vw = versioned_writes.filter_factory(conf)(self.app)
         self.filter = copy.filter_factory({})(self.vw)
@@ -1488,19 +1515,19 @@ class VersionedWritesCopyingTestCase(VersionedWritesBaseTestCase):
 
 class TestSwiftInfo(unittest.TestCase):
     def setUp(self):
-        utils._swift_info = {}
-        utils._swift_admin_info = {}
+        registry._swift_info = {}
+        registry._swift_admin_info = {}
 
     def test_registered_defaults(self):
         versioned_writes.filter_factory({})('have to pass in an app')
-        swift_info = utils.get_swift_info()
+        swift_info = registry.get_swift_info()
         # in default, versioned_writes is not in swift_info
         self.assertNotIn('versioned_writes', swift_info)
 
     def test_registered_explicitly_set(self):
         versioned_writes.filter_factory(
             {'allow_versioned_writes': 'true'})('have to pass in an app')
-        swift_info = utils.get_swift_info()
+        swift_info = registry.get_swift_info()
         self.assertIn('versioned_writes', swift_info)
         self.assertEqual(
             swift_info['versioned_writes'].get('allowed_flags'),

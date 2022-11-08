@@ -1,6 +1,14 @@
+.. _saio:
+
 =======================
-SAIO - Swift All In One
+SAIO (Swift All In One)
 =======================
+
+.. note::
+    This guide assumes an existing Linux server. A physical machine or VM will
+    work. We recommend configuring it with at least 2GB of memory and 40GB of
+    storage space. We recommend using a VM in order to isolate Swift and its
+    dependencies from other projects you may be working on.
 
 ---------------------------------------------
 Instructions for setting up a development VM
@@ -10,10 +18,11 @@ This section documents setting up a virtual machine for doing Swift
 development.  The virtual machine will emulate running a four node Swift
 cluster. To begin:
 
-* Get a linux system server image, this guide will cover:
+* Get a Linux system server image, this guide will cover:
 
   * Ubuntu 14.04, 16.04 LTS
-  * Fedora/CentOS
+  * CentOS 7
+  * Fedora
   * OpenSuse
 
 - Create guest virtual machine from the image.
@@ -32,6 +41,14 @@ is ``swift``, which may not exist on your system.  These instructions are
 intended to allow a developer to use his/her username for
 ``<your-user-name>:<your-group-name>``.
 
+.. note::
+  For OpenSuse users, a user's primary group is ``users``, so you have 2 options:
+
+  * Change ``${USER}:${USER}`` to ``${USER}:users`` in all references of this guide; or
+  * Create a group for your username and add yourself to it::
+
+     sudo groupadd ${USER} && sudo gpasswd -a ${USER} ${USER} && newgrp ${USER}
+
 -----------------------
 Installing dependencies
 -----------------------
@@ -48,10 +65,25 @@ Installing dependencies
                              python-netifaces python-pip python-dnspython \
                              python-mock
 
-* On ``yum`` based systems::
+* On ``CentOS`` (requires additional repositories)::
 
         sudo yum update
+        sudo yum install epel-release
+        sudo yum-config-manager --enable epel extras
+        sudo yum install centos-release-openstack-train
         sudo yum install curl gcc memcached rsync sqlite xfsprogs git-core \
+                         libffi-devel xinetd liberasurecode-devel \
+                         openssl-devel python-setuptools \
+                         python-coverage python-devel python-nose \
+                         pyxattr python-eventlet \
+                         python-greenlet python-paste-deploy \
+                         python-netifaces python-pip python-dns \
+                         python-mock
+
+* On ``Fedora``::
+
+        sudo dnf update
+        sudo dnf install curl gcc memcached rsync-daemon sqlite xfsprogs git-core \
                          libffi-devel xinetd liberasurecode-devel \
                          openssl-devel python-setuptools \
                          python-coverage python-devel python-nose \
@@ -70,11 +102,18 @@ Installing dependencies
                             python2-netifaces python2-pip python2-dnspython \
                             python2-mock
 
-  Note: This installs necessary system dependencies and *most* of the python
-  dependencies. Later in the process setuptools/distribute or pip will install
-  and/or upgrade packages.
+.. note::
+   This installs necessary system dependencies and *most* of the python
+   dependencies. Later in the process setuptools/distribute or pip will install
+   and/or upgrade packages.
 
-Next, choose either :ref:`partition-section` or :ref:`loopback-section`.
+-------------------
+Configuring storage
+-------------------
+
+Swift requires some space on XFS filesystems to store data and run tests.
+
+Choose either :ref:`partition-section` or :ref:`loopback-section`.
 
 .. _partition-section:
 
@@ -84,51 +123,32 @@ Using a partition for storage
 If you are going to use a separate partition for Swift data, be sure to add
 another device when creating the VM, and follow these instructions:
 
-  #. Set up a single partition::
+.. note::
+   The disk does not have to be ``/dev/sdb1`` (for example, it could be
+   ``/dev/vdb1``) however the mount point should still be ``/mnt/sdb1``.
 
-        sudo fdisk /dev/sdb
-        sudo mkfs.xfs /dev/sdb1
+#. Set up a single partition on the device (this will wipe the drive)::
 
-  #. Edit ``/etc/fstab`` and add::
+      sudo parted /dev/sdb mklabel msdos mkpart p xfs 0% 100%
 
-        /dev/sdb1 /mnt/sdb1 xfs noatime,nodiratime,nobarrier,logbufs=8 0 0
+#. Create an XFS file system on the partition::
 
-  #. Create the mount point and the individualized links::
+      sudo mkfs.xfs /dev/sdb1
 
-        sudo mkdir /mnt/sdb1
-        sudo mount /mnt/sdb1
-        sudo mkdir /mnt/sdb1/1 /mnt/sdb1/2 /mnt/sdb1/3 /mnt/sdb1/4
-        sudo chown ${USER}:${USER} /mnt/sdb1/*
-        sudo mkdir /srv
-        for x in {1..4}; do sudo ln -s /mnt/sdb1/$x /srv/$x; done
-        sudo mkdir -p /srv/1/node/sdb1 /srv/1/node/sdb5 \
-                      /srv/2/node/sdb2 /srv/2/node/sdb6 \
-                      /srv/3/node/sdb3 /srv/3/node/sdb7 \
-                      /srv/4/node/sdb4 /srv/4/node/sdb8 \
-                      /var/run/swift
-        sudo chown -R ${USER}:${USER} /var/run/swift
-        # **Make sure to include the trailing slash after /srv/$x/**
-        for x in {1..4}; do sudo chown -R ${USER}:${USER} /srv/$x/; done
+#. Find the UUID of the new partition::
 
-     Note: For OpenSuse users, a user's primary group is `users`, so you have 2 options:
+      sudo blkid
 
-     * Change `${USER}:${USER}` to `${USER}:users` in all references of this guide; or
-     * Create a group for your username and add yourself to it::
+#. Edit ``/etc/fstab`` and add::
 
-        sudo groupadd ${USER} && sudo gpasswd -a ${USER} ${USER}
+      UUID="<UUID-from-output-above>" /mnt/sdb1 xfs noatime 0 0
 
-     Note: We create the mount points and mount the storage disk under
-     /mnt/sdb1. This disk will contain one directory per simulated swift node,
-     each owned by the current swift user.
+#. Create the Swift data mount point and test that mounting works::
 
-     We then create symlinks to these directories under /srv.
-     If the disk sdb is unmounted, files will not be written under
-     /srv/\*, because the symbolic link destination /mnt/sdb1/* will not
-     exist. This prevents disk sync operations from writing to the root
-     partition in the event a drive is unmounted.
+      sudo mkdir /mnt/sdb1
+      sudo mount -a
 
-  #. Next, skip to :ref:`common-dev-section`.
-
+#. Next, skip to :ref:`common-dev-section`.
 
 .. _loopback-section:
 
@@ -138,202 +158,245 @@ Using a loopback device for storage
 If you want to use a loopback device instead of another partition, follow
 these instructions:
 
-  #. Create the file for the loopback device::
+#. Create the file for the loopback device::
 
-        sudo mkdir /srv
-        sudo truncate -s 1GB /srv/swift-disk
-        sudo mkfs.xfs /srv/swift-disk
+      sudo mkdir -p /srv
+      sudo truncate -s 1GB /srv/swift-disk
+      sudo mkfs.xfs /srv/swift-disk
 
-     Modify size specified in the ``truncate`` command to make a larger or
-     smaller partition as needed.
+   Modify size specified in the ``truncate`` command to make a larger or
+   smaller partition as needed.
 
-  #. Edit `/etc/fstab` and add::
+#. Edit `/etc/fstab` and add::
 
-        /srv/swift-disk /mnt/sdb1 xfs loop,noatime,nodiratime,nobarrier,logbufs=8 0 0
+      /srv/swift-disk /mnt/sdb1 xfs loop,noatime 0 0
 
-  #. Create the mount point and the individualized links::
+#. Create the Swift data mount point and test that mounting works::
 
-        sudo mkdir /mnt/sdb1
-        sudo mount /mnt/sdb1
-        sudo mkdir /mnt/sdb1/1 /mnt/sdb1/2 /mnt/sdb1/3 /mnt/sdb1/4
-        sudo chown ${USER}:${USER} /mnt/sdb1/*
-        for x in {1..4}; do sudo ln -s /mnt/sdb1/$x /srv/$x; done
-        sudo mkdir -p /srv/1/node/sdb1 /srv/1/node/sdb5 \
-                      /srv/2/node/sdb2 /srv/2/node/sdb6 \
-                      /srv/3/node/sdb3 /srv/3/node/sdb7 \
-                      /srv/4/node/sdb4 /srv/4/node/sdb8 \
-                      /var/run/swift
-        sudo chown -R ${USER}:${USER} /var/run/swift
-        # **Make sure to include the trailing slash after /srv/$x/**
-        for x in {1..4}; do sudo chown -R ${USER}:${USER} /srv/$x/; done
-
-     Note: For OpenSuse users, a user's primary group is `users`, so you have 2 options:
-
-     * Change `${USER}:${USER}` to `${USER}:users` in all references of this guide; or
-     * Create a group for your username and add yourself to it::
-
-        sudo groupadd ${USER} && sudo gpasswd -a ${USER} ${USER}
-
-     Note: We create the mount points and mount the loopback file under
-     /mnt/sdb1. This file will contain one directory per simulated swift node,
-     each owned by the current swift user.
-
-     We then create symlinks to these directories under /srv.
-     If the loopback file is unmounted, files will not be written under
-     /srv/\*, because the symbolic link destination /mnt/sdb1/* will not
-     exist. This prevents disk sync operations from writing to the root
-     partition in the event a drive is unmounted.
+      sudo mkdir /mnt/sdb1
+      sudo mount -a
 
 .. _common-dev-section:
 
 Common Post-Device Setup
 ========================
 
-Add the following lines to ``/etc/rc.local`` (before the ``exit 0``)::
+#. Create the individualized data links::
+
+      sudo mkdir /mnt/sdb1/1 /mnt/sdb1/2 /mnt/sdb1/3 /mnt/sdb1/4
+      sudo chown ${USER}:${USER} /mnt/sdb1/*
+      for x in {1..4}; do sudo ln -s /mnt/sdb1/$x /srv/$x; done
+      sudo mkdir -p /srv/1/node/sdb1 /srv/1/node/sdb5 \
+                    /srv/2/node/sdb2 /srv/2/node/sdb6 \
+                    /srv/3/node/sdb3 /srv/3/node/sdb7 \
+                    /srv/4/node/sdb4 /srv/4/node/sdb8
+      sudo mkdir -p /var/run/swift
+      sudo mkdir -p /var/cache/swift /var/cache/swift2 \
+                    /var/cache/swift3 /var/cache/swift4
+      sudo chown -R ${USER}:${USER} /var/run/swift
+      sudo chown -R ${USER}:${USER} /var/cache/swift*
+      # **Make sure to include the trailing slash after /srv/$x/**
+      for x in {1..4}; do sudo chown -R ${USER}:${USER} /srv/$x/; done
+
+   .. note::
+      We create the mount points and mount the loopback file under
+      /mnt/sdb1. This file will contain one directory per simulated Swift node,
+      each owned by the current Swift user.
+
+      We then create symlinks to these directories under /srv.
+      If the disk sdb or loopback file is unmounted, files will not be written under
+      /srv/\*, because the symbolic link destination /mnt/sdb1/* will not
+      exist. This prevents disk sync operations from writing to the root
+      partition in the event a drive is unmounted.
+
+#. Restore appropriate permissions on reboot.
+
+   * On traditional Linux systems, add the following lines to ``/etc/rc.local`` (before the ``exit 0``)::
 
         mkdir -p /var/cache/swift /var/cache/swift2 /var/cache/swift3 /var/cache/swift4
         chown <your-user-name>:<your-group-name> /var/cache/swift*
         mkdir -p /var/run/swift
         chown <your-user-name>:<your-group-name> /var/run/swift
 
-Note that on some systems you might have to create ``/etc/rc.local``.
+   * On CentOS and Fedora we can use systemd (rc.local is deprecated)::
 
-On Fedora 19 or later, you need to place these in ``/etc/rc.d/rc.local``.
+        cat << EOF |sudo tee /etc/tmpfiles.d/swift.conf
+        d /var/cache/swift 0755 ${USER} ${USER} - -
+        d /var/cache/swift2 0755 ${USER} ${USER} - -
+        d /var/cache/swift3 0755 ${USER} ${USER} - -
+        d /var/cache/swift4 0755 ${USER} ${USER} - -
+        d /var/run/swift 0755 ${USER} ${USER} - -
+        EOF
 
-On OpenSuse you need to place these in ``/etc/init.d/boot.local``.
+   * On OpenSuse place the lines in ``/etc/init.d/boot.local``.
+
+   .. note::
+      On some systems the rc file might need to be an executable shell script.
 
 Creating an XFS tmp dir
 -----------------------
 
-Tests require having an XFS directory available in ``/tmp`` or in the
-``TMPDIR`` environment variable. To set up ``/tmp`` with an XFS filesystem,
-do the following::
+Tests require having a directory available on an XFS filesystem. By default the
+tests use ``/tmp``, however this can be pointed elsewhere with the ``TMPDIR``
+environment variable.
 
-        cd ~
-        truncate -s 1GB xfs_file  # create 1GB fil for XFS in your home directory
-        mkfs.xfs xfs_file
-        sudo mount -o loop,noatime,nodiratime xfs_file /tmp
-        sudo chmod -R 1777 /tmp
+.. note::
+   If your root filesystem is XFS, you can skip this section if ``/tmp`` is
+   just a directory and not a mounted tmpfs. Or you could simply point to any
+   existing directory owned by your user by specifying it with the ``TMPDIR``
+   environment variable.
 
-To persist this, edit and add the following to ``/etc/fstab``::
+   If your root filesystem is not XFS, you should create a loopback device,
+   format it with XFS and mount it. You can mount it over ``/tmp`` or to
+   another location and specify it with the ``TMPDIR`` environment variable.
 
-        /home/<your-user-name>/xfs_file /tmp xfs rw,noatime,nodiratime,attr2,inode64,noquota 0 0
+* Create the file for the tmp loopback device::
+
+      sudo mkdir -p /srv
+      sudo truncate -s 1GB /srv/swift-tmp  # create 1GB file for XFS in /srv
+      sudo mkfs.xfs /srv/swift-tmp
+
+* To mount the tmp loopback device at ``/tmp``, do the following::
+
+      sudo mount -o loop,noatime /srv/swift-tmp /tmp
+      sudo chmod -R 1777 /tmp
+
+  * To persist this, edit and add the following to ``/etc/fstab``::
+
+        /srv/swift-tmp /tmp xfs rw,noatime,attr2,inode64,noquota 0 0
+
+* To mount the tmp loopback at an alternate location (for example, ``/mnt/tmp``),
+  do the following::
+
+      sudo mkdir -p /mnt/tmp
+      sudo mount -o loop,noatime /srv/swift-tmp /mnt/tmp
+      sudo chown ${USER}:${USER} /mnt/tmp
+
+  * To persist this, edit and add the following to ``/etc/fstab``::
+
+        /srv/swift-tmp /mnt/tmp xfs rw,noatime,attr2,inode64,noquota 0 0
+
+  * Set your ``TMPDIR`` environment dir so that Swift looks in the right location::
+
+        export TMPDIR=/mnt/tmp
+        echo "export TMPDIR=/mnt/tmp" >> $HOME/.bashrc
 
 ----------------
 Getting the code
 ----------------
 
-  #. Check out the python-swiftclient repo::
+#. Check out the python-swiftclient repo::
 
-        cd $HOME; git clone https://github.com/openstack/python-swiftclient.git
+      cd $HOME; git clone https://github.com/openstack/python-swiftclient.git
 
-  #. Build a development installation of python-swiftclient::
+#. Build a development installation of python-swiftclient::
 
-        cd $HOME/python-swiftclient; sudo python setup.py develop; cd -
+      cd $HOME/python-swiftclient; sudo python setup.py develop; cd -
 
-     Ubuntu 12.04 users need to install python-swiftclient's dependencies before the installation of
-     python-swiftclient. This is due to a bug in an older version of setup tools::
+   Ubuntu 12.04 users need to install python-swiftclient's dependencies before the installation of
+   python-swiftclient. This is due to a bug in an older version of setup tools::
 
-        cd $HOME/python-swiftclient; sudo pip install -r requirements.txt; sudo python setup.py develop; cd -
+      cd $HOME/python-swiftclient; sudo pip install -r requirements.txt; sudo python setup.py develop; cd -
 
-  #. Check out the swift repo::
+#. Check out the Swift repo::
 
-        git clone https://github.com/openstack/swift.git
+      git clone https://github.com/openstack/swift.git
 
-  #. Build a development installation of swift::
+#. Build a development installation of Swift::
 
-        cd $HOME/swift; sudo pip install --no-binary cryptography -r requirements.txt; sudo python setup.py develop; cd -
+      cd $HOME/swift; sudo pip install --no-binary cryptography -r requirements.txt; sudo python setup.py develop; cd -
 
-     Note: Due to a difference in libssl.so naming in OpenSuse to other Linux distros the wheel/binary wont work so the
-     cryptography must be built, thus the ``--no-binary cryptography``.
+   .. note::
+      Due to a difference in how ``libssl.so`` is named in OpenSuse vs. other Linux distros the
+      wheel/binary won't work; thus we use ``--no-binary cryptography`` to build ``cryptography``
+      locally.
 
-     Fedora 19 or later users might have to perform the following if development
-     installation of swift fails::
+   Fedora users might have to perform the following if development
+   installation of Swift fails::
 
-        sudo pip install -U xattr
+      sudo pip install -U xattr
 
-  #. Install swift's test dependencies::
+#. Install Swift's test dependencies::
 
-        cd $HOME/swift; sudo pip install -r test-requirements.txt
+      cd $HOME/swift; sudo pip install -r test-requirements.txt
 
 ----------------
 Setting up rsync
 ----------------
 
-  #. Create ``/etc/rsyncd.conf``::
+#. Create ``/etc/rsyncd.conf``::
 
-        sudo cp $HOME/swift/doc/saio/rsyncd.conf /etc/
-        sudo sed -i "s/<your-user-name>/${USER}/" /etc/rsyncd.conf
+      sudo cp $HOME/swift/doc/saio/rsyncd.conf /etc/
+      sudo sed -i "s/<your-user-name>/${USER}/" /etc/rsyncd.conf
 
-     Here is the default ``rsyncd.conf`` file contents maintained in the repo
-     that is copied and fixed up above:
+   Here is the default ``rsyncd.conf`` file contents maintained in the repo
+   that is copied and fixed up above:
 
-     .. literalinclude:: /../saio/rsyncd.conf
+   .. literalinclude:: /../saio/rsyncd.conf
+      :language: ini
 
-  #. On Ubuntu, edit the following line in ``/etc/default/rsync``::
+#. Enable rsync daemon
 
-        RSYNC_ENABLE=true
+   * On Ubuntu, edit the following line in ``/etc/default/rsync``::
 
-     On Fedora, edit the following line in ``/etc/xinetd.d/rsync``::
+      RSYNC_ENABLE=true
 
-        disable = no
+   .. note::
+      You might have to create the file to perform the edits.
 
-     One might have to create the above files to perform the edits.
+   * On CentOS and Fedora, enable the systemd service::
 
-     On OpenSuse, nothing needs to happen here.
+      sudo systemctl enable rsyncd
 
-  #. On platforms with SELinux in ``Enforcing`` mode, either set to ``Permissive``::
+   * On OpenSuse, nothing needs to happen here.
 
-        sudo setenforce Permissive
 
-     Or just allow rsync full access::
+#. On platforms with SELinux in ``Enforcing`` mode, either set to ``Permissive``::
 
-        sudo setsebool -P rsync_full_access 1
+      sudo setenforce Permissive
+      sudo sed -i 's/^SELINUX=.*/SELINUX=permissive/g' /etc/selinux/config
 
-  #. Start the rsync daemon
+   Or just allow rsync full access::
 
-     * On Ubuntu 14.04, run::
+      sudo setsebool -P rsync_full_access 1
 
-        sudo service rsync restart
+#. Start the rsync daemon
 
-     * On Ubuntu 16.04, run::
+   * On Ubuntu 14.04, run::
 
-        sudo systemctl enable rsync
-        sudo systemctl start rsync
+      sudo service rsync restart
 
-     * On Fedora, run::
+   * On Ubuntu 16.04, run::
 
-        sudo systemctl restart xinetd.service
-        sudo systemctl enable rsyncd.service
-        sudo systemctl start rsyncd.service
+      sudo systemctl enable rsync
+      sudo systemctl start rsync
 
-     * On OpenSuse, run::
+   * On CentOS, Fedora and OpenSuse, run::
 
-        sudo systemctl enable rsyncd.service
-        sudo systemctl start rsyncd.service
+      sudo systemctl start rsyncd
 
-     * On other xinetd based systems simply run::
+   * On other xinetd based systems simply run::
 
-        sudo service xinetd restart
+      sudo service xinetd restart
 
-  #. Verify rsync is accepting connections for all servers::
+#. Verify rsync is accepting connections for all servers::
 
-        rsync rsync://pub@localhost/
+      rsync rsync://pub@localhost/
 
-     You should see the following output from the above command::
+   You should see the following output from the above command::
 
-        account6012
-        account6022
-        account6032
-        account6042
-        container6011
-        container6021
-        container6031
-        container6041
-        object6010
-        object6020
-        object6030
-        object6040
+      account6212
+      account6222
+      account6232
+      account6242
+      container6211
+      container6221
+      container6231
+      container6241
+      object6210
+      object6220
+      object6230
+      object6240
 
 ------------------
 Starting memcached
@@ -346,8 +409,8 @@ On non-Ubuntu distros you need to ensure memcached is running::
 
 or::
 
-        sudo systemctl enable memcached.service
-        sudo systemctl start memcached.service
+        sudo systemctl enable memcached
+        sudo systemctl start memcached
 
 The tempauth middleware stores tokens in memcached. If memcached is not
 running, tokens cannot be validated, and accessing Swift becomes impossible.
@@ -356,50 +419,59 @@ running, tokens cannot be validated, and accessing Swift becomes impossible.
 Optional: Setting up rsyslog for individual logging
 ---------------------------------------------------
 
-  #. Install the swift rsyslogd configuration::
+Fedora and OpenSuse may not have rsyslog installed, in which case you will need
+to install it if you want to use individual logging.
 
-        sudo cp $HOME/swift/doc/saio/rsyslog.d/10-swift.conf /etc/rsyslog.d/
+#. Install rsyslogd
 
-     Note: OpenSuse may have the systemd logger installed, so if you want this
-     to work, you need to install rsyslog::
 
-        sudo zypper install rsyslog
-        sudo systemctl start rsyslog.service
-        sudo systemctl enable rsyslog.service
+   * On Fedora::
 
-     Be sure to review that conf file to determine if you want all the logs
-     in one file vs. all the logs separated out, and if you want hourly logs
-     for stats processing. For convenience, we provide its default contents
-     below:
+      sudo dnf install rsyslog
 
-     .. literalinclude:: /../saio/rsyslog.d/10-swift.conf
+   * On OpenSuse::
 
-  #. Edit ``/etc/rsyslog.conf`` and make the following change (usually in the
-     "GLOBAL DIRECTIVES" section)::
+      sudo zypper install rsyslog
 
-        $PrivDropToGroup adm
+#. Install the Swift rsyslogd configuration::
 
-  #. If using hourly logs (see above) perform::
+      sudo cp $HOME/swift/doc/saio/rsyslog.d/10-swift.conf /etc/rsyslog.d/
 
-        sudo mkdir -p /var/log/swift/hourly
+   Be sure to review that conf file to determine if you want all the logs
+   in one file vs. all the logs separated out, and if you want hourly logs
+   for stats processing. For convenience, we provide its default contents
+   below:
 
-     Otherwise perform::
+   .. literalinclude:: /../saio/rsyslog.d/10-swift.conf
+      :language: ini
 
-        sudo mkdir -p /var/log/swift
+#. Edit ``/etc/rsyslog.conf`` and make the following change (usually in the
+   "GLOBAL DIRECTIVES" section)::
 
-  #. Setup the logging directory and start syslog:
+      $PrivDropToGroup adm
 
-     * On Ubuntu::
+#. If using hourly logs (see above) perform::
 
-        sudo chown -R syslog.adm /var/log/swift
-        sudo chmod -R g+w /var/log/swift
-        sudo service rsyslog restart
+      sudo mkdir -p /var/log/swift/hourly
 
-     * On Fedora and OpenSuse::
+   Otherwise perform::
 
-        sudo chown -R root:adm /var/log/swift
-        sudo chmod -R g+w /var/log/swift
-        sudo systemctl restart rsyslog.service
+      sudo mkdir -p /var/log/swift
+
+#. Setup the logging directory and start syslog:
+
+   * On Ubuntu::
+
+      sudo chown -R syslog.adm /var/log/swift
+      sudo chmod -R g+w /var/log/swift
+      sudo service rsyslog restart
+
+   * On CentOS, Fedora and OpenSuse::
+
+      sudo chown -R root:adm /var/log/swift
+      sudo chmod -R g+w /var/log/swift
+      sudo systemctl restart rsyslog
+      sudo systemctl enable rsyslog
 
 ---------------------
 Configuring each node
@@ -409,89 +481,121 @@ After performing the following steps, be sure to verify that Swift has access
 to resulting configuration files (sample configuration files are provided with
 all defaults in line-by-line comments).
 
-  #. Optionally remove an existing swift directory::
+#. Optionally remove an existing swift directory::
 
-        sudo rm -rf /etc/swift
+      sudo rm -rf /etc/swift
 
-  #. Populate the ``/etc/swift`` directory itself::
+#. Populate the ``/etc/swift`` directory itself::
 
-        cd $HOME/swift/doc; sudo cp -r saio/swift /etc/swift; cd -
-        sudo chown -R ${USER}:${USER} /etc/swift
+      cd $HOME/swift/doc; sudo cp -r saio/swift /etc/swift; cd -
+      sudo chown -R ${USER}:${USER} /etc/swift
 
-  #. Update ``<your-user-name>`` references in the Swift config files::
+#. Update ``<your-user-name>`` references in the Swift config files::
 
-        find /etc/swift/ -name \*.conf | xargs sudo sed -i "s/<your-user-name>/${USER}/"
+      find /etc/swift/ -name \*.conf | xargs sudo sed -i "s/<your-user-name>/${USER}/"
 
 The contents of the configuration files provided by executing the above
 commands are as follows:
 
-  #. ``/etc/swift/swift.conf``
+#. ``/etc/swift/swift.conf``
 
-     .. literalinclude:: /../saio/swift/swift.conf
+   .. literalinclude:: /../saio/swift/swift.conf
+      :language: ini
 
-  #. ``/etc/swift/proxy-server.conf``
+#. ``/etc/swift/proxy-server.conf``
 
-     .. literalinclude:: /../saio/swift/proxy-server.conf
+   .. literalinclude:: /../saio/swift/proxy-server.conf
+      :language: ini
 
-  #. ``/etc/swift/object-expirer.conf``
+#. ``/etc/swift/object-expirer.conf``
 
-     .. literalinclude:: /../saio/swift/object-expirer.conf
+   .. literalinclude:: /../saio/swift/object-expirer.conf
+      :language: ini
 
-  #. ``/etc/swift/container-reconciler.conf``
+#. ``/etc/swift/container-sync-realms.conf``
 
-     .. literalinclude:: /../saio/swift/container-reconciler.conf
+   .. literalinclude:: /../saio/swift/container-sync-realms.conf
+      :language: ini
 
-  #. ``/etc/swift/container-sync-realms.conf``
+#. ``/etc/swift/account-server/1.conf``
 
-     .. literalinclude:: /../saio/swift/container-sync-realms.conf
+   .. literalinclude:: /../saio/swift/account-server/1.conf
+      :language: ini
 
-  #. ``/etc/swift/account-server/1.conf``
+#. ``/etc/swift/container-server/1.conf``
 
-     .. literalinclude:: /../saio/swift/account-server/1.conf
+   .. literalinclude:: /../saio/swift/container-server/1.conf
+      :language: ini
 
-  #. ``/etc/swift/container-server/1.conf``
+#. ``/etc/swift/container-reconciler/1.conf``
 
-     .. literalinclude:: /../saio/swift/container-server/1.conf
+   .. literalinclude:: /../saio/swift/container-reconciler/1.conf
+      :language: ini
 
-  #. ``/etc/swift/object-server/1.conf``
+#. ``/etc/swift/object-server/1.conf``
 
-     .. literalinclude:: /../saio/swift/object-server/1.conf
+   .. literalinclude:: /../saio/swift/object-server/1.conf
+      :language: ini
 
-  #. ``/etc/swift/account-server/2.conf``
+#. ``/etc/swift/account-server/2.conf``
 
-     .. literalinclude:: /../saio/swift/account-server/2.conf
+   .. literalinclude:: /../saio/swift/account-server/2.conf
+      :language: ini
 
-  #. ``/etc/swift/container-server/2.conf``
+#. ``/etc/swift/container-server/2.conf``
 
-     .. literalinclude:: /../saio/swift/container-server/2.conf
+   .. literalinclude:: /../saio/swift/container-server/2.conf
+      :language: ini
 
-  #. ``/etc/swift/object-server/2.conf``
+#. ``/etc/swift/container-reconciler/2.conf``
 
-     .. literalinclude:: /../saio/swift/object-server/2.conf
+   .. literalinclude:: /../saio/swift/container-reconciler/2.conf
+      :language: ini
 
-  #. ``/etc/swift/account-server/3.conf``
+#. ``/etc/swift/object-server/2.conf``
 
-     .. literalinclude:: /../saio/swift/account-server/3.conf
+   .. literalinclude:: /../saio/swift/object-server/2.conf
+      :language: ini
 
-  #. ``/etc/swift/container-server/3.conf``
+#. ``/etc/swift/account-server/3.conf``
 
-     .. literalinclude:: /../saio/swift/container-server/3.conf
+   .. literalinclude:: /../saio/swift/account-server/3.conf
+      :language: ini
 
-  #. ``/etc/swift/object-server/3.conf``
+#. ``/etc/swift/container-server/3.conf``
 
-     .. literalinclude:: /../saio/swift/object-server/3.conf
+   .. literalinclude:: /../saio/swift/container-server/3.conf
+      :language: ini
 
-  #. ``/etc/swift/account-server/4.conf``
+#. ``/etc/swift/container-reconciler/3.conf``
 
-     .. literalinclude:: /../saio/swift/account-server/4.conf
+   .. literalinclude:: /../saio/swift/container-reconciler/3.conf
+      :language: ini
 
-  #. ``/etc/swift/container-server/4.conf``
+#. ``/etc/swift/object-server/3.conf``
 
-     .. literalinclude:: /../saio/swift/container-server/4.conf
+   .. literalinclude:: /../saio/swift/object-server/3.conf
+      :language: ini
 
-  #. ``/etc/swift/object-server/4.conf``
+#. ``/etc/swift/account-server/4.conf``
 
-     .. literalinclude:: /../saio/swift/object-server/4.conf
+   .. literalinclude:: /../saio/swift/account-server/4.conf
+      :language: ini
+
+#. ``/etc/swift/container-server/4.conf``
+
+   .. literalinclude:: /../saio/swift/container-server/4.conf
+      :language: ini
+
+#. ``/etc/swift/container-reconciler/4.conf``
+
+   .. literalinclude:: /../saio/swift/container-reconciler/4.conf
+      :language: ini
+
+#. ``/etc/swift/object-server/4.conf``
+
+   .. literalinclude:: /../saio/swift/object-server/4.conf
+      :language: ini
 
 .. _setup_scripts:
 
@@ -499,139 +603,169 @@ commands are as follows:
 Setting up scripts for running Swift
 ------------------------------------
 
-  #. Copy the SAIO scripts for resetting the environment::
+#. Copy the SAIO scripts for resetting the environment::
 
-        mkdir -p $HOME/bin
-        cd $HOME/swift/doc; cp saio/bin/* $HOME/bin; cd -
-        chmod +x $HOME/bin/*
+      mkdir -p $HOME/bin
+      cd $HOME/swift/doc; cp saio/bin/* $HOME/bin; cd -
+      chmod +x $HOME/bin/*
 
-  #. Edit the ``$HOME/bin/resetswift`` script
+#. Edit the ``$HOME/bin/resetswift`` script
 
-     The template ``resetswift`` script looks like the following:
+   The template ``resetswift`` script looks like the following:
 
-        .. literalinclude:: /../saio/bin/resetswift
+   .. literalinclude:: /../saio/bin/resetswift
+      :language: bash
 
-     If you are using a loopback device add an environment var to
-     substitute ``/dev/sdb1`` with ``/srv/swift-disk``::
+   If you did not set up rsyslog for individual logging, remove the ``find
+   /var/log/swift...`` line::
 
-        echo "export SAIO_BLOCK_DEVICE=/srv/swift-disk" >> $HOME/.bashrc
-
-     If you did not set up rsyslog for individual logging, remove the ``find
-     /var/log/swift...`` line::
-
-        sed -i "/find \/var\/log\/swift/d" $HOME/bin/resetswift
+      sed -i "/find \/var\/log\/swift/d" $HOME/bin/resetswift
 
 
-  #. Install the sample configuration file for running tests::
+#. Install the sample configuration file for running tests::
 
-        cp $HOME/swift/test/sample.conf /etc/swift/test.conf
+      cp $HOME/swift/test/sample.conf /etc/swift/test.conf
 
-     The template ``test.conf`` looks like the following:
+   The template ``test.conf`` looks like the following:
 
-        .. literalinclude:: /../../test/sample.conf
+   .. literalinclude:: /../../test/sample.conf
+      :language: ini
 
-  #. Add an environment variable for running tests below::
+-----------------------------------------
+Configure environment variables for Swift
+-----------------------------------------
 
-        echo "export SWIFT_TEST_CONFIG_FILE=/etc/swift/test.conf" >> $HOME/.bashrc
+#. Add an environment variable for running tests below::
 
-  #. Be sure that your ``PATH`` includes the ``bin`` directory::
+      echo "export SWIFT_TEST_CONFIG_FILE=/etc/swift/test.conf" >> $HOME/.bashrc
 
-        echo "export PATH=${PATH}:$HOME/bin" >> $HOME/.bashrc
+#. Be sure that your ``PATH`` includes the ``bin`` directory::
 
-  #. Source the above environment variables into your current environment::
+      echo "export PATH=${PATH}:$HOME/bin" >> $HOME/.bashrc
 
-        . $HOME/.bashrc
+#. If you are using a loopback device for Swift Storage, add an environment var
+   to substitute ``/dev/sdb1`` with ``/srv/swift-disk``::
 
-  #. Construct the initial rings using the provided script::
+      echo "export SAIO_BLOCK_DEVICE=/srv/swift-disk" >> $HOME/.bashrc
 
-        remakerings
+#. If you are using a device other than ``/dev/sdb1`` for Swift storage (for
+   example, ``/dev/vdb1``), add an environment var to substitute it::
 
-     The ``remakerings`` script looks like the following:
+      echo "export SAIO_BLOCK_DEVICE=/dev/vdb1" >> $HOME/.bashrc
 
-        .. literalinclude:: /../saio/bin/remakerings
+#. If you are using a location other than ``/tmp`` for Swift tmp data (for
+   example, ``/mnt/tmp``), add ``TMPDIR`` environment var to set it::
 
-     You can expect the output from this command to produce the following.  Note
-     that 3 object rings are created in order to test storage policies and EC in
-     the SAIO environment.  The EC ring is the only one with all 8 devices.
-     There are also two replication rings, one for 3x replication and another
-     for 2x replication, but those rings only use 4 devices::
+      export TMPDIR=/mnt/tmp
+      echo "export TMPDIR=/mnt/tmp" >> $HOME/.bashrc
 
-        Device d0r1z1-127.0.0.1:6010R127.0.0.1:6010/sdb1_"" with 1.0 weight got id 0
-        Device d1r1z2-127.0.0.2:6020R127.0.0.2:6020/sdb2_"" with 1.0 weight got id 1
-        Device d2r1z3-127.0.0.3:6030R127.0.0.3:6030/sdb3_"" with 1.0 weight got id 2
-        Device d3r1z4-127.0.0.4:6040R127.0.0.4:6040/sdb4_"" with 1.0 weight got id 3
-        Reassigned 3072 (300.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
-        Device d0r1z1-127.0.0.1:6010R127.0.0.1:6010/sdb1_"" with 1.0 weight got id 0
-        Device d1r1z2-127.0.0.2:6020R127.0.0.2:6020/sdb2_"" with 1.0 weight got id 1
-        Device d2r1z3-127.0.0.3:6030R127.0.0.3:6030/sdb3_"" with 1.0 weight got id 2
-        Device d3r1z4-127.0.0.4:6040R127.0.0.4:6040/sdb4_"" with 1.0 weight got id 3
-        Reassigned 2048 (200.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
-        Device d0r1z1-127.0.0.1:6010R127.0.0.1:6010/sdb1_"" with 1.0 weight got id 0
-        Device d1r1z1-127.0.0.1:6010R127.0.0.1:6010/sdb5_"" with 1.0 weight got id 1
-        Device d2r1z2-127.0.0.2:6020R127.0.0.2:6020/sdb2_"" with 1.0 weight got id 2
-        Device d3r1z2-127.0.0.2:6020R127.0.0.2:6020/sdb6_"" with 1.0 weight got id 3
-        Device d4r1z3-127.0.0.3:6030R127.0.0.3:6030/sdb3_"" with 1.0 weight got id 4
-        Device d5r1z3-127.0.0.3:6030R127.0.0.3:6030/sdb7_"" with 1.0 weight got id 5
-        Device d6r1z4-127.0.0.4:6040R127.0.0.4:6040/sdb4_"" with 1.0 weight got id 6
-        Device d7r1z4-127.0.0.4:6040R127.0.0.4:6040/sdb8_"" with 1.0 weight got id 7
-        Reassigned 6144 (600.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
-        Device d0r1z1-127.0.0.1:6011R127.0.0.1:6011/sdb1_"" with 1.0 weight got id 0
-        Device d1r1z2-127.0.0.2:6021R127.0.0.2:6021/sdb2_"" with 1.0 weight got id 1
-        Device d2r1z3-127.0.0.3:6031R127.0.0.3:6031/sdb3_"" with 1.0 weight got id 2
-        Device d3r1z4-127.0.0.4:6041R127.0.0.4:6041/sdb4_"" with 1.0 weight got id 3
-        Reassigned 3072 (300.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
-        Device d0r1z1-127.0.0.1:6012R127.0.0.1:6012/sdb1_"" with 1.0 weight got id 0
-        Device d1r1z2-127.0.0.2:6022R127.0.0.2:6022/sdb2_"" with 1.0 weight got id 1
-        Device d2r1z3-127.0.0.3:6032R127.0.0.3:6032/sdb3_"" with 1.0 weight got id 2
-        Device d3r1z4-127.0.0.4:6042R127.0.0.4:6042/sdb4_"" with 1.0 weight got id 3
-        Reassigned 3072 (300.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+#. Source the above environment variables into your current environment::
+
+      . $HOME/.bashrc
+
+--------------------------
+Constructing initial rings
+--------------------------
+
+#. Construct the initial rings using the provided script::
+
+      remakerings
+
+   The ``remakerings`` script looks like the following:
+
+   .. literalinclude:: /../saio/bin/remakerings
+      :language: bash
+
+   You can expect the output from this command to produce the following.  Note
+   that 3 object rings are created in order to test storage policies and EC in
+   the SAIO environment.  The EC ring is the only one with all 8 devices.
+   There are also two replication rings, one for 3x replication and another
+   for 2x replication, but those rings only use 4 devices:
 
 
-  #. Read more about Storage Policies and your SAIO :doc:`policies_saio`
+   .. code-block:: console
 
-  #. Verify the unit tests run::
+      Device d0r1z1-127.0.0.1:6210R127.0.0.1:6210/sdb1_"" with 1.0 weight got id 0
+      Device d1r1z2-127.0.0.2:6220R127.0.0.2:6220/sdb2_"" with 1.0 weight got id 1
+      Device d2r1z3-127.0.0.3:6230R127.0.0.3:6230/sdb3_"" with 1.0 weight got id 2
+      Device d3r1z4-127.0.0.4:6240R127.0.0.4:6240/sdb4_"" with 1.0 weight got id 3
+      Reassigned 3072 (300.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+      Device d0r1z1-127.0.0.1:6210R127.0.0.1:6210/sdb1_"" with 1.0 weight got id 0
+      Device d1r1z2-127.0.0.2:6220R127.0.0.2:6220/sdb2_"" with 1.0 weight got id 1
+      Device d2r1z3-127.0.0.3:6230R127.0.0.3:6230/sdb3_"" with 1.0 weight got id 2
+      Device d3r1z4-127.0.0.4:6240R127.0.0.4:6240/sdb4_"" with 1.0 weight got id 3
+      Reassigned 2048 (200.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+      Device d0r1z1-127.0.0.1:6210R127.0.0.1:6210/sdb1_"" with 1.0 weight got id 0
+      Device d1r1z1-127.0.0.1:6210R127.0.0.1:6210/sdb5_"" with 1.0 weight got id 1
+      Device d2r1z2-127.0.0.2:6220R127.0.0.2:6220/sdb2_"" with 1.0 weight got id 2
+      Device d3r1z2-127.0.0.2:6220R127.0.0.2:6220/sdb6_"" with 1.0 weight got id 3
+      Device d4r1z3-127.0.0.3:6230R127.0.0.3:6230/sdb3_"" with 1.0 weight got id 4
+      Device d5r1z3-127.0.0.3:6230R127.0.0.3:6230/sdb7_"" with 1.0 weight got id 5
+      Device d6r1z4-127.0.0.4:6240R127.0.0.4:6240/sdb4_"" with 1.0 weight got id 6
+      Device d7r1z4-127.0.0.4:6240R127.0.0.4:6240/sdb8_"" with 1.0 weight got id 7
+      Reassigned 6144 (600.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+      Device d0r1z1-127.0.0.1:6211R127.0.0.1:6211/sdb1_"" with 1.0 weight got id 0
+      Device d1r1z2-127.0.0.2:6221R127.0.0.2:6221/sdb2_"" with 1.0 weight got id 1
+      Device d2r1z3-127.0.0.3:6231R127.0.0.3:6231/sdb3_"" with 1.0 weight got id 2
+      Device d3r1z4-127.0.0.4:6241R127.0.0.4:6241/sdb4_"" with 1.0 weight got id 3
+      Reassigned 3072 (300.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
+      Device d0r1z1-127.0.0.1:6212R127.0.0.1:6212/sdb1_"" with 1.0 weight got id 0
+      Device d1r1z2-127.0.0.2:6222R127.0.0.2:6222/sdb2_"" with 1.0 weight got id 1
+      Device d2r1z3-127.0.0.3:6232R127.0.0.3:6232/sdb3_"" with 1.0 weight got id 2
+      Device d3r1z4-127.0.0.4:6242R127.0.0.4:6242/sdb4_"" with 1.0 weight got id 3
+      Reassigned 3072 (300.00%) partitions. Balance is now 0.00.  Dispersion is now 0.00
 
-        $HOME/swift/.unittests
 
-     Note that the unit tests do not require any swift daemons running.
+#. Read more about Storage Policies and your SAIO :doc:`policies_saio`
 
-  #. Start the "main" Swift daemon processes (proxy, account, container, and
-     object)::
+-------------
+Testing Swift
+-------------
 
-        startmain
+#. Verify the unit tests run::
 
-     (The "``Unable to increase file descriptor limit.  Running as non-root?``"
-     warnings are expected and ok.)
+      $HOME/swift/.unittests
 
-     The ``startmain`` script looks like the following:
+   Note that the unit tests do not require any Swift daemons running.
 
-        .. literalinclude:: /../saio/bin/startmain
+#. Start the "main" Swift daemon processes (proxy, account, container, and
+   object)::
 
-  #. Get an ``X-Storage-Url`` and ``X-Auth-Token``::
+      startmain
 
-        curl -v -H 'X-Storage-User: test:tester' -H 'X-Storage-Pass: testing' http://127.0.0.1:8080/auth/v1.0
+   (The "``Unable to increase file descriptor limit.  Running as non-root?``"
+   warnings are expected and ok.)
 
-  #. Check that you can ``GET`` account::
+   The ``startmain`` script looks like the following:
 
-        curl -v -H 'X-Auth-Token: <token-from-x-auth-token-above>' <url-from-x-storage-url-above>
+   .. literalinclude:: /../saio/bin/startmain
+      :language: bash
 
-  #. Check that ``swift`` command provided by the python-swiftclient package works::
+#. Get an ``X-Storage-Url`` and ``X-Auth-Token``::
 
-        swift -A http://127.0.0.1:8080/auth/v1.0 -U test:tester -K testing stat
+      curl -v -H 'X-Storage-User: test:tester' -H 'X-Storage-Pass: testing' http://127.0.0.1:8080/auth/v1.0
 
-  #. Verify the functional tests run::
+#. Check that you can ``GET`` account::
 
-        $HOME/swift/.functests
+      curl -v -H 'X-Auth-Token: <token-from-x-auth-token-above>' <url-from-x-storage-url-above>
 
-     (Note: functional tests will first delete everything in the configured
-     accounts.)
+#. Check that ``swift`` command provided by the python-swiftclient package works::
 
-  #. Verify the probe tests run::
+      swift -A http://127.0.0.1:8080/auth/v1.0 -U test:tester -K testing stat
 
-        $HOME/swift/.probetests
+#. Verify the functional tests run::
 
-     (Note: probe tests will reset your environment as they call ``resetswift``
-     for each test.)
+      $HOME/swift/.functests
+
+   (Note: functional tests will first delete everything in the configured
+   accounts.)
+
+#. Verify the probe tests run::
+
+      $HOME/swift/.probetests
+
+   (Note: probe tests will reset your environment as they call ``resetswift``
+   for each test.)
 
 ----------------
 Debugging Issues

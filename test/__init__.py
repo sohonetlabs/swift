@@ -37,6 +37,25 @@ except ImportError:
             return result
         return result[:_MAX_LENGTH] + ' [truncated]...'
 
+import warnings
+warnings.filterwarnings('ignore', module='cryptography|OpenSSL', message=(
+    'Python 2 is no longer supported by the Python core team. '
+    'Support for it is now deprecated in cryptography, '
+    'and will be removed in a future release.'))
+warnings.filterwarnings('ignore', module='cryptography|OpenSSL', message=(
+    'Python 2 is no longer supported by the Python core team. '
+    'Support for it is now deprecated in cryptography, '
+    'and will be removed in the next release.'))
+warnings.filterwarnings('ignore', message=(
+    'Python 3.6 is no longer supported by the Python core team. '
+    'Therefore, support for it is deprecated in cryptography '
+    'and will be removed in a future release.'))
+
+if sys.version_info < (3, 2):
+    import unittest
+    unittest.TestCase.assertRaisesRegex = unittest.TestCase.assertRaisesRegexp
+    unittest.TestCase.assertRegex = unittest.TestCase.assertRegexpMatches
+
 from eventlet.green import socket
 
 # make unittests pass on all locale

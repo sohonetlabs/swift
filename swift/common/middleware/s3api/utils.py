@@ -15,8 +15,10 @@
 
 import base64
 import calendar
+import datetime
 import email.utils
 import re
+import six
 import time
 import uuid
 
@@ -51,17 +53,20 @@ def snake_to_camel(snake):
 
 
 def unique_id():
-    return base64.urlsafe_b64encode(str(uuid.uuid4()))
+    result = base64.urlsafe_b64encode(str(uuid.uuid4()).encode('ascii'))
+    if six.PY2:
+        return result
+    return result.decode('ascii')
 
 
 def utf8encode(s):
-    if isinstance(s, unicode):
-        s = s.encode('utf8')
-    return s
+    if s is None or isinstance(s, bytes):
+        return s
+    return s.encode('utf8')
 
 
 def utf8decode(s):
-    if isinstance(s, str):
+    if isinstance(s, bytes):
         s = s.decode('utf8')
     return s
 
@@ -91,8 +96,8 @@ def validate_bucket_name(name, dns_compliant_bucket_names):
     elif name.endswith('.'):
         # Bucket names must not end with dot
         return False
-    elif re.match("^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.)"
-                  "{3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$",
+    elif re.match(r"^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\.)"
+                  r"{3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$",
                   name):
         # Bucket names cannot be formatted as an IP Address
         return False
@@ -104,9 +109,19 @@ def validate_bucket_name(name, dns_compliant_bucket_names):
 
 
 class S3Timestamp(utils.Timestamp):
+    S3_XML_FORMAT = "%Y-%m-%dT%H:%M:%S.000Z"
+
     @property
     def s3xmlformat(self):
-        return self.isoformat[:-7] + '.000Z'
+        dt = datetime.datetime.utcfromtimestamp(self.ceil())
+        return dt.strftime(self.S3_XML_FORMAT)
+
+    @classmethod
+    def from_s3xmlformat(cls, date_string):
+        dt = datetime.datetime.strptime(date_string, cls.S3_XML_FORMAT)
+        dt = dt.replace(tzinfo=utils.UTC)
+        seconds = calendar.timegm(dt.timetuple())
+        return cls(seconds)
 
     @property
     def amz_date_format(self):
@@ -115,10 +130,6 @@ class S3Timestamp(utils.Timestamp):
         """
         return self.isoformat.replace(
             '-', '').replace(':', '')[:-7] + 'Z'
-
-    @classmethod
-    def now(cls):
-        return cls(time.time())
 
 
 def mktime(timestamp_str, time_format='%Y-%m-%dT%H:%M:%S'):
@@ -152,7 +163,19 @@ def mktime(timestamp_str, time_format='%Y-%m-%dT%H:%M:%S'):
 
 
 class Config(dict):
+    DEFAULTS = {
+        'storage_domains': [],
+        'location': 'us-east-1',
+        'force_swift_request_proxy_log': False,
+        'dns_compliant_bucket_names': True,
+        'allow_multipart_uploads': True,
+        'allow_no_owner': False,
+        'allowable_clock_skew': 900,
+        'ratelimit_as_client_error': False,
+    }
+
     def __init__(self, base=None):
+        self.update(self.DEFAULTS)
         if base is not None:
             self.update(base)
 

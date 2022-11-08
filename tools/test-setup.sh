@@ -20,11 +20,35 @@ function is_rhel7 {
         cat /etc/*release | grep -q -e "Red Hat" -e "CentOS" -e "CloudLinux" && \
         cat /etc/*release | grep -q 'release 7'
 }
+function is_rhel8 {
+    [ -f /usr/bin/dnf ] && \
+        cat /etc/*release | grep -q -e "Red Hat" -e "CentOS" -e "CloudLinux" && \
+        cat /etc/*release | grep -q 'release 8'
+}
+function is_rhel9 {
+    [ -f /usr/bin/dnf ] && \
+        cat /etc/*release | grep -q -e "Red Hat" -e "CentOS" -e "CloudLinux" && \
+        cat /etc/*release | grep -q 'release 9'
+}
 
 
 if is_rhel7; then
     # Install CentOS OpenStack repos so that we have access to some extra
     # packages.
-    sudo yum install -y centos-release-openstack-queens
+    sudo yum install -y centos-release-openstack-rocky
     sudo yum install -y liberasurecode-devel
+fi
+
+if is_rhel8; then
+    # Install CentOS OpenStack repos so that we have access to some extra
+    # packages.
+    sudo dnf install -y centos-release-openstack-xena
+    sudo dnf install -y liberasurecode-devel
+fi
+
+if is_rhel9; then
+    # Install CentOS OpenStack repos so that we have access to some extra
+    # packages.
+    sudo dnf install -y centos-release-openstack-yoga
+    sudo dnf install -y liberasurecode-devel
 fi

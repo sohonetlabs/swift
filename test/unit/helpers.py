@@ -40,14 +40,16 @@ from swift.common.storage_policy import StoragePolicy, ECStoragePolicy
 from swift.common.middleware import listing_formats, proxy_logging
 from swift.common import utils
 from swift.common.utils import mkdirs, normalize_timestamp, NullLogger
+from swift.common.wsgi import SwiftHttpProtocol
 from swift.container import server as container_server
 from swift.obj import server as object_server
 from swift.proxy import server as proxy_server
 import swift.proxy.controllers.obj
 
 from test import listen_zero
-from test.unit import write_fake_ring, DEFAULT_TEST_EC_TYPE, debug_logger, \
-    connect_tcp, readuntil2crlfs
+from test.debug_logger import debug_logger
+from test.unit import write_fake_ring, DEFAULT_TEST_EC_TYPE, connect_tcp, \
+    readuntil2crlfs
 
 
 def setup_servers(the_object_server=object_server, extra_conf=None):
@@ -91,7 +93,7 @@ def setup_servers(the_object_server=object_server, extra_conf=None):
     conf = {'devices': _testdir, 'swift_dir': _testdir,
             'mount_check': 'false', 'allowed_headers':
             'content-encoding, x-object-manifest, content-disposition, foo',
-            'allow_versions': 't'}
+            'allow_versions': 't', 'node_timeout': 20}
     if extra_conf:
         conf.update(extra_conf)
     prolis = listen_zero()
@@ -211,18 +213,41 @@ def setup_servers(the_object_server=object_server, extra_conf=None):
          obj4srv, obj5srv, obj6srv)
     nl = NullLogger()
     logging_prosv = proxy_logging.ProxyLoggingMiddleware(
-        listing_formats.ListingFilter(prosrv), conf, logger=prosrv.logger)
-    prospa = spawn(wsgi.server, prolis, logging_prosv, nl)
-    acc1spa = spawn(wsgi.server, acc1lis, acc1srv, nl)
-    acc2spa = spawn(wsgi.server, acc2lis, acc2srv, nl)
-    con1spa = spawn(wsgi.server, con1lis, con1srv, nl)
-    con2spa = spawn(wsgi.server, con2lis, con2srv, nl)
-    obj1spa = spawn(wsgi.server, obj1lis, obj1srv, nl)
-    obj2spa = spawn(wsgi.server, obj2lis, obj2srv, nl)
-    obj3spa = spawn(wsgi.server, obj3lis, obj3srv, nl)
-    obj4spa = spawn(wsgi.server, obj4lis, obj4srv, nl)
-    obj5spa = spawn(wsgi.server, obj5lis, obj5srv, nl)
-    obj6spa = spawn(wsgi.server, obj6lis, obj6srv, nl)
+        listing_formats.ListingFilter(prosrv, {}, logger=prosrv.logger),
+        conf, logger=prosrv.logger)
+    prospa = spawn(wsgi.server, prolis, logging_prosv, nl,
+                   protocol=SwiftHttpProtocol,
+                   capitalize_response_headers=False)
+    acc1spa = spawn(wsgi.server, acc1lis, acc1srv, nl,
+                    protocol=SwiftHttpProtocol,
+                    capitalize_response_headers=False)
+    acc2spa = spawn(wsgi.server, acc2lis, acc2srv, nl,
+                    protocol=SwiftHttpProtocol,
+                    capitalize_response_headers=False)
+    con1spa = spawn(wsgi.server, con1lis, con1srv, nl,
+                    protocol=SwiftHttpProtocol,
+                    capitalize_response_headers=False)
+    con2spa = spawn(wsgi.server, con2lis, con2srv, nl,
+                    protocol=SwiftHttpProtocol,
+                    capitalize_response_headers=False)
+    obj1spa = spawn(wsgi.server, obj1lis, obj1srv, nl,
+                    protocol=SwiftHttpProtocol,
+                    capitalize_response_headers=False)
+    obj2spa = spawn(wsgi.server, obj2lis, obj2srv, nl,
+                    protocol=SwiftHttpProtocol,
+                    capitalize_response_headers=False)
+    obj3spa = spawn(wsgi.server, obj3lis, obj3srv, nl,
+                    protocol=SwiftHttpProtocol,
+                    capitalize_response_headers=False)
+    obj4spa = spawn(wsgi.server, obj4lis, obj4srv, nl,
+                    protocol=SwiftHttpProtocol,
+                    capitalize_response_headers=False)
+    obj5spa = spawn(wsgi.server, obj5lis, obj5srv, nl,
+                    protocol=SwiftHttpProtocol,
+                    capitalize_response_headers=False)
+    obj6spa = spawn(wsgi.server, obj6lis, obj6srv, nl,
+                    protocol=SwiftHttpProtocol,
+                    capitalize_response_headers=False)
     context["test_coros"] = \
         (prospa, acc1spa, acc2spa, con1spa, con2spa, obj1spa, obj2spa, obj3spa,
          obj4spa, obj5spa, obj6spa)
@@ -254,49 +279,49 @@ def setup_servers(the_object_server=object_server, extra_conf=None):
         assert(resp.status == 201)
     # Create containers, 1 per test policy
     sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-    fd = sock.makefile()
-    fd.write('PUT /v1/a/c HTTP/1.1\r\nHost: localhost\r\n'
-             'Connection: close\r\nX-Auth-Token: t\r\n'
-             'Content-Length: 0\r\n\r\n')
+    fd = sock.makefile('rwb')
+    fd.write(b'PUT /v1/a/c HTTP/1.1\r\nHost: localhost\r\n'
+             b'Connection: close\r\nX-Auth-Token: t\r\n'
+             b'Content-Length: 0\r\n\r\n')
     fd.flush()
     headers = readuntil2crlfs(fd)
-    exp = 'HTTP/1.1 201'
+    exp = b'HTTP/1.1 201'
     assert headers[:len(exp)] == exp, "Expected '%s', encountered '%s'" % (
         exp, headers[:len(exp)])
     # Create container in other account
     # used for account-to-account tests
     sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-    fd = sock.makefile()
-    fd.write('PUT /v1/a1/c1 HTTP/1.1\r\nHost: localhost\r\n'
-             'Connection: close\r\nX-Auth-Token: t\r\n'
-             'Content-Length: 0\r\n\r\n')
+    fd = sock.makefile('rwb')
+    fd.write(b'PUT /v1/a1/c1 HTTP/1.1\r\nHost: localhost\r\n'
+             b'Connection: close\r\nX-Auth-Token: t\r\n'
+             b'Content-Length: 0\r\n\r\n')
     fd.flush()
     headers = readuntil2crlfs(fd)
-    exp = 'HTTP/1.1 201'
+    exp = b'HTTP/1.1 201'
     assert headers[:len(exp)] == exp, "Expected '%s', encountered '%s'" % (
         exp, headers[:len(exp)])
 
     sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-    fd = sock.makefile()
+    fd = sock.makefile('rwb')
     fd.write(
-        'PUT /v1/a/c1 HTTP/1.1\r\nHost: localhost\r\n'
-        'Connection: close\r\nX-Auth-Token: t\r\nX-Storage-Policy: one\r\n'
-        'Content-Length: 0\r\n\r\n')
+        b'PUT /v1/a/c1 HTTP/1.1\r\nHost: localhost\r\n'
+        b'Connection: close\r\nX-Auth-Token: t\r\nX-Storage-Policy: one\r\n'
+        b'Content-Length: 0\r\n\r\n')
     fd.flush()
     headers = readuntil2crlfs(fd)
-    exp = 'HTTP/1.1 201'
+    exp = b'HTTP/1.1 201'
     assert headers[:len(exp)] == exp, \
-        "Expected '%s', encountered '%s'" % (exp, headers[:len(exp)])
+        "Expected %r, encountered %r" % (exp, headers[:len(exp)])
 
     sock = connect_tcp(('localhost', prolis.getsockname()[1]))
-    fd = sock.makefile()
+    fd = sock.makefile('rwb')
     fd.write(
-        'PUT /v1/a/c2 HTTP/1.1\r\nHost: localhost\r\n'
-        'Connection: close\r\nX-Auth-Token: t\r\nX-Storage-Policy: two\r\n'
-        'Content-Length: 0\r\n\r\n')
+        b'PUT /v1/a/c2 HTTP/1.1\r\nHost: localhost\r\n'
+        b'Connection: close\r\nX-Auth-Token: t\r\nX-Storage-Policy: two\r\n'
+        b'Content-Length: 0\r\n\r\n')
     fd.flush()
     headers = readuntil2crlfs(fd)
-    exp = 'HTTP/1.1 201'
+    exp = b'HTTP/1.1 201'
     assert headers[:len(exp)] == exp, \
         "Expected '%s', encountered '%s'" % (exp, headers[:len(exp)])
     return context

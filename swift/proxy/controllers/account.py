@@ -15,8 +15,6 @@
 
 from six.moves.urllib.parse import unquote
 
-from swift import gettext_ as _
-
 from swift.account.utils import account_listing_response
 from swift.common.middleware.acl import parse_acl, format_acl
 from swift.common.utils import public
@@ -55,7 +53,7 @@ class AccountController(Controller):
         length_limit = self.get_name_length_limit()
         if len(self.account_name) > length_limit:
             resp = HTTPBadRequest(request=req)
-            resp.body = 'Account name length of %d longer than %d' % \
+            resp.body = b'Account name length of %d longer than %d' % \
                         (len(self.account_name), length_limit)
             # Don't cache this. We know the account doesn't exist because
             # the name is bad; we don't need to cache that because it's
@@ -64,13 +62,14 @@ class AccountController(Controller):
 
         partition = self.app.account_ring.get_part(self.account_name)
         concurrency = self.app.account_ring.replica_count \
-            if self.app.concurrent_gets else 1
-        node_iter = self.app.iter_nodes(self.app.account_ring, partition)
+            if self.app.get_policy_options(None).concurrent_gets else 1
+        node_iter = self.app.iter_nodes(self.app.account_ring, partition,
+                                        self.logger)
         params = req.params
         params['format'] = 'json'
         req.params = params
         resp = self.GETorHEAD_base(
-            req, _('Account'), node_iter, partition,
+            req, 'Account', node_iter, partition,
             req.swift_entity_path.rstrip('/'), concurrency)
         if resp.status_int == HTTP_NOT_FOUND:
             if resp.headers.get('X-Account-Status', '').lower() == 'deleted':
@@ -119,7 +118,7 @@ class AccountController(Controller):
         length_limit = self.get_name_length_limit()
         if len(self.account_name) > length_limit:
             resp = HTTPBadRequest(request=req)
-            resp.body = 'Account name length of %d longer than %d' % \
+            resp.body = b'Account name length of %d longer than %d' % \
                         (len(self.account_name), length_limit)
             return resp
         account_partition, accounts = \
@@ -138,7 +137,7 @@ class AccountController(Controller):
         length_limit = self.get_name_length_limit()
         if len(self.account_name) > length_limit:
             resp = HTTPBadRequest(request=req)
-            resp.body = 'Account name length of %d longer than %d' % \
+            resp.body = b'Account name length of %d longer than %d' % \
                         (len(self.account_name), length_limit)
             return resp
         error_response = check_metadata(req, 'account')

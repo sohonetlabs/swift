@@ -21,7 +21,7 @@ import six
 from six.moves.configparser import ConfigParser
 from swift.common.utils import (
     config_true_value, quorum_size, whataremyips, list_from_csv,
-    config_positive_int_value, get_zero_indexed_base_string)
+    config_positive_int_value, get_zero_indexed_base_string, load_pkg_resource)
 from swift.common.ring import Ring, RingData
 from swift.common import utils
 from swift.common.exceptions import RingLoadError
@@ -37,11 +37,11 @@ DEFAULT_EC_OBJECT_SEGMENT_SIZE = 1048576
 
 
 class BindPortsCache(object):
-    def __init__(self, swift_dir, bind_ip):
+    def __init__(self, swift_dir, ring_ip):
         self.swift_dir = swift_dir
         self.mtimes_by_ring_path = {}
         self.portsets_by_ring_path = {}
-        self.my_ips = set(whataremyips(bind_ip))
+        self.my_ips = set(whataremyips(ring_ip))
 
     def all_bind_ports_for_node(self):
         """
@@ -157,7 +157,8 @@ class BaseStoragePolicy(object):
     policy_type_to_policy_cls = {}
 
     def __init__(self, idx, name='', is_default=False, is_deprecated=False,
-                 object_ring=None, aliases=''):
+                 object_ring=None, aliases='',
+                 diskfile_module='egg:swift#replication.fs'):
         # do not allow BaseStoragePolicy class to be instantiated directly
         if type(self) == BaseStoragePolicy:
             raise TypeError("Can't instantiate BaseStoragePolicy directly")
@@ -187,6 +188,8 @@ class BaseStoragePolicy(object):
         self.ring_name = _get_policy_string('object', self.idx)
         self.object_ring = object_ring
 
+        self.diskfile_module = diskfile_module
+
     @property
     def name(self):
         return self.alias_list[0]
@@ -202,6 +205,9 @@ class BaseStoragePolicy(object):
 
     def __int__(self):
         return self.idx
+
+    def __hash__(self):
+        return hash(self.idx)
 
     def __eq__(self, other):
         return self.idx == int(other)
@@ -252,6 +258,7 @@ class BaseStoragePolicy(object):
             'policy_type': 'policy_type',
             'default': 'is_default',
             'deprecated': 'is_deprecated',
+            'diskfile_module': 'diskfile_module'
         }
 
     @classmethod
@@ -285,6 +292,7 @@ class BaseStoragePolicy(object):
             if not self.is_deprecated:
                 info.pop('deprecated')
             info.pop('policy_type')
+            info.pop('diskfile_module')
         return info
 
     def _validate_policy_name(self, name):
@@ -358,15 +366,26 @@ class BaseStoragePolicy(object):
             self._validate_policy_name(name)
         self.alias_list.insert(0, name)
 
-    def load_ring(self, swift_dir):
+    def validate_ring_data(self, ring_data):
+        """
+        Validation hook used when loading the ring; currently only used for EC
+        """
+
+    def load_ring(self, swift_dir, reload_time=None):
         """
         Load the ring for this policy immediately.
 
         :param swift_dir: path to rings
+        :param reload_time: time interval in seconds to check for a ring change
         """
         if self.object_ring:
+            if reload_time is not None:
+                self.object_ring.reload_time = reload_time
             return
-        self.object_ring = Ring(swift_dir, ring_name=self.ring_name)
+
+        self.object_ring = Ring(
+            swift_dir, ring_name=self.ring_name,
+            validation_hook=self.validate_ring_data, reload_time=reload_time)
 
     @property
     def quorum(self):
@@ -375,6 +394,32 @@ class BaseStoragePolicy(object):
         consider the client request successful.
         """
         raise NotImplementedError()
+
+    def get_diskfile_manager(self, *args, **kwargs):
+        """
+        Return an instance of the diskfile manager class configured for this
+        storage policy.
+
+        :param args: positional args to pass to the diskfile manager
+            constructor.
+        :param kwargs: keyword args to pass to the diskfile manager
+            constructor.
+        :return: A disk file manager instance.
+        """
+        try:
+            dfm_cls = load_pkg_resource('swift.diskfile', self.diskfile_module)
+        except ImportError as err:
+            raise PolicyError(
+                'Unable to load diskfile_module %s for policy %s: %s' %
+                (self.diskfile_module, self.name, err))
+        try:
+            dfm_cls.check_policy(self)
+        except ValueError:
+            raise PolicyError(
+                'Invalid diskfile_module %s for policy %s:%s (%s)' %
+                (self.diskfile_module, int(self), self.name, self.policy_type))
+
+        return dfm_cls(*args, **kwargs)
 
 
 @BaseStoragePolicy.register(REPL_POLICY)
@@ -411,13 +456,15 @@ class ECStoragePolicy(BaseStoragePolicy):
 
     def __init__(self, idx, name='', aliases='', is_default=False,
                  is_deprecated=False, object_ring=None,
+                 diskfile_module='egg:swift#erasure_coding.fs',
                  ec_segment_size=DEFAULT_EC_OBJECT_SEGMENT_SIZE,
                  ec_type=None, ec_ndata=None, ec_nparity=None,
                  ec_duplication_factor=1):
 
         super(ECStoragePolicy, self).__init__(
             idx=idx, name=name, aliases=aliases, is_default=is_default,
-            is_deprecated=is_deprecated, object_ring=object_ring)
+            is_deprecated=is_deprecated, object_ring=object_ring,
+            diskfile_module=diskfile_module)
 
         # Validate erasure_coding policy specific members
         # ec_type is one of the EC implementations supported by PyEClib
@@ -607,38 +654,25 @@ class ECStoragePolicy(BaseStoragePolicy):
         """
         return self._ec_quorum_size * self.ec_duplication_factor
 
-    def load_ring(self, swift_dir):
+    def validate_ring_data(self, ring_data):
         """
-        Load the ring for this policy immediately.
+        EC specific validation
 
-        :param swift_dir: path to rings
+        Replica count check - we need _at_least_ (#data + #parity) replicas
+        configured.  Also if the replica count is larger than exactly that
+        number there's a non-zero risk of error for code that is
+        considering the number of nodes in the primary list from the ring.
         """
-        if self.object_ring:
-            return
 
-        def validate_ring_data(ring_data):
-            """
-            EC specific validation
-
-            Replica count check - we need _at_least_ (#data + #parity) replicas
-            configured.  Also if the replica count is larger than exactly that
-            number there's a non-zero risk of error for code that is
-            considering the number of nodes in the primary list from the ring.
-            """
-
-            configured_fragment_count = ring_data.replica_count
-            required_fragment_count = \
-                (self.ec_n_unique_fragments) * self.ec_duplication_factor
-            if configured_fragment_count != required_fragment_count:
-                raise RingLoadError(
-                    'EC ring for policy %s needs to be configured with '
-                    'exactly %d replicas. Got %s.' % (
-                        self.name, required_fragment_count,
-                        configured_fragment_count))
-
-        self.object_ring = Ring(
-            swift_dir, ring_name=self.ring_name,
-            validation_hook=validate_ring_data)
+        configured_fragment_count = ring_data.replica_count
+        required_fragment_count = \
+            (self.ec_n_unique_fragments) * self.ec_duplication_factor
+        if configured_fragment_count != required_fragment_count:
+            raise RingLoadError(
+                'EC ring for policy %s needs to be configured with '
+                'exactly %d replicas. Got %s.' % (
+                    self.name, required_fragment_count,
+                    configured_fragment_count))
 
     def get_backend_index(self, node_index):
         """
@@ -782,6 +816,15 @@ class StoragePolicyCollection(object):
             except ValueError:
                 return None
         return self.by_index.get(index)
+
+    def get_by_name_or_index(self, name_or_index):
+        by_name = self.get_by_name(name_or_index)
+        by_index = self.get_by_index(name_or_index)
+        if by_name and by_index and by_name != by_index:
+            raise PolicyError(
+                "Found different polices when searching by "
+                "name (%s) and by index (%s)" % (by_name, by_index))
+        return by_name or by_index
 
     @property
     def legacy(self):

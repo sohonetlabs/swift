@@ -26,7 +26,7 @@ from swift.common.middleware import container_sync
 from swift.proxy.controllers.base import get_cache_key
 from swift.proxy.controllers.info import InfoController
 
-from test.unit import FakeLogger
+from test.debug_logger import debug_logger
 
 
 class FakeApp(object):
@@ -34,19 +34,20 @@ class FakeApp(object):
     def __call__(self, env, start_response):
         if env.get('PATH_INFO') == '/info':
             controller = InfoController(
-                app=None, version=None, expose_info=True,
+                app=mock.Mock(logger=debug_logger()),
+                version=None, expose_info=True,
                 disallowed_sections=[], admin_key=None)
             handler = getattr(controller, env.get('REQUEST_METHOD'))
             return handler(swob.Request(env))(env, start_response)
         if env.get('swift.authorize_override'):
-            body = 'Response to Authorized Request'
+            body = b'Response to Authorized Request'
         else:
-            body = 'Pass-Through Response'
+            body = b'Pass-Through Response'
         headers = [('Content-Length', str(len(body)))]
         if 'HTTP_X_TIMESTAMP' in env:
             headers.append(('X-Timestamp', env['HTTP_X_TIMESTAMP']))
         start_response('200 OK', headers)
-        return body
+        return [body]
 
 
 class TestContainerSync(unittest.TestCase):
@@ -90,7 +91,7 @@ cluster_dfw1 = http://dfw1.host/v1/
     def test_current_invalid(self):
         self.conf = {'swift_dir': self.tempdir, 'current': 'foo'}
         self.sync = container_sync.ContainerSync(self.app, self.conf,
-                                                 logger=FakeLogger())
+                                                 logger=debug_logger())
         self.assertIsNone(self.sync.realm)
         self.assertIsNone(self.sync.cluster)
         info = {}
@@ -136,7 +137,7 @@ cluster_dfw1 = http://dfw1.host/v1/
     def test_missing_from_realms_conf(self):
         self.conf = {'swift_dir': self.tempdir, 'current': 'foo/bar'}
         self.sync = container_sync.ContainerSync(self.app, self.conf,
-                                                 logger=FakeLogger())
+                                                 logger=debug_logger())
         self.assertEqual('FOO', self.sync.realm)
         self.assertEqual('BAR', self.sync.cluster)
         info = {}
@@ -161,7 +162,7 @@ cluster_dfw1 = http://dfw1.host/v1/
         req = swob.Request.blank('/v1/a/c')
         resp = req.get_response(self.sync)
         self.assertEqual(resp.status, '200 OK')
-        self.assertEqual(resp.body, 'Pass-Through Response')
+        self.assertEqual(resp.body, b'Pass-Through Response')
 
     def test_not_enough_args(self):
         req = swob.Request.blank(
@@ -170,8 +171,8 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertEqual(resp.status, '401 Unauthorized')
         self.assertEqual(
             resp.body,
-            'X-Container-Sync-Auth header not valid; contact cluster operator '
-            'for support.')
+            b'X-Container-Sync-Auth header not valid; '
+            b'contact cluster operator for support.')
         self.assertTrue(
             'cs:not-3-args' in req.environ.get('swift.log_info'),
             req.environ.get('swift.log_info'))
@@ -183,8 +184,8 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertEqual(resp.status, '401 Unauthorized')
         self.assertEqual(
             resp.body,
-            'X-Container-Sync-Auth header not valid; contact cluster operator '
-            'for support.')
+            b'X-Container-Sync-Auth header not valid; '
+            b'contact cluster operator for support.')
         self.assertTrue(
             'cs:no-local-realm-key' in req.environ.get('swift.log_info'),
             req.environ.get('swift.log_info'))
@@ -196,8 +197,8 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertEqual(resp.status, '401 Unauthorized')
         self.assertEqual(
             resp.body,
-            'X-Container-Sync-Auth header not valid; contact cluster operator '
-            'for support.')
+            b'X-Container-Sync-Auth header not valid; '
+            b'contact cluster operator for support.')
         self.assertTrue(
             'cs:no-local-user-key' in req.environ.get('swift.log_info'),
             req.environ.get('swift.log_info'))
@@ -211,11 +212,12 @@ cluster_dfw1 = http://dfw1.host/v1/
         self.assertEqual(resp.status, '401 Unauthorized')
         self.assertEqual(
             resp.body,
-            'X-Container-Sync-Auth header not valid; contact cluster operator '
-            'for support.')
+            b'X-Container-Sync-Auth header not valid; '
+            b'contact cluster operator for support.')
         self.assertIn('cs:invalid-sig', req.environ.get('swift.log_info'))
         self.assertNotIn('swift.authorize_override', req.environ)
         self.assertNotIn('swift.slo_override', req.environ)
+        self.assertNotIn('swift.symlink_override', req.environ)
 
     def test_valid_sig(self):
         ts = '1455221706.726999_0123456789abcdef'
@@ -229,12 +231,13 @@ cluster_dfw1 = http://dfw1.host/v1/
         infocache[get_cache_key('a', 'c')] = {'sync_key': 'abc'}
         resp = req.get_response(self.sync)
         self.assertEqual(resp.status, '200 OK')
-        self.assertEqual(resp.body, 'Response to Authorized Request')
+        self.assertEqual(resp.body, b'Response to Authorized Request')
         self.assertIn('cs:valid', req.environ.get('swift.log_info'))
         self.assertIn('X-Timestamp', resp.headers)
         self.assertEqual(ts, resp.headers['X-Timestamp'])
         self.assertIn('swift.authorize_override', req.environ)
         self.assertIn('swift.slo_override', req.environ)
+        self.assertIn('swift.symlink_override', req.environ)
 
     def test_valid_sig2(self):
         sig = self.sync.realms_conf.get_sig(
@@ -246,10 +249,11 @@ cluster_dfw1 = http://dfw1.host/v1/
         infocache[get_cache_key('a', 'c')] = {'sync_key': 'abc'}
         resp = req.get_response(self.sync)
         self.assertEqual(resp.status, '200 OK')
-        self.assertEqual(resp.body, 'Response to Authorized Request')
+        self.assertEqual(resp.body, b'Response to Authorized Request')
         self.assertIn('cs:valid', req.environ.get('swift.log_info'))
         self.assertIn('swift.authorize_override', req.environ)
         self.assertIn('swift.slo_override', req.environ)
+        self.assertIn('swift.symlink_override', req.environ)
 
     def test_info(self):
         req = swob.Request.blank('/info')
@@ -309,9 +313,9 @@ cluster_lon3 = http://lon3.host/v1/
         self.assertEqual(resp.status, '400 Bad Request')
         self.assertEqual(
             resp.body,
-            'Full URLs are not allowed for X-Container-Sync-To values. Only '
-            'realm values of the format //realm/cluster/account/container are '
-            'allowed.\n')
+            b'Full URLs are not allowed for X-Container-Sync-To values. Only '
+            b'realm values of the format //realm/cluster/account/container '
+            b'are allowed.\n')
 
     def test_filter(self):
         app = FakeApp()

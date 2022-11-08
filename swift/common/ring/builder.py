@@ -33,7 +33,7 @@ from six.moves import range
 from time import time
 
 from swift.common import exceptions
-from swift.common.ring import RingData
+from swift.common.ring.ring import RingData
 from swift.common.ring.utils import tiers_for_dev, build_tier_tree, \
     validate_and_normalize_address, validate_replicas_by_tier, pretty_dev
 
@@ -178,7 +178,7 @@ class RingBuilder(object):
     @contextmanager
     def debug(self):
         """
-        Temporarily enables debug logging, useful in tests, e.g.
+        Temporarily enables debug logging, useful in tests, e.g.::
 
             with rb.debug():
                 rb.rebalance()
@@ -364,13 +364,15 @@ class RingBuilder(object):
             # shift an unsigned int >I right to obtain the partition for the
             # int).
             if not self._replica2part2dev:
-                self._ring = RingData([], devs, self.part_shift)
+                self._ring = RingData([], devs, self.part_shift,
+                                      version=self.version)
             else:
                 self._ring = \
                     RingData([array('H', p2d) for p2d in
                               self._replica2part2dev],
                              devs, self.part_shift,
-                             self.next_part_power)
+                             self.next_part_power,
+                             self.version)
         return self._ring
 
     def add_dev(self, dev):
@@ -417,11 +419,11 @@ class RingBuilder(object):
         # Add holes to self.devs to ensure self.devs[dev['id']] will be the dev
         while dev['id'] >= len(self.devs):
             self.devs.append(None)
-        required_keys = ('ip', 'port', 'weight')
-        if any(required not in dev for required in required_keys):
-            raise ValueError(
-                '%r is missing at least one the required key %r' % (
-                    dev, required_keys))
+        required_keys = ('region', 'zone', 'ip', 'port', 'device', 'weight')
+        missing = tuple(key for key in required_keys if key not in dev)
+        if missing:
+            raise ValueError('%r is missing required key(s): %s' % (
+                dev, ', '.join(missing)))
         dev['weight'] = float(dev['weight'])
         dev['parts'] = 0
         dev.setdefault('meta', '')
@@ -447,6 +449,46 @@ class RingBuilder(object):
             raise ValueError("Can not set weight of dev_id %s because it "
                              "is marked for removal" % (dev_id,))
         self.devs[dev_id]['weight'] = weight
+        self.devs_changed = True
+        self.version += 1
+
+    def set_dev_region(self, dev_id, region):
+        """
+        Set the region of a device. This should be called rather than just
+        altering the region key in the device dict directly, as the builder
+        will need to rebuild some internal state to reflect the change.
+
+        .. note::
+            This will not rebalance the ring immediately as you may want to
+            make multiple changes for a single rebalance.
+
+        :param dev_id: device id
+        :param region: new region for device
+        """
+        if any(dev_id == d['id'] for d in self._remove_devs):
+            raise ValueError("Can not set region of dev_id %s because it "
+                             "is marked for removal" % (dev_id,))
+        self.devs[dev_id]['region'] = region
+        self.devs_changed = True
+        self.version += 1
+
+    def set_dev_zone(self, dev_id, zone):
+        """
+        Set the zone of a device. This should be called rather than just
+        altering the zone key in the device dict directly, as the builder
+        will need to rebuild some internal state to reflect the change.
+
+        .. note::
+            This will not rebalance the ring immediately as you may want to
+            make multiple changes for a single rebalance.
+
+        :param dev_id: device id
+        :param zone: new zone for device
+        """
+        if any(dev_id == d['id'] for d in self._remove_devs):
+            raise ValueError("Can not set zone of dev_id %s because it "
+                             "is marked for removal" % (dev_id,))
+        self.devs[dev_id]['zone'] = zone
         self.devs_changed = True
         self.version += 1
 
@@ -1395,17 +1437,17 @@ class RingBuilder(object):
             {(): 3.0,
             (1,): 3.0,
             (1, 1): 1.0,
-            (1, 1, '127.0.0.1:6010'): 1.0,
-            (1, 1, '127.0.0.1:6010', 0): 1.0,
+            (1, 1, '127.0.0.1:6210'): 1.0,
+            (1, 1, '127.0.0.1:6210', 0): 1.0,
             (1, 2): 1.0,
-            (1, 2, '127.0.0.1:6020'): 1.0,
-            (1, 2, '127.0.0.1:6020', 1): 1.0,
+            (1, 2, '127.0.0.1:6220'): 1.0,
+            (1, 2, '127.0.0.1:6220', 1): 1.0,
             (1, 3): 1.0,
-            (1, 3, '127.0.0.1:6030'): 1.0,
-            (1, 3, '127.0.0.1:6030', 2): 1.0,
+            (1, 3, '127.0.0.1:6230'): 1.0,
+            (1, 3, '127.0.0.1:6230', 2): 1.0,
             (1, 4): 1.0,
-            (1, 4, '127.0.0.1:6040'): 1.0,
-            (1, 4, '127.0.0.1:6040', 3): 1.0}
+            (1, 4, '127.0.0.1:6240'): 1.0,
+            (1, 4, '127.0.0.1:6240', 3): 1.0}
 
         """
         # Used by walk_tree to know what entries to create for each recursive

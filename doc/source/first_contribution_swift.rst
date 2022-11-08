@@ -21,7 +21,7 @@ A source tarball for the latest release of Swift is available on the
 Prebuilt packages for Ubuntu and RHEL variants are available.
 
 * `Swift Ubuntu Packages <https://launchpad.net/ubuntu/+source/swift>`_
-* `Swift RDO Packages <https://www.rdoproject.org/Repositories>`_
+* `Swift RDO Packages <https://www.rdoproject.org/documentation/repositories/>`_
 
 --------------------
 Source Control Setup
@@ -117,7 +117,7 @@ Tracking your changes
 ---------------------
 
 After proposing changes to Swift, you can track them at
-https://review.openstack.org. After logging in, you will see a dashboard of
+https://review.opendev.org. After logging in, you will see a dashboard of
 "Outgoing reviews" for changes you have proposed, "Incoming reviews" for
 changes you are reviewing, and "Recently closed" changes for which you were
 either a reviewer or owner.

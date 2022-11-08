@@ -169,8 +169,7 @@ class SwiftRecon(object):
             ret_dict = {'low': min(cstats), 'high': max(cstats),
                         'total': sum(cstats), 'reported': len(cstats),
                         'number_none': len(stats) - len(cstats), 'name': name}
-            ret_dict['average'] = \
-                ret_dict['total'] / float(len(cstats))
+            ret_dict['average'] = ret_dict['total'] / float(len(cstats))
             ret_dict['perc_none'] = \
                 ret_dict['number_none'] * 100.0 / len(stats)
         else:
@@ -222,7 +221,7 @@ class SwiftRecon(object):
         Compare ring md5sum's with those on remote host
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
         :param swift_dir: The local directory with the ring files.
         """
         matches = 0
@@ -276,7 +275,7 @@ class SwiftRecon(object):
         Compare swift.conf md5sum with that on remote hosts
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
         :param printfn: function to print text; defaults to print()
         """
         matches = 0
@@ -308,7 +307,7 @@ class SwiftRecon(object):
         Obtain and print async pending statistics
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
         """
         scan = {}
         recon = Scout("async", self.verbose, self.suppress_errors,
@@ -330,7 +329,7 @@ class SwiftRecon(object):
         Obtain and print drive audit error statistics
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)]
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)]
         """
         scan = {}
         recon = Scout("driveaudit", self.verbose, self.suppress_errors,
@@ -352,7 +351,7 @@ class SwiftRecon(object):
         Check for and print unmounted drives
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
         """
         unmounted = {}
         errors = {}
@@ -385,7 +384,7 @@ class SwiftRecon(object):
         Check for server types on the ring
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
         """
         errors = {}
         recon = Scout("server_type_check", self.verbose, self.suppress_errors,
@@ -408,7 +407,7 @@ class SwiftRecon(object):
         Obtain and print expirer statistics
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
         """
         stats = {'object_expiration_pass': [], 'expired_last_pass': []}
         recon = Scout("expirer/%s" % self.server_type, self.verbose,
@@ -432,53 +431,28 @@ class SwiftRecon(object):
                 print("[%s] - No hosts returned valid data." % k)
         print("=" * 79)
 
-    def replication_check(self, hosts):
-        """
-        Obtain and print replication statistics
+    def _calculate_least_and_most_recent(self, url_time_data):
+        """calulate and print the least and most recent urls
 
-        :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+        Given a list of url and time tuples calulate the most and least
+        recent timings and print it out.
+        :param url_time_data: list of url and time tuples: [(url, time_), ..]
         """
-        stats = {'replication_time': [], 'failure': [], 'success': [],
-                 'attempted': []}
-        recon = Scout("replication/%s" % self.server_type, self.verbose,
-                      self.suppress_errors, self.timeout)
-        print("[%s] Checking on replication" % self._ptime())
         least_recent_time = 9999999999
         least_recent_url = None
         most_recent_time = 0
         most_recent_url = None
-        for url, response, status, ts_start, ts_end in self.pool.imap(
-                recon.scout, hosts):
-            if status == 200:
-                stats['replication_time'].append(
-                    response.get('replication_time',
-                                 response.get('object_replication_time', 0)))
-                repl_stats = response.get('replication_stats')
-                if repl_stats:
-                    for stat_key in ['attempted', 'failure', 'success']:
-                        stats[stat_key].append(repl_stats.get(stat_key))
-                last = response.get('replication_last',
-                                    response.get('object_replication_last', 0))
-                if last < least_recent_time:
-                    least_recent_time = last
-                    least_recent_url = url
-                if last > most_recent_time:
-                    most_recent_time = last
-                    most_recent_url = url
-        for k in stats:
-            if stats[k]:
-                if k != 'replication_time':
-                    computed = self._gen_stats(stats[k],
-                                               name='replication_%s' % k)
-                else:
-                    computed = self._gen_stats(stats[k], name=k)
-                if computed['reported'] > 0:
-                    self._print_stats(computed)
-                else:
-                    print("[%s] - No hosts returned valid data." % k)
-            else:
-                print("[%s] - No hosts returned valid data." % k)
+
+        for url, last in url_time_data:
+            if last is None:
+                continue
+            if last < least_recent_time:
+                least_recent_time = last
+                least_recent_url = url
+            if last > most_recent_time:
+                most_recent_time = last
+                most_recent_url = url
+
         if least_recent_url is not None:
             host = urlparse(least_recent_url).netloc
             if not least_recent_time:
@@ -496,6 +470,79 @@ class SwiftRecon(object):
             print('Most recent completion was %s (%d %s ago) by %s.' % (
                 self._ptime(most_recent_time),
                 elapsed, elapsed_unit, host))
+
+    def reconstruction_check(self, hosts):
+        """
+        Obtain and print reconstructon statistics
+
+        :param hosts: set of hosts to check. in the format of:
+            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+        """
+        stats = []
+        last_stats = []
+        recon = Scout("reconstruction/%s" % self.server_type, self.verbose,
+                      self.suppress_errors, self.timeout)
+        print("[%s] Checking on reconstructors" % self._ptime())
+        for url, response, status, ts_start, ts_end in self.pool.imap(
+                recon.scout, hosts):
+            if status == 200:
+                stats.append(response.get('object_reconstruction_time'))
+                last = response.get('object_reconstruction_last', 0)
+                last_stats.append((url, last))
+        if stats:
+            computed = self._gen_stats(stats,
+                                       name='object_reconstruction_time')
+            if computed['reported'] > 0:
+                self._print_stats(computed)
+            else:
+                print("[object_reconstruction_time] - No hosts returned "
+                      "valid data.")
+        else:
+            print("[object_reconstruction_time] - No hosts returned "
+                  "valid data.")
+        self._calculate_least_and_most_recent(last_stats)
+        print("=" * 79)
+
+    def replication_check(self, hosts):
+        """
+        Obtain and print replication statistics
+
+        :param hosts: set of hosts to check. in the format of:
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
+        """
+        stats = {'replication_time': [], 'failure': [], 'success': [],
+                 'attempted': []}
+        last_stats = []
+        recon = Scout("replication/%s" % self.server_type, self.verbose,
+                      self.suppress_errors, self.timeout)
+        print("[%s] Checking on replication" % self._ptime())
+        for url, response, status, ts_start, ts_end in self.pool.imap(
+                recon.scout, hosts):
+            if status == 200:
+                stats['replication_time'].append(
+                    response.get('replication_time',
+                                 response.get('object_replication_time', 0)))
+                repl_stats = response.get('replication_stats')
+                if repl_stats:
+                    for stat_key in ['attempted', 'failure', 'success']:
+                        stats[stat_key].append(repl_stats.get(stat_key))
+                last = response.get('replication_last',
+                                    response.get('object_replication_last', 0))
+                last_stats.append((url, last))
+        for k in stats:
+            if stats[k]:
+                if k != 'replication_time':
+                    computed = self._gen_stats(stats[k],
+                                               name='replication_%s' % k)
+                else:
+                    computed = self._gen_stats(stats[k], name=k)
+                if computed['reported'] > 0:
+                    self._print_stats(computed)
+                else:
+                    print("[%s] - No hosts returned valid data." % k)
+            else:
+                print("[%s] - No hosts returned valid data." % k)
+        self._calculate_least_and_most_recent(last_stats)
         print("=" * 79)
 
     def updater_check(self, hosts):
@@ -503,7 +550,7 @@ class SwiftRecon(object):
         Obtain and print updater statistics
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
         """
         stats = []
         recon = Scout("updater/%s" % self.server_type, self.verbose,
@@ -530,7 +577,7 @@ class SwiftRecon(object):
         Obtain and print obj auditor statistics
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
         """
         scan = {}
         adone = '%s_auditor_pass_completed' % self.server_type
@@ -602,7 +649,7 @@ class SwiftRecon(object):
         Obtain and print obj auditor statistics
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
         """
         all_scan = {}
         zbf_scan = {}
@@ -673,12 +720,75 @@ class SwiftRecon(object):
             print("[ZBF_auditor] - No hosts returned valid data.")
         print("=" * 79)
 
+    def sharding_check(self, hosts):
+        """
+        Obtain and print sharding statistics
+
+        :param hosts: set of hosts to check. in the format of:
+            set([('127.0.0.1', 6221), ('127.0.0.2', 6231)])
+        """
+        stats = {'sharding_time': [],
+                 'attempted': [], 'failure': [], 'success': []}
+        recon = Scout("sharding", self.verbose,
+                      self.suppress_errors, self.timeout)
+        print("[%s] Checking on sharders" % self._ptime())
+        least_recent_time = 9999999999
+        least_recent_url = None
+        most_recent_time = 0
+        most_recent_url = None
+        for url, response, status, ts_start, ts_end in self.pool.imap(
+                recon.scout, hosts):
+            if status == 200:
+                stats['sharding_time'].append(response.get('sharding_time', 0))
+                shard_stats = response.get('sharding_stats')
+                if shard_stats:
+                    # Sharding has a ton more stats, like "no_change".
+                    # Not sure if we need them at all, or maybe for -v.
+                    for stat_key in ['attempted', 'failure', 'success']:
+                        stats[stat_key].append(shard_stats.get(stat_key))
+                last = response.get('sharding_last', 0)
+                if last is None:
+                    continue
+                if last < least_recent_time:
+                    least_recent_time = last
+                    least_recent_url = url
+                if last > most_recent_time:
+                    most_recent_time = last
+                    most_recent_url = url
+        for k in stats:
+            if stats[k]:
+                computed = self._gen_stats(stats[k], name=k)
+                if computed['reported'] > 0:
+                    self._print_stats(computed)
+                else:
+                    print("[%s] - No hosts returned valid data." % k)
+            else:
+                print("[%s] - No hosts returned valid data." % k)
+        if least_recent_url is not None:
+            host = urlparse(least_recent_url).netloc
+            if not least_recent_time:
+                print('Oldest completion was NEVER by %s.' % host)
+            else:
+                elapsed = time.time() - least_recent_time
+                elapsed, elapsed_unit = seconds2timeunit(elapsed)
+                print('Oldest completion was %s (%d %s ago) by %s.' % (
+                    self._ptime(least_recent_time),
+                    elapsed, elapsed_unit, host))
+        if most_recent_url is not None:
+            host = urlparse(most_recent_url).netloc
+            elapsed = time.time() - most_recent_time
+            elapsed, elapsed_unit = seconds2timeunit(elapsed)
+            print('Most recent completion was %s (%d %s ago) by %s.' % (
+                self._ptime(most_recent_time),
+                elapsed, elapsed_unit, host))
+        print("=" * 79)
+
     def load_check(self, hosts):
         """
         Obtain and print load average statistics
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
         """
         load1 = {}
         load5 = {}
@@ -707,7 +817,7 @@ class SwiftRecon(object):
         Obtain and print quarantine statistics
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
         """
         objq = {}
         conq = {}
@@ -741,7 +851,7 @@ class SwiftRecon(object):
         Obtain and print /proc/net/sockstat statistics
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
         """
         inuse4 = {}
         mem = {}
@@ -775,7 +885,7 @@ class SwiftRecon(object):
         Obtain and print disk usage statistics
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
         """
         stats = {}
         highs = []
@@ -787,9 +897,15 @@ class SwiftRecon(object):
         low_percents = [(None, 100)] * lowest
         recon = Scout("diskusage", self.verbose, self.suppress_errors,
                       self.timeout)
+        # We want to only query each host once, but we don't care
+        # which of the available ports we use. So we filter hosts by
+        # constructing a host->port dictionary, since the dict
+        # constructor ensures each key is unique, thus each host
+        # appears only once in filtered_hosts.
+        filtered_hosts = set(dict(hosts).items())
         print("[%s] Checking disk usage now" % self._ptime())
         for url, response, status, ts_start, ts_end in self.pool.imap(
-                recon.scout, hosts):
+                recon.scout, filtered_hosts):
             if status == 200:
                 hostusage = []
                 for entry in response:
@@ -874,7 +990,7 @@ class SwiftRecon(object):
         Check a time synchronization of hosts with current time
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
         :param jitter: Maximal allowed time jitter
         """
 
@@ -913,7 +1029,7 @@ class SwiftRecon(object):
         Check OS Swift version of hosts. Inform if differs.
 
         :param hosts: set of hosts to check. in the format of:
-            set([('127.0.0.1', 6020), ('127.0.0.2', 6030)])
+            set([('127.0.0.1', 6220), ('127.0.0.2', 6230)])
         """
         versions = set()
         errors = 0
@@ -972,7 +1088,7 @@ class SwiftRecon(object):
         print("=" * 79)
         usage = '''
         usage: %prog <server_type> [<server_type> [<server_type>]]
-        [-v] [--suppress] [-a] [-r] [-u] [-d]
+        [-v] [--suppress] [-a] [-r] [-u] [-d] [-R]
         [-l] [-T] [--md5] [--auditor] [--updater] [--expirer] [--sockstat]
         [--human-readable]
 
@@ -986,16 +1102,21 @@ class SwiftRecon(object):
                         help="Print verbose info")
         args.add_option('--suppress', action="store_true",
                         help="Suppress most connection related errors")
-        args.add_option('--async', '-a', action="store_true",
+        args.add_option('--async', '-a',
+                        action="store_true", dest="async_check",
                         help="Get async stats")
         args.add_option('--replication', '-r', action="store_true",
                         help="Get replication stats")
+        args.add_option('--reconstruction', '-R', action="store_true",
+                        help="Get reconstruction stats")
         args.add_option('--auditor', action="store_true",
                         help="Get auditor stats")
         args.add_option('--updater', action="store_true",
                         help="Get updater stats")
         args.add_option('--expirer', action="store_true",
                         help="Get expirer stats")
+        args.add_option('--sharding', action="store_true",
+                        help="Get sharding stats")
         args.add_option('--unmounted', '-u', action="store_true",
                         help="Check cluster for unmounted devices")
         args.add_option('--diskusage', '-d', action="store_true",
@@ -1027,7 +1148,7 @@ class SwiftRecon(object):
                         help='Also show the lowest COUNT entries in rank \
                         order.')
         args.add_option('--all', action="store_true",
-                        help="Perform all checks. Equal to \t\t\t-arudlqT "
+                        help="Perform all checks. Equal to \t\t\t-arRudlqT "
                         "--md5 --sockstat --auditor --updater --expirer "
                         "--driveaudit --validate-servers --swift-versions")
         args.add_option('--region', type="int",
@@ -1085,9 +1206,11 @@ class SwiftRecon(object):
                     self.object_auditor_check(hosts)
                     self.updater_check(hosts)
                     self.expirer_check(hosts)
+                    self.reconstruction_check(hosts)
                 elif self.server_type == 'container':
                     self.auditor_check(hosts)
                     self.updater_check(hosts)
+                    self.sharding_check(hosts)
                 elif self.server_type == 'account':
                     self.auditor_check(hosts)
                 self.replication_check(hosts)
@@ -1104,7 +1227,7 @@ class SwiftRecon(object):
                 self.time_check(hosts, options.jitter)
                 self.version_check(hosts)
             else:
-                if options.async:
+                if options.async_check:
                     if self.server_type == 'object':
                         self.async_check(hosts)
                     else:
@@ -1131,8 +1254,22 @@ class SwiftRecon(object):
                     if self.server_type == 'object':
                         self.expirer_check(hosts)
                     else:
-                        print("Error: Can't check expired on non object "
+                        print("Error: Can't check expirer on non object "
                               "servers.")
+                        print("=" * 79)
+                if options.sharding:
+                    if self.server_type == 'container':
+                        self.sharding_check(hosts)
+                    else:
+                        print("Error: Can't check sharding on non container "
+                              "servers.")
+                        print("=" * 79)
+                if options.reconstruction:
+                    if self.server_type == 'object':
+                        self.reconstruction_check(hosts)
+                    else:
+                        print("Error: Can't check reconstruction stats on "
+                              "non object servers.")
                         print("=" * 79)
                 if options.validate_servers:
                     self.server_type_check(hosts)

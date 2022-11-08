@@ -13,20 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from swift import gettext_ as _
 import json
+import random
 
+import six
 from six.moves.urllib.parse import unquote
-from swift.common.utils import public, csv_append, Timestamp, \
-    config_true_value, ShardRange
+
+from swift.common.memcached import MemcacheConnectionError
+from swift.common.utils import public, private, csv_append, Timestamp, \
+    config_true_value, ShardRange, cache_from_env, filter_shard_ranges
 from swift.common.constraints import check_metadata, CONTAINER_LISTING_LIMIT
 from swift.common.http import HTTP_ACCEPTED, is_success
-from swift.common.request_helpers import get_sys_meta_prefix
+from swift.common.request_helpers import get_sys_meta_prefix, get_param, \
+    constrain_req_limit, validate_container_params
 from swift.proxy.controllers.base import Controller, delay_denial, \
-    cors_validation, set_info_cache, clear_info_cache
+    cors_validation, set_info_cache, clear_info_cache, _get_info_from_caches, \
+    get_cache_key, headers_from_container_info, update_headers
 from swift.common.storage_policy import POLICIES
-from swift.common.swob import HTTPBadRequest, HTTPForbidden, \
-    HTTPNotFound, HTTPServerError
+from swift.common.swob import HTTPBadRequest, HTTPForbidden, HTTPNotFound, \
+    HTTPServiceUnavailable, str_to_wsgi, wsgi_to_str, Response
 
 
 class ContainerController(Controller):
@@ -84,6 +89,153 @@ class ContainerController(Controller):
                         return HTTPBadRequest(request=req, body=str(err))
         return None
 
+    def _clear_container_info_cache(self, req):
+        clear_info_cache(self.app, req.environ,
+                         self.account_name, self.container_name)
+        clear_info_cache(self.app, req.environ,
+                         self.account_name, self.container_name, 'listing')
+        # TODO: should we also purge updating shards from cache?
+
+    def _GETorHEAD_from_backend(self, req):
+        part = self.app.container_ring.get_part(
+            self.account_name, self.container_name)
+        concurrency = self.app.container_ring.replica_count \
+            if self.app.get_policy_options(None).concurrent_gets else 1
+        node_iter = self.app.iter_nodes(self.app.container_ring, part,
+                                        self.logger)
+        resp = self.GETorHEAD_base(
+            req, 'Container', node_iter, part,
+            req.swift_entity_path, concurrency)
+        return resp
+
+    def _filter_resp_shard_ranges(self, req, cached_ranges):
+        # filter returned shard ranges according to request constraints
+        marker = get_param(req, 'marker', '')
+        end_marker = get_param(req, 'end_marker')
+        includes = get_param(req, 'includes')
+        reverse = config_true_value(get_param(req, 'reverse'))
+        if reverse:
+            marker, end_marker = end_marker, marker
+        shard_ranges = [
+            ShardRange.from_dict(shard_range)
+            for shard_range in cached_ranges]
+        shard_ranges = filter_shard_ranges(shard_ranges, includes, marker,
+                                           end_marker)
+        if reverse:
+            shard_ranges.reverse()
+        return json.dumps([dict(sr) for sr in shard_ranges]).encode('ascii')
+
+    def _GET_using_cache(self, req, info):
+        # It may be possible to fulfil the request from cache: we only reach
+        # here if request record_type is 'shard' or 'auto', so if the container
+        # state is 'sharded' then look for cached shard ranges. However, if
+        # X-Newest is true then we always fetch from the backend servers.
+        get_newest = config_true_value(req.headers.get('x-newest', False))
+        if get_newest:
+            self.logger.debug(
+                'Skipping shard cache lookup (x-newest) for %s', req.path_qs)
+        elif (info and is_success(info['status']) and
+                info.get('sharding_state') == 'sharded'):
+            # container is sharded so we may have the shard ranges cached
+            headers = headers_from_container_info(info)
+            if headers:
+                # only use cached values if all required headers available
+                infocache = req.environ.setdefault('swift.infocache', {})
+                memcache = cache_from_env(req.environ, True)
+                cache_key = get_cache_key(self.account_name,
+                                          self.container_name,
+                                          shard='listing')
+                cached_ranges = infocache.get(cache_key)
+                if cached_ranges is None and memcache:
+                    skip_chance = \
+                        self.app.container_listing_shard_ranges_skip_cache
+                    if skip_chance and random.random() < skip_chance:
+                        self.logger.increment('shard_listing.cache.skip')
+                    else:
+                        try:
+                            cached_ranges = memcache.get(
+                                cache_key, raise_on_error=True)
+                            cache_state = 'hit' if cached_ranges else 'miss'
+                        except MemcacheConnectionError:
+                            cache_state = 'error'
+                        self.logger.increment(
+                            'shard_listing.cache.%s' % cache_state)
+
+                if cached_ranges is not None:
+                    infocache[cache_key] = tuple(cached_ranges)
+                    # shard ranges can be returned from cache
+                    self.logger.debug('Found %d shards in cache for %s',
+                                      len(cached_ranges), req.path_qs)
+                    headers.update({'x-backend-record-type': 'shard',
+                                    'x-backend-cached-results': 'true'})
+                    shard_range_body = self._filter_resp_shard_ranges(
+                        req, cached_ranges)
+                    # mimic GetOrHeadHandler.get_working_response...
+                    # note: server sets charset with content_type but proxy
+                    # GETorHEAD_base does not, so don't set it here either
+                    resp = Response(request=req, body=shard_range_body)
+                    update_headers(resp, headers)
+                    resp.last_modified = Timestamp(
+                        headers['x-put-timestamp']).ceil()
+                    resp.environ['swift_x_timestamp'] = headers.get(
+                        'x-timestamp')
+                    resp.accept_ranges = 'bytes'
+                    resp.content_type = 'application/json'
+                    return resp
+
+        # The request was not fulfilled from cache so send to the backend
+        # server, but instruct the backend server to ignore name constraints in
+        # request params if returning shard ranges so that the response can
+        # potentially be cached. Only do this if the container state is
+        # 'sharded'. We don't attempt to cache shard ranges for a 'sharding'
+        # container as they may include the container itself as a 'gap filler'
+        # for shard ranges that have not yet cleaved; listings from 'gap
+        # filler' shard ranges are likely to become stale as the container
+        # continues to cleave objects to its shards and caching them is
+        # therefore more likely to result in stale or incomplete listings on
+        # subsequent container GETs.
+        req.headers['x-backend-override-shard-name-filter'] = 'sharded'
+        resp = self._GETorHEAD_from_backend(req)
+
+        sharding_state = resp.headers.get(
+            'x-backend-sharding-state', '').lower()
+        resp_record_type = resp.headers.get(
+            'x-backend-record-type', '').lower()
+        complete_listing = config_true_value(resp.headers.pop(
+            'x-backend-override-shard-name-filter', False))
+        # given that we sent 'x-backend-override-shard-name-filter=sharded' we
+        # should only receive back 'x-backend-override-shard-name-filter=true'
+        # if the sharding state is 'sharded', but check them both anyway...
+        if (resp_record_type == 'shard' and
+                sharding_state == 'sharded' and
+                complete_listing):
+            # backend returned unfiltered listing state shard ranges so parse
+            # them and replace response body with filtered listing
+            cache_key = get_cache_key(self.account_name, self.container_name,
+                                      shard='listing')
+            data = self._parse_listing_response(req, resp)
+            backend_shard_ranges = self._parse_shard_ranges(req, data, resp)
+            if backend_shard_ranges is not None:
+                cached_ranges = [dict(sr) for sr in backend_shard_ranges]
+                if resp.headers.get('x-backend-sharding-state') == 'sharded':
+                    # cache in infocache even if no shard ranges returned; this
+                    # is unexpected but use that result for this request
+                    infocache = req.environ.setdefault('swift.infocache', {})
+                    infocache[cache_key] = tuple(cached_ranges)
+                    memcache = cache_from_env(req.environ, True)
+                    if memcache and cached_ranges:
+                        # cache in memcache only if shard ranges as expected
+                        self.logger.debug('Caching %d shards for %s',
+                                          len(cached_ranges), req.path_qs)
+                        memcache.set(
+                            cache_key, cached_ranges,
+                            time=self.app.recheck_listing_shard_ranges)
+
+                # filter returned shard ranges according to request constraints
+                resp.body = self._filter_resp_shard_ranges(req, cached_ranges)
+
+        return resp
+
     def GETorHEAD(self, req):
         """Handler for HTTP GET/HEAD requests."""
         ai = self.account_info(self.account_name, req)
@@ -99,33 +251,84 @@ class ContainerController(Controller):
             # Don't cache this. The lack of account will be cached, and that
             # is sufficient.
             return HTTPNotFound(request=req)
-        part = self.app.container_ring.get_part(
-            self.account_name, self.container_name)
-        concurrency = self.app.container_ring.replica_count \
-            if self.app.concurrent_gets else 1
-        node_iter = self.app.iter_nodes(self.app.container_ring, part)
+
+        # The read-modify-write of params here is because the Request.params
+        # getter dynamically generates a dict of params from the query string;
+        # the setter must be called for new params to update the query string.
         params = req.params
         params['format'] = 'json'
+        # x-backend-record-type may be sent via internal client e.g. from
+        # the sharder or in probe tests
         record_type = req.headers.get('X-Backend-Record-Type', '').lower()
         if not record_type:
             record_type = 'auto'
             req.headers['X-Backend-Record-Type'] = 'auto'
             params['states'] = 'listing'
         req.params = params
-        resp = self.GETorHEAD_base(
-            req, _('Container'), node_iter, part,
-            req.swift_entity_path, concurrency)
+
+        memcache = cache_from_env(req.environ, True)
+        if (req.method == 'GET'
+                and get_param(req, 'states') == 'listing'
+                and record_type != 'object'):
+            may_get_listing_shards = True
+            info = _get_info_from_caches(self.app, req.environ,
+                                         self.account_name,
+                                         self.container_name)
+        else:
+            info = None
+            may_get_listing_shards = False
+
+        if (may_get_listing_shards and
+                self.app.recheck_listing_shard_ranges > 0
+                and memcache
+                and not config_true_value(
+                    req.headers.get('x-backend-include-deleted', False))):
+            # This GET might be served from cache or might populate cache.
+            # 'x-backend-include-deleted' is not usually expected in requests
+            # to the proxy (it is used from sharder to container servers) but
+            # it is included in the conditions just in case because we don't
+            # cache deleted shard ranges.
+            resp = self._GET_using_cache(req, info)
+        else:
+            resp = self._GETorHEAD_from_backend(req)
+
         resp_record_type = resp.headers.get('X-Backend-Record-Type', '')
+        cached_results = config_true_value(
+            resp.headers.get('x-backend-cached-results'))
+
+        if may_get_listing_shards and not cached_results:
+            if is_success(resp.status_int):
+                if resp_record_type == 'shard':
+                    # We got shard ranges from backend so increment the success
+                    # metric. Note: it's possible that later we find that shard
+                    # ranges can't be parsed
+                    self.logger.increment(
+                        'shard_listing.backend.%s' % resp.status_int)
+            elif info:
+                if (is_success(info['status'])
+                        and info.get('sharding_state') == 'sharded'):
+                    # We expected to get shard ranges from backend, but the
+                    # request failed. We can't be sure that the container is
+                    # sharded but we assume info was correct and increment the
+                    # failure metric
+                    self.logger.increment(
+                        'shard_listing.backend.%s' % resp.status_int)
+            # else:
+            #  The request failed, but in the absence of info we cannot assume
+            #  the container is sharded, so we don't increment the metric
+
         if all((req.method == "GET", record_type == 'auto',
                resp_record_type.lower() == 'shard')):
             resp = self._get_from_shards(req, resp)
 
-        # Cache this. We just made a request to a storage node and got
-        # up-to-date information for the container.
-        resp.headers['X-Backend-Recheck-Container-Existence'] = str(
-            self.app.recheck_container_existence)
-        set_info_cache(self.app, req.environ, self.account_name,
-                       self.container_name, resp)
+        if not config_true_value(
+                resp.headers.get('X-Backend-Cached-Results')):
+            # Cache container metadata. We just made a request to a storage
+            # node and got up-to-date information for the container.
+            resp.headers['X-Backend-Recheck-Container-Existence'] = str(
+                self.app.recheck_container_existence)
+            set_info_cache(self.app, req.environ, self.account_name,
+                           self.container_name, resp)
         if 'swift.authorize' in req.environ:
             req.acl = resp.headers.get('x-container-read')
             aresp = req.environ['swift.authorize'](req)
@@ -145,39 +348,72 @@ class ContainerController(Controller):
         return resp
 
     def _get_from_shards(self, req, resp):
-        # construct listing using shards described by the response body
+        # Construct listing using shards described by the response body.
+        # The history of containers that have returned shard ranges is
+        # maintained in the request environ so that loops can be avoided by
+        # forcing an object listing if the same container is visited again.
+        # This can happen in at least two scenarios:
+        #   1. a container has filled a gap in its shard ranges with a
+        #      shard range pointing to itself
+        #   2. a root container returns a (stale) shard range pointing to a
+        #      shard that has shrunk into the root, in which case the shrunken
+        #      shard may return the root's shard range.
+        shard_listing_history = req.environ.setdefault(
+            'swift.shard_listing_history', [])
+        policy_key = 'X-Backend-Storage-Policy-Index'
+        if not (shard_listing_history or policy_key in req.headers):
+            # We're handling the original request to the root container: set
+            # the root policy index in the request, unless it is already set,
+            # so that shards will return listings for that policy index.
+            # Note: we only get here if the root responded with shard ranges,
+            # or if the shard ranges were cached and the cached root container
+            # info has sharding_state==sharded; in both cases we can assume
+            # that the response is "modern enough" to include
+            # 'X-Backend-Storage-Policy-Index'.
+            req.headers[policy_key] = resp.headers[policy_key]
+        shard_listing_history.append((self.account_name, self.container_name))
         shard_ranges = [ShardRange.from_dict(data)
                         for data in json.loads(resp.body)]
-        self.app.logger.debug('GET listing from %s shards for: %s',
-                              len(shard_ranges), req.path_qs)
+        self.logger.debug('GET listing from %s shards for: %s',
+                          len(shard_ranges), req.path_qs)
         if not shard_ranges:
             # can't find ranges or there was a problem getting the ranges. So
             # return what we have.
             return resp
 
         objects = []
-        req_limit = int(req.params.get('limit', CONTAINER_LISTING_LIMIT))
+        req_limit = constrain_req_limit(req, CONTAINER_LISTING_LIMIT)
         params = req.params.copy()
         params.pop('states', None)
         req.headers.pop('X-Backend-Record-Type', None)
         reverse = config_true_value(params.get('reverse'))
-        marker = params.get('marker')
-        end_marker = params.get('end_marker')
+        marker = wsgi_to_str(params.get('marker'))
+        end_marker = wsgi_to_str(params.get('end_marker'))
+        prefix = wsgi_to_str(params.get('prefix'))
 
         limit = req_limit
-        for shard_range in shard_ranges:
+        all_resp_status = []
+        for i, shard_range in enumerate(shard_ranges):
             params['limit'] = limit
             # Always set marker to ensure that object names less than or equal
             # to those already in the listing are not fetched; if the listing
             # is empty then the original request marker, if any, is used. This
             # allows misplaced objects below the expected shard range to be
             # included in the listing.
+            last_name = ''
+            last_name_was_subdir = False
             if objects:
-                last_name = objects[-1].get('name',
-                                            objects[-1].get('subdir', u''))
-                params['marker'] = last_name.encode('utf-8')
+                last_name_was_subdir = 'subdir' in objects[-1]
+                if last_name_was_subdir:
+                    last_name = objects[-1]['subdir']
+                else:
+                    last_name = objects[-1]['name']
+
+                if six.PY2:
+                    last_name = last_name.encode('utf8')
+                params['marker'] = str_to_wsgi(last_name)
             elif marker:
-                params['marker'] = marker
+                params['marker'] = str_to_wsgi(marker)
             else:
                 params['marker'] = ''
             # Always set end_marker to ensure that misplaced objects beyond the
@@ -185,26 +421,69 @@ class ContainerController(Controller):
             # object obscuring correctly placed objects in the next shard
             # range.
             if end_marker and end_marker in shard_range:
-                params['end_marker'] = end_marker
+                params['end_marker'] = str_to_wsgi(end_marker)
             elif reverse:
-                params['end_marker'] = shard_range.lower_str
+                params['end_marker'] = str_to_wsgi(shard_range.lower_str)
             else:
-                params['end_marker'] = shard_range.end_marker
+                params['end_marker'] = str_to_wsgi(shard_range.end_marker)
 
-            if (shard_range.account == self.account_name and
-                    shard_range.container == self.container_name):
+            headers = {}
+            if ((shard_range.account, shard_range.container) in
+                    shard_listing_history):
                 # directed back to same container - force GET of objects
-                headers = {'X-Backend-Record-Type': 'object'}
-            else:
-                headers = None
-            self.app.logger.debug('Getting from %s %s with %s',
-                                  shard_range, shard_range.name, headers)
+                headers['X-Backend-Record-Type'] = 'object'
+            if config_true_value(req.headers.get('x-newest', False)):
+                headers['X-Newest'] = 'true'
+
+            if prefix:
+                if prefix > shard_range:
+                    continue
+                try:
+                    just_past = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+                except ValueError:
+                    pass
+                else:
+                    if just_past < shard_range:
+                        continue
+
+            if last_name_was_subdir and str(
+                shard_range.lower if reverse else shard_range.upper
+            ).startswith(last_name):
+                continue
+
+            self.logger.debug(
+                'Getting listing part %d from shard %s %s with %s',
+                i, shard_range, shard_range.name, headers)
             objs, shard_resp = self._get_container_listing(
                 req, shard_range.account, shard_range.container,
                 headers=headers, params=params)
+            all_resp_status.append(shard_resp.status_int)
+
+            sharding_state = shard_resp.headers.get('x-backend-sharding-state',
+                                                    'unknown')
+
+            if objs is None:
+                # give up if any non-success response from shard containers
+                self.logger.error(
+                    'Aborting listing from shards due to bad response: %r'
+                    % all_resp_status)
+                return HTTPServiceUnavailable(request=req)
+            shard_policy = shard_resp.headers.get(
+                'X-Backend-Record-Storage-Policy-Index',
+                shard_resp.headers[policy_key]
+            )
+            if shard_policy != req.headers[policy_key]:
+                self.logger.error(
+                    'Aborting listing from shards due to bad shard policy '
+                    'index: %s (expected %s)',
+                    shard_policy, req.headers[policy_key])
+                return HTTPServiceUnavailable(request=req)
+            self.logger.debug(
+                'Found %d objects in shard (state=%s), total = %d',
+                len(objs), sharding_state, len(objs) + len(objects))
 
             if not objs:
-                # tolerate errors or empty shard containers
+                # tolerate empty shard containers
                 continue
 
             objects.extend(objs)
@@ -212,18 +491,20 @@ class ContainerController(Controller):
 
             if limit <= 0:
                 break
-            elif (end_marker and reverse and
-                  end_marker >= objects[-1]['name'].encode('utf-8')):
+            last_name = objects[-1].get('name',
+                                        objects[-1].get('subdir', u''))
+            if six.PY2:
+                last_name = last_name.encode('utf8')
+            if end_marker and reverse and end_marker >= last_name:
                 break
-            elif (end_marker and not reverse and
-                  end_marker <= objects[-1]['name'].encode('utf-8')):
+            if end_marker and not reverse and end_marker <= last_name:
                 break
 
-        resp.body = json.dumps(objects)
+        resp.body = json.dumps(objects).encode('ascii')
         constrained = any(req.params.get(constraint) for constraint in (
             'marker', 'end_marker', 'path', 'prefix', 'delimiter'))
         if not constrained and len(objects) < req_limit:
-            self.app.logger.debug('Setting object count to %s' % len(objects))
+            self.logger.debug('Setting object count to %s' % len(objects))
             # prefer the actual listing stats over the potentially outdated
             # root stats. This condition is only likely when a sharded
             # container is shrinking or in tests; typically a sharded container
@@ -240,6 +521,8 @@ class ContainerController(Controller):
     @cors_validation
     def GET(self, req):
         """Handler for HTTP GET requests."""
+        # early checks for request validity
+        validate_container_params(req)
         return self.GETorHEAD(req)
 
     @public
@@ -267,15 +550,15 @@ class ContainerController(Controller):
                 str(config_true_value(req.headers['X-Container-Sharding']))
         length_limit = self.get_name_length_limit()
         if len(self.container_name) > length_limit:
-            resp = HTTPBadRequest(request=req)
-            resp.body = 'Container name length of %d longer than %d' % \
-                        (len(self.container_name), length_limit)
+            body = 'Container name length of %d longer than %d' % (
+                len(self.container_name), length_limit)
+            resp = HTTPBadRequest(request=req, body=body)
             return resp
         account_partition, accounts, container_count = \
             self.account_info(self.account_name, req)
         if not accounts and self.app.account_autocreate:
             if not self.autocreate_account(req, self.account_name):
-                return HTTPServerError(request=req)
+                return HTTPServiceUnavailable(request=req)
             account_partition, accounts, container_count = \
                 self.account_info(self.account_name, req)
         if not accounts:
@@ -286,9 +569,9 @@ class ContainerController(Controller):
                 self.container_info(self.account_name, self.container_name,
                                     req)
             if not is_success(container_info.get('status')):
-                resp = HTTPForbidden(request=req)
-                resp.body = 'Reached container limit of %s' % \
-                    self.app.max_containers_per_account
+                body = 'Reached container limit of %s' % (
+                    self.app.max_containers_per_account, )
+                resp = HTTPForbidden(request=req, body=body)
                 return resp
         container_partition, containers = self.app.container_ring.get_nodes(
             self.account_name, self.container_name)
@@ -298,8 +581,7 @@ class ContainerController(Controller):
         resp = self.make_requests(
             req, self.app.container_ring,
             container_partition, 'PUT', req.swift_entity_path, headers)
-        clear_info_cache(self.app, req.environ,
-                         self.account_name, self.container_name)
+        self._clear_container_info_cache(req)
         return resp
 
     @public
@@ -324,8 +606,7 @@ class ContainerController(Controller):
         container_partition, containers = self.app.container_ring.get_nodes(
             self.account_name, self.container_name)
         headers = self.generate_request_headers(req, transfer=True)
-        clear_info_cache(self.app, req.environ,
-                         self.account_name, self.container_name)
+        self._clear_container_info_cache(req)
         resp = self.make_requests(
             req, self.app.container_ring, container_partition, 'POST',
             req.swift_entity_path, [headers] * len(containers))
@@ -343,8 +624,7 @@ class ContainerController(Controller):
             self.account_name, self.container_name)
         headers = self._backend_requests(req, len(containers),
                                          account_partition, accounts)
-        clear_info_cache(self.app, req.environ,
-                         self.account_name, self.container_name)
+        self._clear_container_info_cache(req)
         resp = self.make_requests(
             req, self.app.container_ring, container_partition, 'DELETE',
             req.swift_entity_path, headers)
@@ -352,6 +632,27 @@ class ContainerController(Controller):
         if resp.status_int == HTTP_ACCEPTED:
             return HTTPNotFound(request=req)
         return resp
+
+    @private
+    def UPDATE(self, req):
+        """HTTP UPDATE request handler.
+
+        Method to perform bulk operations on container DBs,
+        similar to a merge_items REPLICATE request.
+
+        Not client facing; internal clients or middlewares must include
+        ``X-Backend-Allow-Method: UPDATE`` header to access.
+        """
+        container_partition, containers = self.app.container_ring.get_nodes(
+            self.account_name, self.container_name)
+        # Since this isn't client facing, expect callers to supply an index
+        policy_index = req.headers['X-Backend-Storage-Policy-Index']
+        headers = self._backend_requests(
+            req, len(containers), account_partition=None, accounts=[],
+            policy_index=policy_index)
+        return self.make_requests(
+            req, self.app.container_ring, container_partition, 'UPDATE',
+            req.swift_entity_path, headers, body=req.body)
 
     def _backend_requests(self, req, n_outgoing, account_partition, accounts,
                           policy_index=None):

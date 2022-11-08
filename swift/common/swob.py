@@ -35,24 +35,27 @@ place to keep Swift working every time webob decides some interface
 needs to change.
 """
 
-from collections import defaultdict, MutableMapping
+from collections import defaultdict
+try:
+    from collections.abc import MutableMapping
+except ImportError:
+    from collections import MutableMapping  # py2
 import time
 from functools import partial
-from datetime import datetime, timedelta, tzinfo
+from datetime import datetime
 from email.utils import parsedate
 import re
 import random
 import functools
-import inspect
+from io import BytesIO
 
 import six
-from six import BytesIO
 from six import StringIO
 from six.moves import urllib
 
 from swift.common.header_key_dict import HeaderKeyDict
-from swift.common.utils import reiterate, split_path, Timestamp, pairs, \
-    close_if_possible, closing_if_possible
+from swift.common.utils import UTC, reiterate, split_path, Timestamp, pairs, \
+    close_if_possible, closing_if_possible, config_true_value
 from swift.common.exceptions import InvalidTimestamp
 
 
@@ -111,26 +114,13 @@ RESPONSE_REASONS = {
           'backend server.'),
     507: ('Insufficient Storage', 'There was not enough space to save the '
           'resource. Drive: %(drive)s'),
+    529: ('Too Many Backend Requests', 'The server is incapable of performing '
+          'the requested operation due to too many requests. Slow down.')
 }
 
 MAX_RANGE_OVERLAPS = 2
 MAX_NONASCENDING_RANGES = 8
 MAX_RANGES = 50
-
-
-class _UTC(tzinfo):
-    """
-    A tzinfo class for datetime objects that returns a 0 timedelta (UTC time)
-    """
-    def dst(self, dt):
-        return timedelta(0)
-    utcoffset = dst
-
-    def tzname(self, dt):
-        return 'UTC'
-
-
-UTC = _UTC()
 
 
 class WsgiBytesIO(BytesIO):
@@ -224,8 +214,12 @@ def header_to_environ_key(header_name):
     # Why the to/from wsgi dance? Headers that include something like b'\xff'
     # on the wire get translated to u'\u00ff' on py3, which gets upper()ed to
     # u'\u0178', which is nonsense in a WSGI string.
-    real_header = wsgi_to_str(header_name)
-    header_name = 'HTTP_' + str_to_wsgi(real_header.upper()).replace('-', '_')
+    # Note that we have to only get as far as bytes because something like
+    # b'\xc3\x9f' on the wire would be u'\u00df' as a native string on py3,
+    # which would upper() to 'SS'.
+    real_header = wsgi_to_bytes(header_name)
+    header_name = 'HTTP_' + bytes_to_wsgi(
+        real_header.upper()).replace('-', '_')
     if header_name == 'HTTP_CONTENT_LENGTH':
         return 'CONTENT_LENGTH'
     if header_name == 'HTTP_CONTENT_TYPE':
@@ -272,8 +266,9 @@ class HeaderEnvironProxy(MutableMapping):
 
     def keys(self):
         # See the to/from WSGI comment in header_to_environ_key
-        keys = [str_to_wsgi(wsgi_to_str(key[5:]).replace('_', '-').title())
-                for key in self.environ if key.startswith('HTTP_')]
+        keys = [
+            bytes_to_wsgi(wsgi_to_bytes(key[5:]).replace(b'_', b'-').title())
+            for key in self.environ if key.startswith('HTTP_')]
         if 'CONTENT_LENGTH' in self.environ:
             keys.append('Content-Length')
         if 'CONTENT_TYPE' in self.environ:
@@ -282,12 +277,16 @@ class HeaderEnvironProxy(MutableMapping):
 
 
 def wsgi_to_bytes(wsgi_str):
+    if wsgi_str is None:
+        return None
     if six.PY2:
         return wsgi_str
     return wsgi_str.encode('latin1')
 
 
 def wsgi_to_str(wsgi_str):
+    if wsgi_str is None:
+        return None
     if six.PY2:
         return wsgi_str
     return wsgi_to_bytes(wsgi_str).decode('utf8', errors='surrogateescape')
@@ -303,6 +302,50 @@ def str_to_wsgi(native_str):
     if six.PY2:
         return native_str
     return bytes_to_wsgi(native_str.encode('utf8', errors='surrogateescape'))
+
+
+def wsgi_quote(wsgi_str, safe='/'):
+    if six.PY2:
+        if not isinstance(wsgi_str, bytes):
+            raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+        return urllib.parse.quote(wsgi_str, safe=safe)
+
+    if not isinstance(wsgi_str, str) or any(ord(x) > 255 for x in wsgi_str):
+        raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+    return urllib.parse.quote(wsgi_str, safe=safe, encoding='latin-1')
+
+
+def wsgi_unquote(wsgi_str):
+    if six.PY2:
+        if not isinstance(wsgi_str, bytes):
+            raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+        return urllib.parse.unquote(wsgi_str)
+
+    if not isinstance(wsgi_str, str) or any(ord(x) > 255 for x in wsgi_str):
+        raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+    return urllib.parse.unquote(wsgi_str, encoding='latin-1')
+
+
+def wsgi_quote_plus(wsgi_str):
+    if six.PY2:
+        if not isinstance(wsgi_str, bytes):
+            raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+        return urllib.parse.quote_plus(wsgi_str)
+
+    if not isinstance(wsgi_str, str) or any(ord(x) > 255 for x in wsgi_str):
+        raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+    return urllib.parse.quote_plus(wsgi_str, encoding='latin-1')
+
+
+def wsgi_unquote_plus(wsgi_str):
+    if six.PY2:
+        if not isinstance(wsgi_str, bytes):
+            raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+        return urllib.parse.unquote_plus(wsgi_str)
+
+    if not isinstance(wsgi_str, str) or any(ord(x) > 255 for x in wsgi_str):
+        raise TypeError('Expected a WSGI string; got %r' % wsgi_str)
+    return urllib.parse.unquote_plus(wsgi_str, encoding='latin-1')
 
 
 def _resp_status_property():
@@ -430,6 +473,10 @@ def _resp_app_iter_property():
 
     def setter(self, value):
         if isinstance(value, (list, tuple)):
+            for i, item in enumerate(value):
+                if not isinstance(item, bytes):
+                    raise TypeError('WSGI responses must be bytes; '
+                                    'got %s for item %d' % (type(item), i))
             self.content_length = sum(map(len, value))
         elif value is not None:
             self.content_length = None
@@ -647,6 +694,12 @@ class Range(object):
         return all_ranges
 
 
+def normalize_etag(tag):
+    if tag and tag.startswith('"') and tag.endswith('"') and tag != '"':
+        return tag[1:-1]
+    return tag
+
+
 class Match(object):
     """
     Wraps a Request's If-[None-]Match header as a friendly object.
@@ -659,13 +712,10 @@ class Match(object):
             tag = tag.strip()
             if not tag:
                 continue
-            if tag.startswith('"') and tag.endswith('"'):
-                self.tags.add(tag[1:-1])
-            else:
-                self.tags.add(tag)
+            self.tags.add(normalize_etag(tag))
 
     def __contains__(self, val):
-        return '*' in self.tags or val in self.tags
+        return '*' in self.tags or normalize_etag(val) in self.tags
 
     def __repr__(self):
         return '%s(%r)' % (
@@ -749,20 +799,24 @@ class Accept(object):
 def _req_environ_property(environ_field, is_wsgi_string_field=True):
     """
     Set and retrieve value of the environ_field entry in self.environ.
-    (Used by both request and response)
+    (Used by Request)
     """
     def getter(self):
         return self.environ.get(environ_field, None)
 
     def setter(self, value):
-        if six.PY2 and isinstance(value, six.text_type):
-            self.environ[environ_field] = value.encode('utf-8')
-        elif not six.PY2 and isinstance(value, six.binary_type):
-            self.environ[environ_field] = value.decode('latin1')
+        if six.PY2:
+            if isinstance(value, six.text_type):
+                self.environ[environ_field] = value.encode('utf-8')
+            else:
+                self.environ[environ_field] = value
         else:
-            if not six.PY2 and is_wsgi_string_field:
+            if is_wsgi_string_field:
                 # Check that input is valid before setting
-                value.encode('latin1')
+                if isinstance(value, str):
+                    value.encode('latin1').decode('utf-8')
+                if isinstance(value, bytes):
+                    value = value.decode('latin1')
             self.environ[environ_field] = value
 
     return property(getter, setter, doc=("Get and set the %s property "
@@ -878,9 +932,10 @@ class Request(object):
         """
         headers = headers or {}
         environ = environ or {}
-        if six.PY2 and isinstance(path, six.text_type):
-            path = path.encode('utf-8')
-        elif not six.PY2:
+        if six.PY2:
+            if isinstance(path, six.text_type):
+                path = path.encode('utf-8')
+        else:
             if isinstance(path, six.binary_type):
                 path = path.decode('latin1')
             else:
@@ -898,16 +953,11 @@ class Request(object):
                            'https': 443}.get(parsed_path.scheme, 80)
         if parsed_path.scheme and parsed_path.scheme not in ['http', 'https']:
             raise TypeError('Invalid scheme: %s' % parsed_path.scheme)
-        if six.PY2:
-            path_info = urllib.parse.unquote(parsed_path.path)
-        else:
-            path_info = urllib.parse.unquote(parsed_path.path,
-                                             encoding='latin-1')
         env = {
             'REQUEST_METHOD': 'GET',
             'SCRIPT_NAME': '',
             'QUERY_STRING': parsed_path.query,
-            'PATH_INFO': path_info,
+            'PATH_INFO': wsgi_unquote(parsed_path.path),
             'SERVER_NAME': server_name,
             'SERVER_PORT': str(server_port),
             'HTTP_HOST': '%s:%d' % (server_name, server_port),
@@ -946,8 +996,13 @@ class Request(object):
         "Provides QUERY_STRING parameters as a dictionary"
         if self._params_cache is None:
             if 'QUERY_STRING' in self.environ:
-                self._params_cache = dict(
-                    urllib.parse.parse_qsl(self.environ['QUERY_STRING'], True))
+                if six.PY2:
+                    self._params_cache = dict(urllib.parse.parse_qsl(
+                        self.environ['QUERY_STRING'], True))
+                else:
+                    self._params_cache = dict(urllib.parse.parse_qsl(
+                        self.environ['QUERY_STRING'],
+                        keep_blank_values=True, encoding='latin-1'))
             else:
                 self._params_cache = {}
         return self._params_cache
@@ -956,7 +1011,38 @@ class Request(object):
     @params.setter
     def params(self, param_pairs):
         self._params_cache = None
-        self.query_string = urllib.parse.urlencode(param_pairs)
+        if six.PY2:
+            self.query_string = urllib.parse.urlencode(param_pairs)
+        else:
+            self.query_string = urllib.parse.urlencode(param_pairs,
+                                                       encoding='latin-1')
+
+    def ensure_x_timestamp(self):
+        """
+        Similar to :attr:`timestamp`, but the ``X-Timestamp`` header will be
+        set if not present.
+
+        :raises HTTPBadRequest: if X-Timestamp is already set but not a valid
+                                :class:`~swift.common.utils.Timestamp`
+        :returns: the request's X-Timestamp header,
+                  as a :class:`~swift.common.utils.Timestamp`
+        """
+        # The container sync feature includes an x-timestamp header with
+        # requests. If present this is checked and preserved, otherwise a fresh
+        # timestamp is added.
+        if 'HTTP_X_TIMESTAMP' in self.environ:
+            try:
+                self._timestamp = Timestamp(self.environ['HTTP_X_TIMESTAMP'])
+            except ValueError:
+                raise HTTPBadRequest(
+                    request=self, content_type='text/plain',
+                    body='X-Timestamp should be a UNIX timestamp float value; '
+                         'was %r' % self.environ['HTTP_X_TIMESTAMP'])
+        else:
+            self._timestamp = Timestamp.now()
+        # Always normalize it to the internal form
+        self.environ['HTTP_X_TIMESTAMP'] = self._timestamp.internal
+        return self._timestamp
 
     @property
     def timestamp(self):
@@ -985,25 +1071,21 @@ class Request(object):
     @property
     def path(self):
         "Provides the full path of the request, excluding the QUERY_STRING"
-        if six.PY2:
-            return urllib.parse.quote(self.environ.get('SCRIPT_NAME', '') +
-                                      self.environ['PATH_INFO'])
-        else:
-            return urllib.parse.quote(self.environ.get('SCRIPT_NAME', '') +
-                                      self.environ['PATH_INFO'],
-                                      encoding='latin-1')
+        return wsgi_quote(self.environ.get('SCRIPT_NAME', '') +
+                          self.environ['PATH_INFO'])
 
     @property
     def swift_entity_path(self):
         """
-        Provides the account/container/object path, sans API version.
+        Provides the (native string) account/container/object path,
+        sans API version.
 
         This can be useful when constructing a path to send to a backend
         server, as that path will need everything after the "/v1".
         """
         _ver, entity_path = self.split_path(1, 2, rest_with_last=True)
         if entity_path is not None:
-            return '/' + entity_path
+            return '/' + wsgi_to_str(entity_path)
 
     @property
     def is_chunked(self):
@@ -1013,6 +1095,11 @@ class Request(object):
     def url(self):
         "Provides the full url of the request"
         return self.host_url + self.path_qs
+
+    @property
+    def allow_reserved_names(self):
+        return config_true_value(self.environ.get(
+            'HTTP_X_BACKEND_ALLOW_RESERVED_NAMES'))
 
     def as_referer(self):
         return self.method + ' ' + self.url
@@ -1177,6 +1264,9 @@ class Response(object):
         self._conditional_etag = conditional_etag
         self.request = request
         self._app_iter = None
+        # Allow error messages to come as natural strings on py3.
+        if isinstance(body, six.text_type):
+            body = body.encode('utf8')
         self.body = body
         self.app_iter = app_iter
         self.response_iter = None
@@ -1425,7 +1515,7 @@ class Response(object):
                 realm = 'unknown'
         except (AttributeError, ValueError):
             realm = 'unknown'
-        return 'Swift realm="%s"' % urllib.parse.quote(realm)
+        return 'Swift realm="%s"' % wsgi_quote(realm)
 
     @property
     def is_success(self):
@@ -1478,23 +1568,15 @@ def wsgify(func):
     return a Response object into WSGI callables.  Also catches any raised
     HTTPExceptions and treats them as a returned Response.
     """
-    argspec = inspect.getargspec(func)
-    if argspec.args and argspec.args[0] == 'self':
-        @functools.wraps(func)
-        def _wsgify_self(self, env, start_response):
-            try:
-                return func(self, Request(env))(env, start_response)
-            except HTTPException as err_resp:
-                return err_resp(env, start_response)
-        return _wsgify_self
-    else:
-        @functools.wraps(func)
-        def _wsgify_bare(env, start_response):
-            try:
-                return func(Request(env))(env, start_response)
-            except HTTPException as err_resp:
-                return err_resp(env, start_response)
-        return _wsgify_bare
+    @functools.wraps(func)
+    def _wsgify(*args):
+        env, start_response = args[-2:]
+        new_args = args[:-2] + (Request(env), )
+        try:
+            return func(*new_args)(env, start_response)
+        except HTTPException as err_resp:
+            return err_resp(env, start_response)
+    return _wsgify
 
 
 class StatusMap(object):
@@ -1539,3 +1621,4 @@ HTTPNotImplemented = status_map[501]
 HTTPBadGateway = status_map[502]
 HTTPServiceUnavailable = status_map[503]
 HTTPInsufficientStorage = status_map[507]
+HTTPTooManyBackendRequests = status_map[529]

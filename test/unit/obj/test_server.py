@@ -31,7 +31,6 @@ import random
 from shutil import rmtree
 from time import gmtime, strftime, time, struct_time
 from tempfile import mkdtemp
-from hashlib import md5
 from collections import defaultdict
 from contextlib import contextmanager
 from textwrap import dedent
@@ -42,7 +41,8 @@ from eventlet.green import httplib
 from swift import __version__ as swift_version
 from swift.common.http import is_success
 from test import listen_zero
-from test.unit import FakeLogger, debug_logger, mocked_http_conn, \
+from test.debug_logger import debug_logger
+from test.unit import mocked_http_conn, \
     make_timestamp_iter, DEFAULT_TEST_EC_TYPE, skip_if_no_xattrs, \
     connect_tcp, readuntil2crlfs, patch_policies, encode_frag_archive_bodies, \
     mock_check_drive
@@ -53,8 +53,9 @@ from swift.common import utils, bufferedhttp
 from swift.common.header_key_dict import HeaderKeyDict
 from swift.common.utils import hash_path, mkdirs, normalize_timestamp, \
     NullLogger, storage_directory, public, replication, encode_timestamps, \
-    Timestamp
+    Timestamp, md5
 from swift.common import constraints
+from swift.common.request_helpers import get_reserved_name
 from swift.common.swob import Request, WsgiBytesIO
 from swift.common.splice import splice
 from swift.common.storage_policy import (StoragePolicy, ECStoragePolicy,
@@ -139,23 +140,23 @@ class TestObjectController(unittest.TestCase):
     def setUp(self):
         """Set up for testing swift.object.server.ObjectController"""
         skip_if_no_xattrs()
-        utils.HASH_PATH_SUFFIX = 'endcap'
-        utils.HASH_PATH_PREFIX = 'startcap'
+        utils.HASH_PATH_SUFFIX = b'endcap'
+        utils.HASH_PATH_PREFIX = b'startcap'
         self.tmpdir = mkdtemp()
         self.testdir = os.path.join(self.tmpdir,
                                     'tmp_test_object_server_ObjectController')
         mkdirs(os.path.join(self.testdir, 'sda1'))
         self.conf = {'devices': self.testdir, 'mount_check': 'false',
                      'container_update_timeout': 0.0}
+        self.logger = debug_logger('test-object-controller')
         self.object_controller = object_server.ObjectController(
-            self.conf, logger=debug_logger())
+            self.conf, logger=self.logger)
         self.object_controller.bytes_per_sync = 1
         self._orig_tpool_exc = tpool.execute
         tpool.execute = lambda f, *args, **kwargs: f(*args, **kwargs)
         self.df_mgr = diskfile.DiskFileManager(self.conf,
                                                self.object_controller.logger)
 
-        self.logger = debug_logger('test-object-controller')
         self.ts = make_timestamp_iter()
         self.ec_policies = [p for p in POLICIES if p.policy_type == EC_POLICY]
 
@@ -173,16 +174,37 @@ class TestObjectController(unittest.TestCase):
             self.policy = policy
             yield policy
 
+    def test_init(self):
+        conf = {
+            'devices': self.testdir,
+            'mount_check': 'false',
+            'container_update_timeout': 0.0,
+        }
+        app = object_server.ObjectController(conf, logger=self.logger)
+        self.assertEqual(app.container_update_timeout, 0.0)
+        self.assertEqual(app.auto_create_account_prefix, '.')
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [])
+
+        conf['auto_create_account_prefix'] = '-'
+        app = object_server.ObjectController(conf, logger=self.logger)
+        self.assertEqual(app.auto_create_account_prefix, '-')
+        self.assertEqual(self.logger.get_lines_for_level('warning'), [
+            'Option auto_create_account_prefix is deprecated. '
+            'Configure auto_create_account_prefix under the '
+            'swift-constraints section of swift.conf. This option '
+            'will be ignored in a future release.'
+        ])
+
     def check_all_api_methods(self, obj_name='o', alt_res=None):
         path = '/sda1/p/a/c/%s' % obj_name
-        body = 'SPECIAL_STRING'
+        body = b'SPECIAL_STRING'
 
         op_table = {
-            "PUT": (body, alt_res or 201, ''),  # create one
-            "GET": ('', alt_res or 200, body),  # check it
-            "POST": ('', alt_res or 202, ''),   # update it
-            "HEAD": ('', alt_res or 200, ''),   # head it
-            "DELETE": ('', alt_res or 204, '')  # delete it
+            "PUT": (body, alt_res or 201, b''),  # create one
+            "GET": (b'', alt_res or 200, body),  # check it
+            "POST": (b'', alt_res or 202, b''),   # update it
+            "HEAD": (b'', alt_res or 200, b''),   # head it
+            "DELETE": (b'', alt_res or 204, b'')  # delete it
         }
 
         for method in ["PUT", "GET", "POST", "HEAD", "DELETE"]:
@@ -200,6 +222,9 @@ class TestObjectController(unittest.TestCase):
 
     def test_REQUEST_SPECIAL_CHARS(self):
         obj = 'special昆%20/%'
+        if six.PY3:
+            # The path argument of Request.blank() is a WSGI string, somehow
+            obj = obj.encode('utf-8').decode('latin-1')
         self.check_all_api_methods(obj)
 
     def test_device_unavailable(self):
@@ -234,8 +259,8 @@ class TestObjectController(unittest.TestCase):
                    'X-Object-Meta-Two': 'Two'}
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                             headers=headers)
-        req.body = 'VERIFY'
-        etag = '"%s"' % md5('VERIFY').hexdigest()
+        req.body = b'VERIFY'
+        etag = '"%s"' % md5(b'VERIFY', usedforsecurity=False).hexdigest()
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
         self.assertEqual(dict(resp.headers), {
@@ -250,8 +275,7 @@ class TestObjectController(unittest.TestCase):
                    'X-Object-Meta-4': 'Four',
                    'Content-Encoding': 'gzip',
                    'Foo': 'fooheader',
-                   'Bar': 'barheader',
-                   'Content-Type': 'application/x-test'}
+                   'Bar': 'barheader'}
         req = Request.blank('/sda1/p/a/c/o',
                             environ={'REQUEST_METHOD': 'POST'},
                             headers=headers)
@@ -260,6 +284,7 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(dict(resp.headers), {
             'Content-Type': 'text/html; charset=UTF-8',
             'Content-Length': str(len(resp.body)),
+            'X-Backend-Content-Type': 'application/x-test',
             'X-Object-Sysmeta-Color': 'blue',
         })
 
@@ -295,19 +320,20 @@ class TestObjectController(unittest.TestCase):
                             environ={'REQUEST_METHOD': 'POST'},
                             headers={'X-Timestamp': post_timestamp,
                                      'X-Object-Sysmeta-Color': 'red',
-                                     'Content-Type': 'application/x-test'})
+                                     'Content-Type': 'application/x-test2'})
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 202)
         self.assertEqual(dict(resp.headers), {
             'Content-Type': 'text/html; charset=UTF-8',
             'Content-Length': str(len(resp.body)),
+            'X-Backend-Content-Type': 'application/x-test2',
             'X-Object-Sysmeta-Color': 'blue',
         })
 
         req = Request.blank('/sda1/p/a/c/o')
         resp = req.get_response(self.object_controller)
         self.assertEqual(dict(resp.headers), {
-            'Content-Type': 'application/x-test',
+            'Content-Type': 'application/x-test2',
             'Content-Length': '6',
             'Etag': etag,
             'X-Object-Sysmeta-Color': 'blue',
@@ -377,6 +403,7 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(dict(resp.headers), {
             'Content-Type': 'text/html; charset=UTF-8',
             'Content-Length': str(len(resp.body)),
+            'X-Backend-Content-Type': 'application/x-test',
             'X-Object-Sysmeta-Color': 'red',
         })
 
@@ -410,6 +437,7 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(dict(resp.headers), {
             'Content-Type': 'text/html; charset=UTF-8',
             'Content-Length': str(len(resp.body)),
+            'X-Backend-Content-Type': 'application/x-test',
             'X-Object-Sysmeta-Color': 'red',
         })
 
@@ -564,7 +592,7 @@ class TestObjectController(unittest.TestCase):
                     return self
 
                 def read(self, amt=None):
-                    return ''
+                    return b''
 
             return lambda *args, **kwargs: FakeConn(calls, response, with_exc)
 
@@ -958,7 +986,7 @@ class TestObjectController(unittest.TestCase):
                             headers=put_headers, body='test')
 
         with mock.patch('swift.obj.server.http_connect', fake_http_connect), \
-                mock.patch('swift.common.utils.HASH_PATH_PREFIX', ''), \
+                mock.patch('swift.common.utils.HASH_PATH_PREFIX', b''), \
                 fake_spawn():
             resp = req.get_response(self.object_controller)
 
@@ -982,7 +1010,7 @@ class TestObjectController(unittest.TestCase):
         if policy.policy_type == EC_POLICY:
             expected_put_headers['X-Etag'] = update_etag
         self.assertDictEqual(
-            pickle.load(open(async_pending_file_put)),
+            pickle.load(open(async_pending_file_put, 'rb')),
             {'headers': expected_put_headers,
              'account': 'a', 'container': 'c', 'obj': 'o', 'op': 'PUT'})
 
@@ -1002,7 +1030,7 @@ class TestObjectController(unittest.TestCase):
                             headers=post_headers)
 
         with mock.patch('swift.obj.server.http_connect', fake_http_connect), \
-                mock.patch('swift.common.utils.HASH_PATH_PREFIX', ''), \
+                mock.patch('swift.common.utils.HASH_PATH_PREFIX', b''), \
                 fake_spawn():
             resp = req.get_response(self.object_controller)
 
@@ -1011,7 +1039,7 @@ class TestObjectController(unittest.TestCase):
         self.maxDiff = None
         # check async pending file for PUT is still intact
         self.assertDictEqual(
-            pickle.load(open(async_pending_file_put)),
+            pickle.load(open(async_pending_file_put, 'rb')),
             {'headers': expected_put_headers,
              'account': 'a', 'container': 'c', 'obj': 'o', 'op': 'PUT'})
 
@@ -1037,7 +1065,7 @@ class TestObjectController(unittest.TestCase):
         if policy.policy_type == EC_POLICY:
             expected_post_headers['X-Etag'] = update_etag
         self.assertDictEqual(
-            pickle.load(open(async_pending_file_post)),
+            pickle.load(open(async_pending_file_post, 'rb')),
             {'headers': expected_post_headers,
              'account': 'a', 'container': 'c', 'obj': 'o', 'op': 'PUT'})
 
@@ -1062,6 +1090,7 @@ class TestObjectController(unittest.TestCase):
         # User-Agent is updated.
         expected_post_headers['User-Agent'] = 'object-updater %s' % os.getpid()
         expected_post_headers['X-Backend-Accept-Redirect'] = 'true'
+        expected_post_headers['X-Backend-Accept-Quoted-Location'] = 'true'
         self.assertDictEqual(expected_post_headers, actual_headers)
         self.assertFalse(
             os.listdir(os.path.join(
@@ -1074,7 +1103,8 @@ class TestObjectController(unittest.TestCase):
         self._test_PUT_then_POST_async_pendings(
             POLICIES[1], update_etag='override_etag')
 
-    def _check_PUT_redirected_async_pending(self, container_path=None):
+    def _check_PUT_redirected_async_pending(self, container_path=None,
+                                            old_style=False):
         # When container update is redirected verify that the redirect location
         # is persisted in the async pending file.
         policy = POLICIES[0]
@@ -1093,8 +1123,10 @@ class TestObjectController(unittest.TestCase):
             'X-Container-Device': 'cdevice'}
 
         if container_path:
-            # the proxy may include this header
-            put_headers['X-Backend-Container-Path'] = container_path
+            # the proxy may include either header
+            hdr = ('X-Backend-Container-Path' if old_style
+                   else 'X-Backend-Quoted-Container-Path')
+            put_headers[hdr] = container_path
             expected_update_path = '/cdevice/99/%s/o' % container_path
         else:
             expected_update_path = '/cdevice/99/a/c/o'
@@ -1107,12 +1139,12 @@ class TestObjectController(unittest.TestCase):
 
         req = Request.blank('/sda1/p/a/c/o',
                             environ={'REQUEST_METHOD': 'PUT'},
-                            headers=put_headers, body='test')
+                            headers=put_headers, body=b'test')
         resp_headers = {'Location': '/.sharded_a/c_shard_1/o',
                         'X-Backend-Redirect-Timestamp': next(self.ts).internal}
 
         with mocked_http_conn(301, headers=[resp_headers]) as conn, \
-                mock.patch('swift.common.utils.HASH_PATH_PREFIX', ''),\
+                mock.patch('swift.common.utils.HASH_PATH_PREFIX', b''),\
                 fake_spawn():
             resp = req.get_response(self.object_controller)
 
@@ -1145,7 +1177,7 @@ class TestObjectController(unittest.TestCase):
             {'headers': expected_put_headers,
              'account': 'a', 'container': 'c', 'obj': 'o', 'op': 'PUT',
              'container_path': '.sharded_a/c_shard_1'},
-            pickle.load(open(async_pending_file_put)))
+            pickle.load(open(async_pending_file_put, 'rb')))
 
         # when updater is run its first request will be to the redirect
         # location that is persisted in the async pending file
@@ -1156,6 +1188,8 @@ class TestObjectController(unittest.TestCase):
                     {'devices': self.testdir,
                      'mount_check': 'false'}, logger=debug_logger())
                 node = {'id': 1, 'ip': 'chost', 'port': 3200,
+                        'replication_ip': 'chost_repl',
+                        'replication_port': 6200,
                         'device': 'cdevice'}
                 mock_ring = mock.MagicMock()
                 mock_ring.get_nodes.return_value = (99, [node])
@@ -1165,12 +1199,18 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(1, len(conn.requests))
         self.assertEqual('/cdevice/99/.sharded_a/c_shard_1/o',
                          conn.requests[0]['path'])
+        self.assertEqual(6200, conn.requests[0]['port'])
+        self.assertEqual('chost_repl', conn.requests[0]['ip'])
 
     def test_PUT_redirected_async_pending(self):
         self._check_PUT_redirected_async_pending()
 
     def test_PUT_redirected_async_pending_with_container_path(self):
         self._check_PUT_redirected_async_pending(container_path='.another/c')
+
+    def test_PUT_redirected_async_pending_with_old_style_container_path(self):
+        self._check_PUT_redirected_async_pending(
+            container_path='.another/c', old_style=True)
 
     def test_POST_quarantine_zbyte(self):
         timestamp = normalize_timestamp(time())
@@ -1240,7 +1280,7 @@ class TestObjectController(unittest.TestCase):
         req.body = 'VERIFY'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 400)
-        self.assertTrue('Content-Type' in resp.body)
+        self.assertTrue(b'Content-Type' in resp.body)
 
     def test_PUT_no_content_length(self):
         req = Request.blank(
@@ -1688,25 +1728,26 @@ class TestObjectController(unittest.TestCase):
                      'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary'},
             environ={'REQUEST_METHOD': 'PUT'})
 
-        obj_etag = md5("obj data").hexdigest()
-        footer_meta = json.dumps({"Etag": obj_etag})
-        footer_meta_cksum = md5(footer_meta).hexdigest()
+        obj_etag = md5(b"obj data", usedforsecurity=False).hexdigest()
+        footer_meta = json.dumps({"Etag": obj_etag}).encode('ascii')
+        footer_meta_cksum = md5(
+            footer_meta, usedforsecurity=False).hexdigest().encode('ascii')
 
-        req.body = "\r\n".join((
-            "--boundary",
-            "",
-            "obj data",
-            "--boundary",
-            "Content-MD5: " + footer_meta_cksum,
-            "",
+        req.body = b"\r\n".join((
+            b"--boundary",
+            b"",
+            b"obj data",
+            b"--boundary",
+            b"Content-MD5: " + footer_meta_cksum,
+            b"",
             footer_meta,
-            "--boundary--",
+            b"--boundary--",
         ))
         req.headers.pop("Content-Length", None)
 
         resp = req.get_response(self.object_controller)
-        self.assertEqual(resp.etag, obj_etag)
         self.assertEqual(resp.status_int, 201)
+        self.assertEqual(resp.etag, obj_etag)
 
         objfile = os.path.join(
             self.testdir, 'sda1',
@@ -1736,21 +1777,22 @@ class TestObjectController(unittest.TestCase):
             '/sda1/p/a/c/o', headers=headers,
             environ={'REQUEST_METHOD': 'PUT'})
 
-        obj_etag = md5("obj data").hexdigest()
+        obj_etag = md5(b"obj data", usedforsecurity=False).hexdigest()
         footers = {'Etag': obj_etag}
         footers.update(override_footers)
-        footer_meta = json.dumps(footers)
-        footer_meta_cksum = md5(footer_meta).hexdigest()
+        footer_meta = json.dumps(footers).encode('ascii')
+        footer_meta_cksum = md5(
+            footer_meta, usedforsecurity=False).hexdigest().encode('ascii')
 
-        req.body = "\r\n".join((
-            "--boundary",
-            "",
-            "obj data",
-            "--boundary",
-            "Content-MD5: " + footer_meta_cksum,
-            "",
+        req.body = b"\r\n".join((
+            b"--boundary",
+            b"",
+            b"obj data",
+            b"--boundary",
+            b"Content-MD5: " + footer_meta_cksum,
+            b"",
             footer_meta,
-            "--boundary--",
+            b"--boundary--",
         ))
         req.headers.pop("Content-Length", None)
 
@@ -1826,18 +1868,20 @@ class TestObjectController(unittest.TestCase):
                      'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary'},
             environ={'REQUEST_METHOD': 'PUT'})
 
-        footer_meta = json.dumps({"Etag": md5("green").hexdigest()})
-        footer_meta_cksum = md5(footer_meta).hexdigest()
+        footers = {"Etag": md5(b"green", usedforsecurity=False).hexdigest()}
+        footer_meta = json.dumps(footers).encode('ascii')
+        footer_meta_cksum = md5(
+            footer_meta, usedforsecurity=False).hexdigest().encode('ascii')
 
-        req.body = "\r\n".join((
-            "--boundary",
-            "",
-            "blue",
-            "--boundary",
-            "Content-MD5: " + footer_meta_cksum,
-            "",
+        req.body = b"\r\n".join((
+            b"--boundary",
+            b"",
+            b"blue",
+            b"--boundary",
+            b"Content-MD5: " + footer_meta_cksum,
+            b"",
             footer_meta,
-            "--boundary--",
+            b"--boundary--",
         ))
         req.headers.pop("Content-Length", None)
 
@@ -1860,18 +1904,19 @@ class TestObjectController(unittest.TestCase):
         footer_meta = json.dumps({
             'X-Object-Meta-X': 'Y',
             'X-Object-Sysmeta-X': 'Y',
-        })
-        footer_meta_cksum = md5(footer_meta).hexdigest()
+        }).encode('ascii')
+        footer_meta_cksum = md5(
+            footer_meta, usedforsecurity=False).hexdigest().encode('ascii')
 
-        req.body = "\r\n".join((
-            "--boundary",
-            "",
-            "stuff stuff stuff",
-            "--boundary",
-            "Content-MD5: " + footer_meta_cksum,
-            "",
+        req.body = b"\r\n".join((
+            b"--boundary",
+            b"",
+            b"stuff stuff stuff",
+            b"--boundary",
+            b"Content-MD5: " + footer_meta_cksum,
+            b"",
             footer_meta,
-            "--boundary--",
+            b"--boundary--",
         ))
         req.headers.pop("Content-Length", None)
 
@@ -1898,17 +1943,19 @@ class TestObjectController(unittest.TestCase):
                      'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary'},
             environ={'REQUEST_METHOD': 'PUT'})
 
-        footer_meta = json.dumps({"Etag": md5("obj data").hexdigest()})
+        footer_meta = json.dumps({
+            "Etag": md5(b"obj data", usedforsecurity=False).hexdigest()
+        }).encode('ascii')
 
-        req.body = "\r\n".join((
-            "--boundary",
-            "",
-            "obj data",
-            "--boundary",
+        req.body = b"\r\n".join((
+            b"--boundary",
+            b"",
+            b"obj data",
+            b"--boundary",
             # no Content-MD5
-            "",
+            b"",
             footer_meta,
-            "--boundary--",
+            b"--boundary--",
         ))
         req.headers.pop("Content-Length", None)
 
@@ -1926,18 +1973,22 @@ class TestObjectController(unittest.TestCase):
                      'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary'},
             environ={'REQUEST_METHOD': 'PUT'})
 
-        footer_meta = json.dumps({"Etag": md5("obj data").hexdigest()})
-        bad_footer_meta_cksum = md5(footer_meta + "bad").hexdigest()
+        footer_meta = json.dumps({
+            "Etag": md5(b"obj data", usedforsecurity=False).hexdigest()
+        }).encode('ascii')
+        bad_footer_meta_cksum = \
+            md5(footer_meta + b"bad",
+                usedforsecurity=False).hexdigest().encode('ascii')
 
-        req.body = "\r\n".join((
-            "--boundary",
-            "",
-            "obj data",
-            "--boundary",
-            "Content-MD5: " + bad_footer_meta_cksum,
-            "",
+        req.body = b"\r\n".join((
+            b"--boundary",
+            b"",
+            b"obj data",
+            b"--boundary",
+            b"Content-MD5: " + bad_footer_meta_cksum,
+            b"",
             footer_meta,
-            "--boundary--",
+            b"--boundary--",
         ))
         req.headers.pop("Content-Length", None)
 
@@ -1955,18 +2006,19 @@ class TestObjectController(unittest.TestCase):
                      'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary'},
             environ={'REQUEST_METHOD': 'PUT'})
 
-        footer_meta = "{{{[[{{[{[[{[{[[{{{[{{{{[[{{[{["
-        footer_meta_cksum = md5(footer_meta).hexdigest()
+        footer_meta = b"{{{[[{{[{[[{[{[[{{{[{{{{[[{{[{["
+        footer_meta_cksum = md5(
+            footer_meta, usedforsecurity=False).hexdigest().encode('ascii')
 
-        req.body = "\r\n".join((
-            "--boundary",
-            "",
-            "obj data",
-            "--boundary",
-            "Content-MD5: " + footer_meta_cksum,
-            "",
+        req.body = b"\r\n".join((
+            b"--boundary",
+            b"",
+            b"obj data",
+            b"--boundary",
+            b"Content-MD5: " + footer_meta_cksum,
+            b"",
             footer_meta,
-            "--boundary--",
+            b"--boundary--",
         ))
         req.headers.pop("Content-Length", None)
 
@@ -1984,22 +2036,25 @@ class TestObjectController(unittest.TestCase):
                      'X-Backend-Obj-Multipart-Mime-Boundary': 'boundary'},
             environ={'REQUEST_METHOD': 'PUT'})
 
-        footer_meta = json.dumps({'X-Object-Meta-Mint': 'pepper'})
-        footer_meta_cksum = md5(footer_meta).hexdigest()
+        footer_meta = json.dumps({
+            'X-Object-Meta-Mint': 'pepper'
+        }).encode('ascii')
+        footer_meta_cksum = md5(
+            footer_meta, usedforsecurity=False).hexdigest().encode('ascii')
 
-        req.body = "\r\n".join((
-            "--boundary",
-            "",
-            "obj data",
-            "--boundary",
-            "Content-MD5: " + footer_meta_cksum,
-            "",
+        req.body = b"\r\n".join((
+            b"--boundary",
+            b"",
+            b"obj data",
+            b"--boundary",
+            b"Content-MD5: " + footer_meta_cksum,
+            b"",
             footer_meta,
-            "--boundary",
-            "This-Document-Is-Useless: yes",
-            "",
-            "blah blah I take up space",
-            "--boundary--"
+            b"--boundary",
+            b"This-Document-Is-Useless: yes",
+            b"",
+            b"blah blah I take up space",
+            b"--boundary--"
         ))
         req.headers.pop("Content-Length", None)
 
@@ -2038,10 +2093,7 @@ class TestObjectController(unittest.TestCase):
 
             def __exit__(self, typ, value, tb):
                 pass
-        # This is just so the test fails when run on older object server code
-        # instead of exploding.
-        if not hasattr(object_server, 'ChunkReadTimeout'):
-            object_server.ChunkReadTimeout = None
+
         with mock.patch.object(object_server, 'ChunkReadTimeout', FakeTimeout):
             timestamp = normalize_timestamp(time())
             req = Request.blank(
@@ -2527,7 +2579,7 @@ class TestObjectController(unittest.TestCase):
                     return self
 
                 def read(self, amt=None):
-                    return ''
+                    return b''
 
             return lambda *args, **kwargs: FakeConn(response, with_exc)
 
@@ -2581,14 +2633,15 @@ class TestObjectController(unittest.TestCase):
                 resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
-    def test_EC_GET_PUT_data(self):
+    def test_EC_PUT_GET_data(self):
         for policy in self.ec_policies:
-            raw_data = ('VERIFY' * policy.ec_segment_size)[:-432]
+            ts = next(self.ts)
+            raw_data = (b'VERIFY' * policy.ec_segment_size)[:-432]
             frag_archives = encode_frag_archive_bodies(policy, raw_data)
             frag_index = random.randint(0, len(frag_archives) - 1)
             # put EC frag archive
             req = Request.blank('/sda1/p/a/c/o', method='PUT', headers={
-                'X-Timestamp': next(self.ts).internal,
+                'X-Timestamp': ts.internal,
                 'Content-Type': 'application/verify',
                 'Content-Length': len(frag_archives[frag_index]),
                 'X-Object-Sysmeta-Ec-Frag-Index': frag_index,
@@ -2606,9 +2659,62 @@ class TestObjectController(unittest.TestCase):
             self.assertEqual(resp.status_int, 200)
             self.assertEqual(resp.body, frag_archives[frag_index])
 
+            # check the diskfile is durable
+            df_mgr = diskfile.ECDiskFileManager(self.conf,
+                                                self.object_controller.logger)
+            df = df_mgr.get_diskfile('sda1', 'p', 'a', 'c', 'o', policy,
+                                     frag_prefs=[])
+            with df.open():
+                self.assertEqual(ts, df.data_timestamp)
+                self.assertEqual(df.data_timestamp, df.durable_timestamp)
+
+    def test_EC_PUT_GET_data_no_commit(self):
+        for policy in self.ec_policies:
+            ts = next(self.ts)
+            raw_data = (b'VERIFY' * policy.ec_segment_size)[:-432]
+            frag_archives = encode_frag_archive_bodies(policy, raw_data)
+            frag_index = random.randint(0, len(frag_archives) - 1)
+            # put EC frag archive
+            req = Request.blank('/sda1/p/a/c/o', method='PUT', headers={
+                'X-Timestamp': ts.internal,
+                'Content-Type': 'application/verify',
+                'Content-Length': len(frag_archives[frag_index]),
+                'X-Backend-No-Commit': 'true',
+                'X-Object-Sysmeta-Ec-Frag-Index': frag_index,
+                'X-Backend-Storage-Policy-Index': int(policy),
+            })
+            req.body = frag_archives[frag_index]
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 201)
+
+            # get EC frag archive will 404 - nothing durable...
+            req = Request.blank('/sda1/p/a/c/o', headers={
+                'X-Backend-Storage-Policy-Index': int(policy),
+            })
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 404)
+
+            # ...unless we explicitly request *any* fragment...
+            req = Request.blank('/sda1/p/a/c/o', headers={
+                'X-Backend-Storage-Policy-Index': int(policy),
+                'X-Backend-Fragment-Preferences': '[]',
+            })
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(resp.body, frag_archives[frag_index])
+
+            # check the diskfile is not durable
+            df_mgr = diskfile.ECDiskFileManager(self.conf,
+                                                self.object_controller.logger)
+            df = df_mgr.get_diskfile('sda1', 'p', 'a', 'c', 'o', policy,
+                                     frag_prefs=[])
+            with df.open():
+                self.assertEqual(ts, df.data_timestamp)
+                self.assertIsNone(df.durable_timestamp)
+
     def test_EC_GET_quarantine_invalid_frag_archive(self):
         policy = random.choice(self.ec_policies)
-        raw_data = ('VERIFY' * policy.ec_segment_size)[:-432]
+        raw_data = (b'VERIFY' * policy.ec_segment_size)[:-432]
         frag_archives = encode_frag_archive_bodies(policy, raw_data)
         frag_index = random.randint(0, len(frag_archives) - 1)
         content_length = len(frag_archives[frag_index])
@@ -2620,7 +2726,7 @@ class TestObjectController(unittest.TestCase):
             'X-Object-Sysmeta-Ec-Frag-Index': frag_index,
             'X-Backend-Storage-Policy-Index': int(policy),
         })
-        corrupt = 'garbage' + frag_archives[frag_index]
+        corrupt = b'garbage' + frag_archives[frag_index]
         req.body = corrupt[:content_length]
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
@@ -2661,7 +2767,7 @@ class TestObjectController(unittest.TestCase):
             req = Request.blank(
                 '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                 headers=headers)
-            req.body = 'VERIFY'
+            req.body = b'VERIFY'
             resp = req.get_response(self.object_controller)
 
             self.assertEqual(
@@ -2718,7 +2824,7 @@ class TestObjectController(unittest.TestCase):
             req = Request.blank(
                 '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                 headers=headers)
-            req.body = 'VERIFY'
+            req.body = b'VERIFY'
             resp = req.get_response(self.object_controller)
 
             self.assertEqual(resp.status_int, 201)
@@ -2731,6 +2837,203 @@ class TestObjectController(unittest.TestCase):
                             'Expected file %r not found in %r for policy %r'
                             % (data_file, os.listdir(obj_dir), int(policy)))
             rmtree(obj_dir)
+
+    def test_PUT_next_part_power(self):
+        hash_path_ = hash_path('a', 'c', 'o')
+        part_power = 10
+        old_part = utils.get_partition_for_hash(hash_path_, part_power)
+        new_part = utils.get_partition_for_hash(hash_path_, part_power + 1)
+        policy = POLICIES.default
+        timestamp = utils.Timestamp(int(time())).internal
+        headers = {'X-Timestamp': timestamp,
+                   'Content-Length': '6',
+                   'Content-Type': 'application/octet-stream',
+                   'X-Backend-Storage-Policy-Index': int(policy),
+                   'X-Backend-Next-Part-Power': part_power + 1}
+        req = Request.blank(
+            '/sda1/%s/a/c/o' % old_part, method='PUT',
+            headers=headers, body=b'VERIFY')
+        resp = req.get_response(self.object_controller)
+
+        self.assertEqual(resp.status_int, 201)
+
+        def check_file(part):
+            data_file = os.path.join(
+                self.testdir, 'sda1',
+                storage_directory(diskfile.get_data_dir(int(policy)),
+                                  part, hash_path_), timestamp + '.data')
+            self.assertTrue(os.path.isfile(data_file))
+
+        check_file(old_part)
+        check_file(new_part)
+
+    def test_PUT_next_part_power_eexist(self):
+        hash_path_ = hash_path('a', 'c', 'o')
+        part_power = 10
+        old_part = utils.get_partition_for_hash(hash_path_, part_power)
+        new_part = utils.get_partition_for_hash(hash_path_, part_power + 1)
+        policy = POLICIES.default
+        timestamp = utils.Timestamp(int(time())).internal
+
+        # There's no substitute for the real thing ;-)
+        tpool.execute = self._orig_tpool_exc
+
+        # This is a little disingenuous, but it's easier than reproducing
+        # the actual race that could lead to this EEXIST
+        headers = {'X-Timestamp': timestamp,
+                   'Content-Length': '6',
+                   'Content-Type': 'application/octet-stream',
+                   'X-Backend-Storage-Policy-Index': int(policy),
+                   'X-Trans-Id': 'txn1'}
+        req = Request.blank(
+            '/sda1/%s/a/c/o' % new_part, method='PUT',
+            headers=headers, body=b'VERIFY')
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        # The write should succeed, but the relink will fail
+        headers = {'X-Timestamp': timestamp,
+                   'Content-Length': '6',
+                   'Content-Type': 'application/octet-stream',
+                   'X-Backend-Storage-Policy-Index': int(policy),
+                   'X-Backend-Next-Part-Power': part_power + 1,
+                   'X-Trans-Id': 'txn2'}
+        req = Request.blank(
+            '/sda1/%s/a/c/o' % old_part, method='PUT',
+            headers=headers, body=b'VERIFY')
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 201)
+
+        def check_file(part):
+            data_file = os.path.join(
+                self.testdir, 'sda1',
+                storage_directory(diskfile.get_data_dir(int(policy)),
+                                  part, hash_path_), timestamp + '.data')
+            self.assertTrue(os.path.isfile(data_file))
+
+        check_file(old_part)
+        check_file(new_part)
+
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertIn('[Errno 17] File exists', error_lines[0])
+        self.assertEqual([], error_lines[1:])
+        log_extras = self.logger.log_dict['error'][0][1]['extra']
+        self.assertEqual('txn2', log_extras.get('txn_id'))
+
+    def test_PUT_next_part_power_races_around_makedirs_eexist(self):
+        # simulate two 'concurrent' racing to create the new object dir in the
+        # new partition and check that relinking tolerates the dir already
+        # existing when they attempt to create it
+        hash_path_ = hash_path('a', 'c', 'o')
+        part_power = 10
+        old_part = utils.get_partition_for_hash(hash_path_, part_power)
+        new_part = utils.get_partition_for_hash(hash_path_, part_power + 1)
+        policy = POLICIES.default
+
+        def make_request(timestamp):
+            headers = {'X-Timestamp': timestamp.internal,
+                       'Content-Length': '6',
+                       'Content-Type': 'application/octet-stream',
+                       'X-Backend-Storage-Policy-Index': int(policy),
+                       'X-Backend-Next-Part-Power': part_power + 1}
+            req = Request.blank(
+                '/sda1/%s/a/c/o' % old_part, method='PUT',
+                headers=headers, body=b'VERIFY')
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 201)
+
+        def data_file(part, timestamp):
+            return os.path.join(
+                self.testdir, 'sda1',
+                storage_directory(diskfile.get_data_dir(int(policy)),
+                                  part, hash_path_),
+                timestamp.internal + '.data')
+
+        ts_1 = next(self.ts)
+        ts_2 = next(self.ts)
+        calls = []
+        orig_makedirs = os.makedirs
+
+        def mock_makedirs(path, *args, **kwargs):
+            # let another request catch up just as the first is about to create
+            # the next part power object dir, then pretend the first request
+            # process actually makes the dir
+            if path == os.path.dirname(data_file(new_part, ts_1)):
+                calls.append(path)
+                if len(calls) == 1:
+                    # pretend 'yield' to other request process
+                    make_request(ts_2)
+                if len(calls) == 2:
+                    # pretend 'yield' back to first request process for
+                    # its call to makedirs
+                    orig_makedirs(calls[0])
+            return orig_makedirs(path, *args, **kwargs)
+        with mock.patch('swift.obj.diskfile.os.makedirs', mock_makedirs):
+            make_request(ts_1)
+
+        self.assertEqual(
+            [os.path.dirname(data_file(new_part, ts_1)),
+             os.path.dirname(data_file(new_part, ts_1))], calls)
+        self.assertTrue(os.path.isfile(data_file(old_part, ts_2)))
+        self.assertTrue(os.path.isfile(data_file(new_part, ts_2)))
+        self.assertFalse(os.path.isfile(data_file(new_part, ts_1)))
+        self.assertFalse(os.path.isfile(data_file(old_part, ts_1)))
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual([], error_lines)
+
+    def test_PUT_next_part_power_races_around_makedirs_enoent(self):
+        hash_path_ = hash_path('a', 'c', 'o')
+        part_power = 10
+        old_part = utils.get_partition_for_hash(hash_path_, part_power)
+        new_part = utils.get_partition_for_hash(hash_path_, part_power + 1)
+        policy = POLICIES.default
+
+        def make_request(timestamp):
+            headers = {'X-Timestamp': timestamp.internal,
+                       'Content-Length': '6',
+                       'Content-Type': 'application/octet-stream',
+                       'X-Backend-Storage-Policy-Index': int(policy),
+                       'X-Backend-Next-Part-Power': part_power + 1}
+            req = Request.blank(
+                '/sda1/%s/a/c/o' % old_part, method='PUT',
+                headers=headers, body=b'VERIFY')
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 201)
+
+        def data_file(part, timestamp):
+            return os.path.join(
+                self.testdir, 'sda1',
+                storage_directory(diskfile.get_data_dir(int(policy)),
+                                  part, hash_path_),
+                timestamp.internal + '.data')
+
+        ts_1 = next(self.ts)
+        ts_2 = next(self.ts)
+        calls = []
+        orig_makedirs = os.makedirs
+
+        def mock_makedirs(path, *args, **kwargs):
+            # let another request race ahead just as the first is about to
+            # create the next part power object dir
+            if path == os.path.dirname(data_file(new_part, ts_1)):
+                calls.append(path)
+                if len(calls) == 1:
+                    # pretend 'yield' to other request process
+                    make_request(ts_2)
+            return orig_makedirs(path, *args, **kwargs)
+
+        with mock.patch('swift.obj.diskfile.os.makedirs', mock_makedirs):
+            make_request(ts_1)
+
+        self.assertEqual(
+            [os.path.dirname(data_file(new_part, ts_1)),
+             os.path.dirname(data_file(new_part, ts_1))], calls)
+        self.assertTrue(os.path.isfile(data_file(old_part, ts_2)))
+        self.assertTrue(os.path.isfile(data_file(new_part, ts_2)))
+        self.assertFalse(os.path.isfile(data_file(new_part, ts_1)))
+        self.assertFalse(os.path.isfile(data_file(old_part, ts_1)))
+        error_lines = self.logger.get_lines_for_level('error')
+        self.assertEqual([], error_lines)
 
     def test_HEAD(self):
         # Test swift.obj.server.ObjectController.HEAD
@@ -2751,7 +3054,7 @@ class TestObjectController(unittest.TestCase):
                      'Content-Type': 'application/x-test',
                      'X-Object-Meta-1': 'One',
                      'X-Object-Meta-Two': 'Two'})
-        req.body = 'VERIFY'
+        req.body = b'VERIFY'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
@@ -2789,7 +3092,7 @@ class TestObjectController(unittest.TestCase):
                                 'X-Timestamp': timestamp,
                                 'Content-Type': 'application/octet-stream',
                                 'Content-length': '6'})
-        req.body = 'VERIFY'
+        req.body = b'VERIFY'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
@@ -2814,7 +3117,7 @@ class TestObjectController(unittest.TestCase):
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                             headers={'X-Timestamp': timestamp,
                                      'Content-Type': 'application/x-test'})
-        req.body = 'VERIFY'
+        req.body = b'VERIFY'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
         disk_file = self.df_mgr.get_diskfile('sda1', 'p', 'a', 'c', 'o',
@@ -2935,14 +3238,14 @@ class TestObjectController(unittest.TestCase):
                                      'Content-Type': 'application/x-test',
                                      'X-Object-Meta-1': 'One',
                                      'X-Object-Meta-Two': 'Two'})
-        req.body = 'VERIFY'
+        req.body = b'VERIFY'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'})
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.body, 'VERIFY')
+        self.assertEqual(resp.body, b'VERIFY')
         self.assertEqual(resp.content_length, 6)
         self.assertEqual(resp.content_type, 'application/x-test')
         self.assertEqual(resp.headers['content-length'], '6')
@@ -2960,22 +3263,59 @@ class TestObjectController(unittest.TestCase):
         req.range = 'bytes=1-3'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 206)
-        self.assertEqual(resp.body, 'ERI')
+        self.assertEqual(resp.body, b'ERI')
         self.assertEqual(resp.headers['content-length'], '3')
 
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'})
         req.range = 'bytes=1-'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 206)
-        self.assertEqual(resp.body, 'ERIFY')
+        self.assertEqual(resp.body, b'ERIFY')
         self.assertEqual(resp.headers['content-length'], '5')
 
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'})
         req.range = 'bytes=-2'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 206)
-        self.assertEqual(resp.body, 'FY')
+        self.assertEqual(resp.body, b'FY')
         self.assertEqual(resp.headers['content-length'], '2')
+
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+        req.range = 'bytes=100-'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 416)
+        self.assertIn(b'Not Satisfiable', resp.body)
+
+        # Proxy (SLO in particular) can say that if some metadata's present,
+        # it wants the whole thing
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+        req.range = 'bytes=1-3'
+        req.headers['X-Backend-Ignore-Range-If-Metadata-Present'] = \
+            'X-Object-Meta-1'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.body, b'VERIFY')
+        self.assertEqual(resp.headers['content-length'], '6')
+
+        # If it's not present, Range is still respected
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+        req.range = 'bytes=1-3'
+        req.headers['X-Backend-Ignore-Range-If-Metadata-Present'] = \
+            'X-Object-Meta-5'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 206)
+        self.assertEqual(resp.body, b'ERI')
+        self.assertEqual(resp.headers['content-length'], '3')
+
+        # Works like "any", not "all"; also works where we would've 416ed
+        req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'})
+        req.range = 'bytes=100-'
+        req.headers['X-Backend-Ignore-Range-If-Metadata-Present'] = \
+            'X-Object-Meta-1, X-Object-Meta-5'
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status_int, 200)
+        self.assertEqual(resp.body, b'VERIFY')
+        self.assertEqual(resp.headers['content-length'], '6')
 
         objfile = os.path.join(
             self.testdir, 'sda1',
@@ -2994,7 +3334,7 @@ class TestObjectController(unittest.TestCase):
                                 'X-Timestamp': timestamp,
                                 'Content-Type': 'application:octet-stream',
                                 'Content-Length': '6'})
-        req.body = 'VERIFY'
+        req.body = b'VERIFY'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
@@ -3018,7 +3358,7 @@ class TestObjectController(unittest.TestCase):
                             environ={'REQUEST_METHOD': 'PUT'},
                             headers={'X-Timestamp': timestamp,
                                      'Content-Type': 'application/x-test'})
-        req.body = ''
+        req.body = b''
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
@@ -3034,7 +3374,7 @@ class TestObjectController(unittest.TestCase):
                                 'X-Timestamp': normalize_timestamp(time()),
                                 'Content-Type': 'application/octet-stream',
                                 'Content-Length': '4'})
-        req.body = 'test'
+        req.body = b'test'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
         etag = resp.etag
@@ -3105,7 +3445,7 @@ class TestObjectController(unittest.TestCase):
         }
         req = Request.blank('/sda1/p/a/c/o', method='PUT',
                             headers=headers)
-        req.body = 'test'
+        req.body = b'test'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
         real_etag = resp.etag
@@ -3188,7 +3528,7 @@ class TestObjectController(unittest.TestCase):
                                 'X-Timestamp': normalize_timestamp(time()),
                                 'Content-Type': 'application/octet-stream',
                                 'Content-Length': '4'})
-        req.body = 'test'
+        req.body = b'test'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
         etag = resp.etag
@@ -3248,7 +3588,7 @@ class TestObjectController(unittest.TestCase):
                                 'X-Object-Meta-Soup': 'gazpacho',
                                 'Content-Type': 'application/fizzbuzz',
                                 'Content-Length': '4'})
-        req.body = 'test'
+        req.body = b'test'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
         etag = resp.etag
@@ -3301,7 +3641,7 @@ class TestObjectController(unittest.TestCase):
                                 'X-Timestamp': normalize_timestamp(time()),
                                 'Content-Type': 'application/octet-stream',
                                 'Content-Length': '4'})
-        req.body = 'test'
+        req.body = b'test'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
         etag = resp.etag
@@ -3355,7 +3695,7 @@ class TestObjectController(unittest.TestCase):
                                 'X-Timestamp': timestamp,
                                 'Content-Type': 'application/octet-stream',
                                 'Content-Length': '4'})
-        req.body = 'test'
+        req.body = b'test'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
@@ -3403,7 +3743,7 @@ class TestObjectController(unittest.TestCase):
                                 'X-Timestamp': timestamp,
                                 'Content-Type': 'application/octet-stream',
                                 'Content-Length': '4'})
-        req.body = 'test'
+        req.body = b'test'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
@@ -3422,7 +3762,7 @@ class TestObjectController(unittest.TestCase):
                                 'X-Timestamp': timestamp,
                                 'Content-Type': 'application/octet-stream',
                                 'Content-Length': '4'})
-        req.body = 'test'
+        req.body = b'test'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
@@ -3475,7 +3815,7 @@ class TestObjectController(unittest.TestCase):
                                 'X-Timestamp': timestamp,
                                 'Content-Type': 'application/octet-stream',
                                 'Content-Length': '4'})
-        req.body = 'test'
+        req.body = b'test'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
@@ -3495,7 +3835,7 @@ class TestObjectController(unittest.TestCase):
                                 'X-Object-Meta-Burr': 'ito',
                                 'Content-Type': 'application/cat-picture',
                                 'Content-Length': '4'})
-        req.body = 'test'
+        req.body = b'test'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
@@ -3547,7 +3887,7 @@ class TestObjectController(unittest.TestCase):
             headers={'X-Timestamp': timestamp,
                      'Content-Type': 'application/octet-stream',
                      'Content-Length': '4'})
-        req.body = 'test'
+        req.body = b'test'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
@@ -3587,11 +3927,9 @@ class TestObjectController(unittest.TestCase):
 
     def _create_ondisk_fragments(self, policy):
         # Create some on disk files...
-        ts_iter = make_timestamp_iter()
-
         # PUT at ts_0
-        ts_0 = next(ts_iter)
-        body = 'OLDER'
+        ts_0 = next(self.ts)
+        body = b'OLDER'
         headers = {'X-Timestamp': ts_0.internal,
                    'Content-Length': '5',
                    'Content-Type': 'application/octet-stream',
@@ -3610,7 +3948,7 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(resp.status_int, 201)
 
         # POST at ts_1
-        ts_1 = next(ts_iter)
+        ts_1 = next(self.ts)
         headers = {'X-Timestamp': ts_1.internal,
                    'X-Backend-Storage-Policy-Index': int(policy)}
         headers['X-Object-Meta-Test'] = 'abc'
@@ -3621,8 +3959,8 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(resp.status_int, 202)
 
         # PUT again at ts_2 but without making the data file durable
-        ts_2 = next(ts_iter)
-        body = 'NEWER'
+        ts_2 = next(self.ts)
+        body = b'NEWER'
         headers = {'X-Timestamp': ts_2.internal,
                    'Content-Length': '5',
                    'Content-Type': 'application/octet-stream',
@@ -3681,10 +4019,10 @@ class TestObjectController(unittest.TestCase):
 
             if policy.policy_type == EC_POLICY:
                 _assert_frag_0_at_ts_0(resp)
-                self.assertECBodyEqual(resp, 'OLDER')
+                self.assertECBodyEqual(resp, b'OLDER')
             else:
                 _assert_repl_data_at_ts_2()
-                self.assertEqual(resp.body, 'NEWER')
+                self.assertEqual(resp.body, b'NEWER')
 
             req = Request.blank('/sda1/p/a/c/o', headers=headers,
                                 environ={'REQUEST_METHOD': 'HEAD'})
@@ -3706,10 +4044,10 @@ class TestObjectController(unittest.TestCase):
 
             if policy.policy_type == EC_POLICY:
                 _assert_frag_0_at_ts_0(resp)
-                self.assertECBodyEqual(resp, 'OLDER')
+                self.assertECBodyEqual(resp, b'OLDER')
             else:
                 _assert_repl_data_at_ts_2()
-                self.assertEqual(resp.body, 'NEWER')
+                self.assertEqual(resp.body, b'NEWER')
 
             req = Request.blank('/sda1/p/a/c/o', headers=headers,
                                 environ={'REQUEST_METHOD': 'HEAD'})
@@ -3745,10 +4083,10 @@ class TestObjectController(unittest.TestCase):
 
             if policy.policy_type == EC_POLICY:
                 _assert_frag_2_at_ts_2(resp)
-                self.assertECBodyEqual(resp, 'NEWER')
+                self.assertECBodyEqual(resp, b'NEWER')
             else:
                 _assert_repl_data_at_ts_2()
-                self.assertEqual(resp.body, 'NEWER')
+                self.assertEqual(resp.body, b'NEWER')
 
             req = Request.blank('/sda1/p/a/c/o', headers=headers,
                                 environ={'REQUEST_METHOD': 'HEAD'})
@@ -3770,10 +4108,10 @@ class TestObjectController(unittest.TestCase):
             resp = req.get_response(self.object_controller)
             if policy.policy_type == EC_POLICY:
                 _assert_frag_2_at_ts_2(resp)
-                self.assertECBodyEqual(resp, 'NEWER')
+                self.assertECBodyEqual(resp, b'NEWER')
             else:
                 _assert_repl_data_at_ts_2()
-                self.assertEqual(resp.body, 'NEWER')
+                self.assertEqual(resp.body, b'NEWER')
 
             req = Request.blank('/sda1/p/a/c/o', headers=headers,
                                 environ={'REQUEST_METHOD': 'HEAD'})
@@ -3797,7 +4135,7 @@ class TestObjectController(unittest.TestCase):
                 self.assertEqual(resp.status_int, 404)
             else:
                 _assert_repl_data_at_ts_2()
-                self.assertEqual(resp.body, 'NEWER')
+                self.assertEqual(resp.body, b'NEWER')
 
             req = Request.blank('/sda1/p/a/c/o', headers=headers,
                                 environ={'REQUEST_METHOD': 'HEAD'})
@@ -3817,10 +4155,10 @@ class TestObjectController(unittest.TestCase):
             resp = req.get_response(self.object_controller)
             if policy.policy_type == EC_POLICY:
                 _assert_frag_2_at_ts_2(resp)
-                self.assertECBodyEqual(resp, 'NEWER')
+                self.assertECBodyEqual(resp, b'NEWER')
             else:
                 _assert_repl_data_at_ts_2()
-                self.assertEqual(resp.body, 'NEWER')
+                self.assertEqual(resp.body, b'NEWER')
 
             req = Request.blank('/sda1/p/a/c/o', headers=headers,
                                 environ={'REQUEST_METHOD': 'HEAD'})
@@ -3837,15 +4175,15 @@ class TestObjectController(unittest.TestCase):
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                             headers={'X-Timestamp': timestamp,
                                      'Content-Type': 'application/x-test'})
-        req.body = 'VERIFY'
+        req.body = b'VERIFY'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
         disk_file = self.df_mgr.get_diskfile('sda1', 'p', 'a', 'c', 'o',
                                              policy=POLICIES.legacy)
         disk_file.open()
         file_name = os.path.basename(disk_file._data_file)
-        etag = md5()
-        etag.update('VERIF')
+        etag = md5(usedforsecurity=False)
+        etag.update(b'VERIF')
         etag = etag.hexdigest()
         metadata = {'X-Timestamp': timestamp, 'name': '/a/c/o',
                     'Content-Length': 6, 'ETag': etag}
@@ -3858,7 +4196,7 @@ class TestObjectController(unittest.TestCase):
             os.path.basename(os.path.dirname(disk_file._data_file)))
         self.assertEqual(os.listdir(disk_file._datadir)[0], file_name)
         body = resp.body  # actually does quarantining
-        self.assertEqual(body, 'VERIFY')
+        self.assertEqual(body, b'VERIFY')
         self.assertEqual(os.listdir(quar_dir)[0], file_name)
         req = Request.blank('/sda1/p/a/c/o')
         resp = req.get_response(self.object_controller)
@@ -3899,15 +4237,15 @@ class TestObjectController(unittest.TestCase):
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
                             headers={'X-Timestamp': timestamp,
                                      'Content-Type': 'application/x-test'})
-        req.body = 'VERIFY'
+        req.body = b'VERIFY'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
         disk_file = self.df_mgr.get_diskfile('sda1', 'p', 'a', 'c', 'o',
                                              policy=POLICIES.legacy)
         disk_file.open(timestamp)
         file_name = os.path.basename(disk_file._data_file)
-        etag = md5()
-        etag.update('VERIF')
+        etag = md5(usedforsecurity=False)
+        etag.update(b'VERIF')
         etag = etag.hexdigest()
         metadata = {'X-Timestamp': timestamp, 'name': '/a/c/o',
                     'Content-Length': 6, 'ETag': etag}
@@ -4216,7 +4554,7 @@ class TestObjectController(unittest.TestCase):
             container_updates.append((ip, port, method, path, headers))
         # create a new object
         create_timestamp = next(self.ts).internal
-        req = Request.blank('/sda1/p/a/c/o', method='PUT', body='test1',
+        req = Request.blank('/sda1/p/a/c/o', method='PUT', body=b'test1',
                             headers={'X-Timestamp': create_timestamp,
                                      'X-Container-Host': '10.0.0.1:8080',
                                      'X-Container-Device': 'sda1',
@@ -4225,7 +4563,8 @@ class TestObjectController(unittest.TestCase):
         with mocked_http_conn(200, give_connect=capture_updates) as fake_conn:
             with fake_spawn():
                 resp = req.get_response(self.object_controller)
-        self.assertRaises(StopIteration, fake_conn.code_iter.next)
+        with self.assertRaises(StopIteration):
+            next(fake_conn.code_iter)
         self.assertEqual(resp.status_int, 201)
         self.assertEqual(1, len(container_updates))
         for update in container_updates:
@@ -4235,8 +4574,8 @@ class TestObjectController(unittest.TestCase):
             self.assertEqual(method, 'PUT')
             self.assertEqual(path, '/sda1/p/a/c/o')
             expected = {
-                'X-Size': len('test1'),
-                'X-Etag': md5('test1').hexdigest(),
+                'X-Size': len(b'test1'),
+                'X-Etag': md5(b'test1', usedforsecurity=False).hexdigest(),
                 'X-Content-Type': 'text/plain',
                 'X-Timestamp': create_timestamp,
             }
@@ -4251,11 +4590,11 @@ class TestObjectController(unittest.TestCase):
                          utils.Timestamp(create_timestamp).normal)
         self.assertEqual(resp.headers['X-Backend-Timestamp'],
                          create_timestamp)
-        self.assertEqual(resp.body, 'test1')
+        self.assertEqual(resp.body, b'test1')
         # send an update with an offset
         offset_timestamp = utils.Timestamp(
             create_timestamp, offset=1).internal
-        req = Request.blank('/sda1/p/a/c/o', method='PUT', body='test2',
+        req = Request.blank('/sda1/p/a/c/o', method='PUT', body=b'test2',
                             headers={'X-Timestamp': offset_timestamp,
                                      'X-Container-Host': '10.0.0.1:8080',
                                      'X-Container-Device': 'sda1',
@@ -4264,7 +4603,8 @@ class TestObjectController(unittest.TestCase):
         with mocked_http_conn(200, give_connect=capture_updates) as fake_conn:
             with fake_spawn():
                 resp = req.get_response(self.object_controller)
-        self.assertRaises(StopIteration, fake_conn.code_iter.next)
+        with self.assertRaises(StopIteration):
+            next(fake_conn.code_iter)
         self.assertEqual(resp.status_int, 201)
         self.assertEqual(1, len(container_updates))
         for update in container_updates:
@@ -4274,8 +4614,8 @@ class TestObjectController(unittest.TestCase):
             self.assertEqual(method, 'PUT')
             self.assertEqual(path, '/sda1/p/a/c/o')
             expected = {
-                'X-Size': len('test2'),
-                'X-Etag': md5('test2').hexdigest(),
+                'X-Size': len(b'test2'),
+                'X-Etag': md5(b'test2', usedforsecurity=False).hexdigest(),
                 'X-Content-Type': 'text/html',
                 'X-Timestamp': offset_timestamp,
             }
@@ -4290,10 +4630,10 @@ class TestObjectController(unittest.TestCase):
                          utils.Timestamp(offset_timestamp).normal)
         self.assertEqual(resp.headers['X-Backend-Timestamp'],
                          offset_timestamp)
-        self.assertEqual(resp.body, 'test2')
+        self.assertEqual(resp.body, b'test2')
         # now overwrite with a newer time
         overwrite_timestamp = next(self.ts).internal
-        req = Request.blank('/sda1/p/a/c/o', method='PUT', body='test3',
+        req = Request.blank('/sda1/p/a/c/o', method='PUT', body=b'test3',
                             headers={'X-Timestamp': overwrite_timestamp,
                                      'X-Container-Host': '10.0.0.1:8080',
                                      'X-Container-Device': 'sda1',
@@ -4302,7 +4642,8 @@ class TestObjectController(unittest.TestCase):
         with mocked_http_conn(200, give_connect=capture_updates) as fake_conn:
             with fake_spawn():
                 resp = req.get_response(self.object_controller)
-        self.assertRaises(StopIteration, fake_conn.code_iter.next)
+        with self.assertRaises(StopIteration):
+            next(fake_conn.code_iter)
         self.assertEqual(resp.status_int, 201)
         self.assertEqual(1, len(container_updates))
         for update in container_updates:
@@ -4312,8 +4653,8 @@ class TestObjectController(unittest.TestCase):
             self.assertEqual(method, 'PUT')
             self.assertEqual(path, '/sda1/p/a/c/o')
             expected = {
-                'X-Size': len('test3'),
-                'X-Etag': md5('test3').hexdigest(),
+                'X-Size': len(b'test3'),
+                'X-Etag': md5(b'test3', usedforsecurity=False).hexdigest(),
                 'X-Content-Type': 'text/enriched',
                 'X-Timestamp': overwrite_timestamp,
             }
@@ -4328,7 +4669,7 @@ class TestObjectController(unittest.TestCase):
                          utils.Timestamp(overwrite_timestamp).normal)
         self.assertEqual(resp.headers['X-Backend-Timestamp'],
                          overwrite_timestamp)
-        self.assertEqual(resp.body, 'test3')
+        self.assertEqual(resp.body, b'test3')
         # delete with an offset
         offset_delete = utils.Timestamp(overwrite_timestamp,
                                         offset=1).internal
@@ -4340,7 +4681,8 @@ class TestObjectController(unittest.TestCase):
         with mocked_http_conn(200, give_connect=capture_updates) as fake_conn:
             with fake_spawn():
                 resp = req.get_response(self.object_controller)
-        self.assertRaises(StopIteration, fake_conn.code_iter.next)
+        with self.assertRaises(StopIteration):
+            next(fake_conn.code_iter)
         self.assertEqual(resp.status_int, 204)
         self.assertEqual(1, len(container_updates))
         for update in container_updates:
@@ -4371,7 +4713,8 @@ class TestObjectController(unittest.TestCase):
         with mocked_http_conn(200, give_connect=capture_updates) as fake_conn:
             with fake_spawn():
                 resp = req.get_response(self.object_controller)
-        self.assertRaises(StopIteration, fake_conn.code_iter.next)
+        with self.assertRaises(StopIteration):
+            next(fake_conn.code_iter)
         self.assertEqual(resp.status_int, 404)
         self.assertEqual(1, len(container_updates))
         for update in container_updates:
@@ -4401,7 +4744,7 @@ class TestObjectController(unittest.TestCase):
 
         def start_response(*args):
             """Sends args to outbuf"""
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
         self.object_controller.__call__({'REQUEST_METHOD': 'PUT',
                                          'SCRIPT_NAME': '',
@@ -4428,7 +4771,7 @@ class TestObjectController(unittest.TestCase):
 
         def start_response(*args):
             """Sends args to outbuf"""
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
         self.object_controller.__call__({'REQUEST_METHOD': 'GET',
                                          'SCRIPT_NAME': '',
@@ -4455,7 +4798,7 @@ class TestObjectController(unittest.TestCase):
 
         def start_response(*args):
             """Sends args to outbuf"""
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
         self.object_controller.__call__({'REQUEST_METHOD': 'INVALID',
                                          'SCRIPT_NAME': '',
@@ -4480,7 +4823,7 @@ class TestObjectController(unittest.TestCase):
             return False
 
         def my_hash_path(*args):
-            return md5('collide').hexdigest()
+            return md5(b'collide', usedforsecurity=False).hexdigest()
 
         with mock.patch("swift.obj.diskfile.hash_path", my_hash_path):
             with mock.patch("swift.obj.server.check_object_creation",
@@ -4491,7 +4834,7 @@ class TestObjectController(unittest.TestCase):
 
                 def start_response(*args):
                     """Sends args to outbuf"""
-                    outbuf.writelines(args)
+                    outbuf.write(args[0])
 
                 self.object_controller.__call__({
                     'REQUEST_METHOD': 'PUT',
@@ -4520,7 +4863,7 @@ class TestObjectController(unittest.TestCase):
 
                 def start_response(*args):
                     """Sends args to outbuf"""
-                    outbuf.writelines(args)
+                    outbuf.write(args[0])
 
                 self.object_controller.__call__({
                     'REQUEST_METHOD': 'PUT',
@@ -4548,7 +4891,7 @@ class TestObjectController(unittest.TestCase):
         outbuf = StringIO()
 
         def start_response(*args):
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
         self.object_controller.__call__({
             'REQUEST_METHOD': 'method_doesnt_exist',
@@ -4562,7 +4905,7 @@ class TestObjectController(unittest.TestCase):
         outbuf = StringIO()
 
         def start_response(*args):
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
         self.object_controller.__call__({'REQUEST_METHOD': '__init__',
                                          'PATH_INFO': '/sda1/p/a/c/o'},
@@ -4576,27 +4919,28 @@ class TestObjectController(unittest.TestCase):
         killer = spawn(wsgi.server, listener, self.object_controller,
                        NullLogger())
         sock = connect_tcp(('localhost', port))
-        fd = sock.makefile()
-        fd.write('PUT /sda1/p/a/c/o HTTP/1.1\r\nHost: localhost\r\n'
-                 'Content-Type: text/plain\r\n'
-                 'Connection: close\r\nX-Timestamp: %s\r\n'
-                 'Transfer-Encoding: chunked\r\n\r\n'
-                 '2\r\noh\r\n4\r\n hai\r\n0\r\n\r\n' % normalize_timestamp(
-                     1.0))
+        fd = sock.makefile('rwb')
+        s = 'PUT /sda1/p/a/c/o HTTP/1.1\r\nHost: localhost\r\n' \
+            'Content-Type: text/plain\r\n' \
+            'Connection: close\r\nX-Timestamp: %s\r\n' \
+            'Transfer-Encoding: chunked\r\n\r\n' \
+            '2\r\noh\r\n4\r\n hai\r\n0\r\n\r\n'
+        s = s % normalize_timestamp(1.0)
+        fd.write(s.encode('ascii'))
         fd.flush()
         headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
+        exp = b'HTTP/1.1 201'
         self.assertEqual(headers[:len(exp)], exp)
         sock = connect_tcp(('localhost', port))
-        fd = sock.makefile()
-        fd.write('GET /sda1/p/a/c/o HTTP/1.1\r\nHost: localhost\r\n'
-                 'Connection: close\r\n\r\n')
+        fd = sock.makefile('rwb')
+        fd.write(b'GET /sda1/p/a/c/o HTTP/1.1\r\nHost: localhost\r\n'
+                 b'Connection: close\r\n\r\n')
         fd.flush()
         headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 200'
+        exp = b'HTTP/1.1 200'
         self.assertEqual(headers[:len(exp)], exp)
         response = fd.read()
-        self.assertEqual(response, 'oh hai')
+        self.assertEqual(response, b'oh hai')
         killer.kill()
 
     def test_chunked_content_length_mismatch_zero(self):
@@ -4605,30 +4949,32 @@ class TestObjectController(unittest.TestCase):
         killer = spawn(wsgi.server, listener, self.object_controller,
                        NullLogger())
         sock = connect_tcp(('localhost', port))
-        fd = sock.makefile()
-        fd.write('PUT /sda1/p/a/c/o HTTP/1.1\r\nHost: localhost\r\n'
-                 'Content-Type: text/plain\r\n'
-                 'Connection: close\r\nX-Timestamp: %s\r\n'
-                 'Content-Length: 0\r\n'
-                 'Transfer-Encoding: chunked\r\n\r\n'
-                 '2\r\noh\r\n4\r\n hai\r\n0\r\n\r\n' % normalize_timestamp(
-                     1.0))
+        fd = sock.makefile('rwb')
+        s = 'PUT /sda1/p/a/c/o HTTP/1.1\r\nHost: localhost\r\n' \
+            'Content-Type: text/plain\r\n' \
+            'Connection: close\r\nX-Timestamp: %s\r\n' \
+            'Content-Length: 0\r\n' \
+            'Transfer-Encoding: chunked\r\n\r\n' \
+            '2\r\noh\r\n4\r\n hai\r\n0\r\n\r\n'
+        s = s % normalize_timestamp(1.0)
+        fd.write(s.encode('ascii'))
         fd.flush()
         headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 201'
+        exp = b'HTTP/1.1 201'
         self.assertEqual(headers[:len(exp)], exp)
         sock = connect_tcp(('localhost', port))
-        fd = sock.makefile()
-        fd.write('GET /sda1/p/a/c/o HTTP/1.1\r\n'
-                 'Host: localhost\r\n'
-                 'X-Timestamp: %s\r\n'
-                 'Connection: close\r\n\r\n' % normalize_timestamp(2.0))
+        fd = sock.makefile('rwb')
+        s = 'GET /sda1/p/a/c/o HTTP/1.1\r\n' \
+            'Host: localhost\r\n' \
+            'X-Timestamp: %s\r\n' \
+            'Connection: close\r\n\r\n' % normalize_timestamp(2.0)
+        fd.write(s.encode('ascii'))
         fd.flush()
         headers = readuntil2crlfs(fd)
-        exp = 'HTTP/1.1 200'
+        exp = b'HTTP/1.1 200'
         self.assertEqual(headers[:len(exp)], exp)
         response = fd.read()
-        self.assertEqual(response, 'oh hai')
+        self.assertEqual(response, b'oh hai')
         killer.kill()
 
     def test_max_object_name_length(self):
@@ -4664,8 +5010,8 @@ class TestObjectController(unittest.TestCase):
                 if self.sent < 4:
                     sleep(0.1)
                     self.sent += 1
-                    return ' '
-                return ''
+                    return b' '
+                return b''
 
             def set_hundred_continue_response_headers(*a, **kw):
                 pass
@@ -4696,8 +5042,8 @@ class TestObjectController(unittest.TestCase):
             def read(self, size=-1):
                 if not self.sent:
                     self.sent = True
-                    return '   '
-                return ''
+                    return b'   '
+                return b''
 
             def set_hundred_continue_response_headers(*a, **kw):
                 pass
@@ -4715,7 +5061,7 @@ class TestObjectController(unittest.TestCase):
             '/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'PUT'},
             headers={'X-Timestamp': normalize_timestamp(time()),
                      'Content-Length': '4', 'Content-Type': 'text/plain'},
-            body='    ')
+            body=b'    ')
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
         req = Request.blank(
@@ -4745,7 +5091,7 @@ class TestObjectController(unittest.TestCase):
             headers={'X-Timestamp': normalize_timestamp(time()),
                      'Content-Length': '4', 'Content-Type': 'text/plain',
                      'Content-Encoding': 'gzip'},
-            body='    ')
+            body=b'    ')
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
         req = Request.blank('/sda1/p/a/c/o', environ={'REQUEST_METHOD': 'GET'})
@@ -4810,7 +5156,7 @@ class TestObjectController(unittest.TestCase):
                     return self
 
                 def read(self):
-                    return ''
+                    return b''
 
             captured_args = {'ipaddr': ipaddr, 'port': port,
                              'device': device, 'partition': partition,
@@ -4928,7 +5274,7 @@ class TestObjectController(unittest.TestCase):
                     return self
 
                 def read(self):
-                    return ''
+                    return b''
 
             captured_args = {'ipaddr': ipaddr, 'port': port,
                              'device': device, 'partition': partition,
@@ -5012,7 +5358,7 @@ class TestObjectController(unittest.TestCase):
         delete_at_timestamp = utils.normalize_delete_at_timestamp(
             next(self.ts).normal)
         delete_at_container = (
-            int(delete_at_timestamp) /
+            int(delete_at_timestamp) //
             self.object_controller.expiring_objects_container_divisor *
             self.object_controller.expiring_objects_container_divisor)
         headers = {
@@ -5030,13 +5376,14 @@ class TestObjectController(unittest.TestCase):
         if policy.policy_type == EC_POLICY:
             headers['X-Object-Sysmeta-Ec-Frag-Index'] = '2'
         req = Request.blank(
-            '/sda1/p/a/c/o', method='PUT', body='', headers=headers)
+            '/sda1/p/a/c/o', method='PUT', body=b'', headers=headers)
         with mocked_http_conn(
                 500, 500, give_connect=capture_updates) as fake_conn:
             with fake_spawn():
                 resp = req.get_response(self.object_controller)
             self.assertEqual(201, resp.status_int, resp.body)
-        self.assertRaises(StopIteration, fake_conn.code_iter.next)
+        with self.assertRaises(StopIteration):
+            next(fake_conn.code_iter)
         self.assertEqual(resp.status_int, 201)
         self.assertEqual(2, len(container_updates))
         delete_at_update, container_update = container_updates
@@ -5074,7 +5421,7 @@ class TestObjectController(unittest.TestCase):
             for f in files:
                 async_file = os.path.join(root, f)
                 found_files.append(async_file)
-                data = pickle.load(open(async_file))
+                data = pickle.load(open(async_file, 'rb'))
                 if data['account'] == 'a':
                     self.assertEqual(
                         int(data['headers']
@@ -5091,7 +5438,7 @@ class TestObjectController(unittest.TestCase):
         policy = random.choice(list(POLICIES))
         self._stage_tmp_dir(policy)
         _prefix = utils.HASH_PATH_PREFIX
-        utils.HASH_PATH_PREFIX = ''
+        utils.HASH_PATH_PREFIX = b''
 
         def fake_http_connect(*args):
             raise Exception('test')
@@ -5112,7 +5459,7 @@ class TestObjectController(unittest.TestCase):
             pickle.load(open(os.path.join(
                 self.testdir, 'sda1', async_dir, 'a83',
                 '06fbf0b514e5199dfc4e00f42eb5ea83-%s' %
-                utils.Timestamp(1).internal))),
+                utils.Timestamp(1).internal), 'rb')),
             {'headers': {'x-timestamp': '1', 'x-out': 'set',
                          'user-agent': 'object-server %s' % os.getpid(),
                          'X-Backend-Storage-Policy-Index': int(policy)},
@@ -5122,7 +5469,7 @@ class TestObjectController(unittest.TestCase):
         policy = random.choice(list(POLICIES))
         self._stage_tmp_dir(policy)
         _prefix = utils.HASH_PATH_PREFIX
-        utils.HASH_PATH_PREFIX = ''
+        utils.HASH_PATH_PREFIX = b''
 
         def fake_http_connect(status):
 
@@ -5135,7 +5482,7 @@ class TestObjectController(unittest.TestCase):
                     return self
 
                 def read(self):
-                    return ''
+                    return b''
 
             return lambda *args: FakeConn(status)
 
@@ -5153,7 +5500,7 @@ class TestObjectController(unittest.TestCase):
                     pickle.load(open(os.path.join(
                         self.testdir, 'sda1', async_dir, 'a83',
                         '06fbf0b514e5199dfc4e00f42eb5ea83-%s' %
-                        utils.Timestamp(1).internal))),
+                        utils.Timestamp(1).internal), 'rb')),
                     {'headers': {'x-timestamp': '1', 'x-out': str(status),
                                  'user-agent':
                                  'object-server %s' % os.getpid(),
@@ -5167,7 +5514,7 @@ class TestObjectController(unittest.TestCase):
 
     def test_async_update_does_not_save_on_2xx(self):
         _prefix = utils.HASH_PATH_PREFIX
-        utils.HASH_PATH_PREFIX = ''
+        utils.HASH_PATH_PREFIX = b''
 
         def fake_http_connect(status):
 
@@ -5180,7 +5527,7 @@ class TestObjectController(unittest.TestCase):
                     return self
 
                 def read(self):
-                    return ''
+                    return b''
 
             return lambda *args: FakeConn(status)
 
@@ -5203,7 +5550,7 @@ class TestObjectController(unittest.TestCase):
         policy = random.choice(list(POLICIES))
         self._stage_tmp_dir(policy)
         _prefix = utils.HASH_PATH_PREFIX
-        utils.HASH_PATH_PREFIX = ''
+        utils.HASH_PATH_PREFIX = b''
 
         def fake_http_connect():
 
@@ -5272,7 +5619,8 @@ class TestObjectController(unittest.TestCase):
         with mocked_http_conn(200, give_connect=capture_updates) as fake_conn:
             with fake_spawn():
                 resp = req.get_response(self.object_controller)
-        self.assertRaises(StopIteration, fake_conn.code_iter.next)
+        with self.assertRaises(StopIteration):
+            next(fake_conn.code_iter)
         self.assertEqual(resp.status_int, 201)
         self.assertEqual(len(container_updates), 1)
         ip, port, method, path, headers = container_updates[0]
@@ -5315,7 +5663,8 @@ class TestObjectController(unittest.TestCase):
                     200, give_connect=capture_updates) as fake_conn:
                 with fake_spawn():
                     resp = req.get_response(self.object_controller)
-            self.assertRaises(StopIteration, fake_conn.code_iter.next)
+            with self.assertRaises(StopIteration):
+                next(fake_conn.code_iter)
             self.assertEqual(resp.status_int, 201)
             self.assertEqual(len(container_updates), 1)
             ip, port, method, path, headers = container_updates[0]
@@ -5359,7 +5708,7 @@ class TestObjectController(unittest.TestCase):
             'X-Backend-Container-Update-Override-Content-Type': 'ignored',
             'X-Backend-Container-Update-Override-Foo': 'ignored'})
 
-    def test_PUT_container_update_to_shard(self):
+    def test_PUT_container_update_to_old_style_shard(self):
         # verify that alternate container update path is respected when
         # included in request headers
         def do_test(container_path, expected_path, expected_container_path):
@@ -5398,7 +5747,98 @@ class TestObjectController(unittest.TestCase):
                     500, give_connect=capture_updates) as fake_conn:
                 with fake_spawn():
                     resp = req.get_response(self.object_controller)
-            self.assertRaises(StopIteration, fake_conn.code_iter.next)
+            with self.assertRaises(StopIteration):
+                next(fake_conn.code_iter)
+            self.assertEqual(resp.status_int, 201)
+            self.assertEqual(len(container_updates), 1)
+            # verify expected path used in update request
+            ip, port, method, path, headers = container_updates[0]
+            self.assertEqual(ip, 'chost')
+            self.assertEqual(port, 'cport')
+            self.assertEqual(method, 'PUT')
+            self.assertEqual(path, '/cdevice/cpartition/%s/o' % expected_path)
+
+            # verify that the picked update *always* has root container
+            self.assertEqual(1, len(pickle_async_update_args))
+            (objdevice, account, container, obj, data, timestamp,
+             policy) = pickle_async_update_args[0]
+            self.assertEqual(objdevice, 'sda1')
+            self.assertEqual(account, 'a')  # NB user account
+            self.assertEqual(container, 'c')  # NB root container
+            self.assertEqual(obj, 'o')
+            self.assertEqual(timestamp, ts_put.internal)
+            self.assertEqual(policy, policy)
+            expected_data = {
+                'headers': HeaderKeyDict({
+                    'X-Size': '0',
+                    'User-Agent': 'object-server %s' % os.getpid(),
+                    'X-Content-Type': 'text/plain',
+                    'X-Timestamp': ts_put.internal,
+                    'X-Trans-Id': '123',
+                    'Referer': 'PUT http://localhost/sda1/0/a/c/o',
+                    'X-Backend-Storage-Policy-Index': int(policy),
+                    'X-Etag': 'd41d8cd98f00b204e9800998ecf8427e'}),
+                'obj': 'o',
+                'account': 'a',
+                'container': 'c',
+                'op': 'PUT'}
+            if expected_container_path:
+                expected_data['container_path'] = expected_container_path
+            self.assertEqual(expected_data, data)
+
+        do_test('a_shard/c_shard', 'a_shard/c_shard', 'a_shard/c_shard')
+        do_test('', 'a/c', None)
+        do_test(None, 'a/c', None)
+        # TODO: should these cases trigger a 400 response rather than
+        # defaulting to root path?
+        do_test('garbage', 'a/c', None)
+        do_test('/', 'a/c', None)
+        do_test('/no-acct', 'a/c', None)
+        do_test('no-cont/', 'a/c', None)
+        do_test('too/many/parts', 'a/c', None)
+        do_test('/leading/slash', 'a/c', None)
+
+    def test_PUT_container_update_to_shard(self):
+        # verify that alternate container update path is respected when
+        # included in request headers
+        def do_test(container_path, expected_path, expected_container_path):
+            policy = random.choice(list(POLICIES))
+            container_updates = []
+
+            def capture_updates(
+                    ip, port, method, path, headers, *args, **kwargs):
+                container_updates.append((ip, port, method, path, headers))
+
+            pickle_async_update_args = []
+
+            def fake_pickle_async_update(*args):
+                pickle_async_update_args.append(args)
+
+            diskfile_mgr = self.object_controller._diskfile_router[policy]
+            diskfile_mgr.pickle_async_update = fake_pickle_async_update
+
+            ts_put = next(self.ts)
+            headers = {
+                'X-Timestamp': ts_put.internal,
+                'X-Trans-Id': '123',
+                'X-Container-Host': 'chost:cport',
+                'X-Container-Partition': 'cpartition',
+                'X-Container-Device': 'cdevice',
+                'Content-Type': 'text/plain',
+                'X-Object-Sysmeta-Ec-Frag-Index': 0,
+                'X-Backend-Storage-Policy-Index': int(policy),
+            }
+            if container_path is not None:
+                headers['X-Backend-Quoted-Container-Path'] = container_path
+
+            req = Request.blank('/sda1/0/a/c/o', method='PUT',
+                                headers=headers, body='')
+            with mocked_http_conn(
+                    500, give_connect=capture_updates) as fake_conn:
+                with fake_spawn():
+                    resp = req.get_response(self.object_controller)
+            with self.assertRaises(StopIteration):
+                next(fake_conn.code_iter)
             self.assertEqual(resp.status_int, 201)
             self.assertEqual(len(container_updates), 1)
             # verify expected path used in update request
@@ -5471,7 +5911,8 @@ class TestObjectController(unittest.TestCase):
             resp = req.get_response(self.object_controller)
         # fake_spawn() above waits on greenthreads to finish;
         # don't start making assertions until then
-        self.assertRaises(StopIteration, fake_conn.code_iter.next)
+        with self.assertRaises(StopIteration):
+            next(fake_conn.code_iter)
         self.assertEqual(resp.status_int, 201)
         self.assertEqual(len(given_args), 7)
         (objdevice, account, container, obj, data, timestamp,
@@ -5550,11 +5991,9 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(called_async_update_args, [expected])
 
     def test_container_update_as_greenthread_with_timeout(self):
-        '''
-        give it one container to update (for only one greenthred)
-        fake the greenthred so it will raise a timeout
-        test that the right message is logged and the method returns None
-        '''
+        # give it one container to update (for only one greenthred)
+        # fake the greenthred so it will raise a timeout
+        # test that the right message is logged and the method returns None
         called_async_update_args = []
 
         def local_fake_spawn(func, *a, **kw):
@@ -6103,8 +6542,8 @@ class TestObjectController(unittest.TestCase):
 
         # ...unless X-Backend-Replication is sent
         expected = {
-            'GET': 'TEST',
-            'HEAD': '',
+            'GET': b'TEST',
+            'HEAD': b'',
         }
         for meth, expected_body in expected.items():
             req = Request.blank(
@@ -6131,7 +6570,7 @@ class TestObjectController(unittest.TestCase):
                      'X-Delete-At-Container': delete_at_container,
                      'Content-Length': '4',
                      'Content-Type': 'application/octet-stream'})
-        req.body = 'TEST'
+        req.body = b'TEST'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 201)
 
@@ -6354,7 +6793,7 @@ class TestObjectController(unittest.TestCase):
             headers={'X-Timestamp': test_timestamp})
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 200)
-        self.assertEqual(resp.body, 'TEST')
+        self.assertEqual(resp.body, b'TEST')
         objfile = os.path.join(
             self.testdir, 'sda1',
             storage_directory(diskfile.get_data_dir(POLICIES[0]), 'p',
@@ -6658,7 +7097,7 @@ class TestObjectController(unittest.TestCase):
 
         async_pending_ops = []
         for pending_file in async_pendings:
-            with open(pending_file) as fh:
+            with open(pending_file, 'rb') as fh:
                 async_pending = pickle.load(fh)
                 async_pending_ops.append(async_pending['op'])
         self.assertEqual(async_pending_ops, ['PUT'])
@@ -6673,7 +7112,7 @@ class TestObjectController(unittest.TestCase):
         req.body = 'TEST'
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 400)
-        self.assertTrue('X-Delete-At in past' in resp.body)
+        self.assertTrue(b'X-Delete-At in past' in resp.body)
 
     def test_POST_can_skip_updating_expirer_queue(self):
         policy = POLICIES.get_by_index(0)
@@ -6735,7 +7174,7 @@ class TestObjectController(unittest.TestCase):
                      'X-Delete-At': str(int(time() - 1))})
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 400)
-        self.assertTrue('X-Delete-At in past' in resp.body)
+        self.assertTrue(b'X-Delete-At in past' in resp.body)
 
     def test_POST_delete_at_in_past_with_skewed_clock(self):
         proxy_server_put_time = 1000
@@ -6777,21 +7216,43 @@ class TestObjectController(unittest.TestCase):
         def my_tpool_execute(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        was_get_hashes = diskfile.DiskFileManager._get_hashes
-        was_tpool_exe = tpool.execute
-        try:
-            diskfile.DiskFileManager._get_hashes = fake_get_hashes
-            tpool.execute = my_tpool_execute
-            req = Request.blank('/sda1/p/suff',
+        with mock.patch.object(diskfile.DiskFileManager, '_get_hashes',
+                               fake_get_hashes), \
+                mock.patch.object(tpool, 'execute', my_tpool_execute), \
+                mock.patch('swift.obj.diskfile.os.path.exists',
+                           return_value=True):
+            req = Request.blank('/sda1/p/',
                                 environ={'REQUEST_METHOD': 'REPLICATE'},
                                 headers={})
             resp = req.get_response(self.object_controller)
             self.assertEqual(resp.status_int, 200)
             p_data = pickle.loads(resp.body)
             self.assertEqual(p_data, {1: 2})
-        finally:
-            tpool.execute = was_tpool_exe
-            diskfile.DiskFileManager._get_hashes = was_get_hashes
+
+    def test_REPLICATE_pickle_protocol(self):
+
+        def fake_get_hashes(*args, **kwargs):
+            return 0, {1: 2}
+
+        def my_tpool_execute(func, *args, **kwargs):
+            return func(*args, **kwargs)
+
+        with mock.patch.object(diskfile.DiskFileManager, '_get_hashes',
+                               fake_get_hashes), \
+                mock.patch.object(tpool, 'execute', my_tpool_execute), \
+                mock.patch('swift.obj.server.pickle.dumps') as fake_pickle, \
+                mock.patch('swift.obj.diskfile.os.path.exists',
+                           return_value=True):
+            req = Request.blank('/sda1/p/',
+                                environ={'REQUEST_METHOD': 'REPLICATE'},
+                                headers={})
+            fake_pickle.return_value = b''
+            req.get_response(self.object_controller)
+            # This is the key assertion: starting in Python 3.0, the
+            # default protocol version is 3, but such pickles can't be read
+            # on Python 2. As long as we may need to talk to a Python 2
+            # process, we need to cap our protocol version.
+            fake_pickle.assert_called_once_with({1: 2}, protocol=2)
 
     def test_REPLICATE_timeout(self):
 
@@ -6801,18 +7262,17 @@ class TestObjectController(unittest.TestCase):
         def my_tpool_execute(func, *args, **kwargs):
             return func(*args, **kwargs)
 
-        was_get_hashes = diskfile.DiskFileManager._get_hashes
-        was_tpool_exe = tpool.execute
-        try:
+        with mock.patch.object(diskfile.DiskFileManager, '_get_hashes',
+                               fake_get_hashes), \
+                mock.patch.object(tpool, 'execute', my_tpool_execute), \
+                mock.patch('swift.obj.diskfile.os.path.exists',
+                           return_value=True):
             diskfile.DiskFileManager._get_hashes = fake_get_hashes
             tpool.execute = my_tpool_execute
-            req = Request.blank('/sda1/p/suff',
+            req = Request.blank('/sda1/p/',
                                 environ={'REQUEST_METHOD': 'REPLICATE'},
                                 headers={})
             self.assertRaises(Timeout, self.object_controller.REPLICATE, req)
-        finally:
-            tpool.execute = was_tpool_exe
-            diskfile.DiskFileManager._get_hashes = was_get_hashes
 
     def test_REPLICATE_reclaims_tombstones(self):
         conf = {'devices': self.testdir, 'mount_check': False,
@@ -6844,21 +7304,37 @@ class TestObjectController(unittest.TestCase):
                 })
             resp = req.get_response(self.object_controller)
             self.assertEqual(resp.status_int, 200)
-            suffix = pickle.loads(resp.body).keys()[0]
+            suffixes = list(pickle.loads(resp.body).keys())
+            self.assertEqual(1, len(suffixes),
+                             'Expected just one suffix; got %r' % (suffixes,))
+            suffix = suffixes[0]
             self.assertEqual(suffix, os.path.basename(
                 os.path.dirname(objfile._datadir)))
             # tombstone still exists
             self.assertTrue(os.path.exists(tombstone_file))
 
-            # after reclaim REPLICATE will rehash
+            # after reclaim REPLICATE will mark invalid (but NOT rehash!)
             replicate_request = Request.blank(
                 '/sda1/0/%s' % suffix, method='REPLICATE',
                 headers={
                     'x-backend-storage-policy-index': int(policy),
                 })
-            the_future = time() + 200
-            with mock.patch('swift.obj.diskfile.time.time') as mock_time:
-                mock_time.return_value = the_future
+            with mock.patch('swift.obj.diskfile.time.time',
+                            return_value=time() + 200):
+                resp = replicate_request.get_response(self.object_controller)
+            self.assertEqual(resp.status_int, 200)
+            self.assertEqual(None, pickle.loads(resp.body))
+            # no rehash means tombstone still exists...
+            self.assertTrue(os.path.exists(tombstone_file))
+
+            # but at some point (like the next pre-sync REPLICATE) it rehashes
+            replicate_request = Request.blank(
+                '/sda1/0/', method='REPLICATE',
+                headers={
+                    'x-backend-storage-policy-index': int(policy),
+                })
+            with mock.patch('swift.obj.diskfile.time.time',
+                            return_value=time() + 200):
                 resp = replicate_request.get_response(self.object_controller)
             self.assertEqual(resp.status_int, 200)
             self.assertEqual({}, pickle.loads(resp.body))
@@ -6867,8 +7343,8 @@ class TestObjectController(unittest.TestCase):
 
             # N.B. with a small reclaim age like this - if proxy clocks get far
             # enough out of whack ...
-            with mock.patch('swift.obj.diskfile.time.time') as mock_time:
-                mock_time.return_value = the_future
+            with mock.patch('swift.obj.diskfile.time.time',
+                            return_value=time() + 200):
                 resp = delete_request.get_response(self.object_controller)
                 # we won't even create the tombstone
                 self.assertFalse(os.path.exists(tombstone_file))
@@ -6881,6 +7357,8 @@ class TestObjectController(unittest.TestCase):
                             headers={})
         resp = req.get_response(self.object_controller)
         self.assertEqual(resp.status_int, 200)
+        self.assertEqual('True',
+                         resp.headers.get('X-Backend-Accept-No-Commit'))
 
     def test_PUT_with_full_drive(self):
 
@@ -6892,8 +7370,8 @@ class TestObjectController(unittest.TestCase):
             def read(self, size=-1):
                 if not self.read_called:
                     self.read_called = True
-                    return 'VERIFY'
-                return ''
+                    return b'VERIFY'
+                return b''
 
         def fake_fallocate(fd, size):
             raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
@@ -6922,7 +7400,7 @@ class TestObjectController(unittest.TestCase):
         global_conf = {}
         object_server.global_conf_callback(preloaded_app_conf, global_conf)
         self.assertEqual(preloaded_app_conf, {})
-        self.assertEqual(global_conf.keys(), ['replication_semaphore'])
+        self.assertEqual(list(global_conf.keys()), ['replication_semaphore'])
         try:
             value = global_conf['replication_semaphore'][0].get_value()
         except NotImplementedError:
@@ -6954,8 +7432,8 @@ class TestObjectController(unittest.TestCase):
     def test_serv_reserv(self):
         # Test replication_server flag was set from configuration file.
         conf = {'devices': self.testdir, 'mount_check': 'false'}
-        self.assertEqual(
-            object_server.ObjectController(conf).replication_server, None)
+        self.assertTrue(
+            object_server.ObjectController(conf).replication_server)
         for val in [True, '1', 'True', 'true']:
             conf['replication_server'] = val
             self.assertTrue(
@@ -6988,7 +7466,7 @@ class TestObjectController(unittest.TestCase):
 
         def start_response(*args):
             # Sends args to outbuf
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
         method = 'PUT'
         env = {'REQUEST_METHOD': method,
@@ -7026,7 +7504,7 @@ class TestObjectController(unittest.TestCase):
 
         def start_response(*args):
             # Sends args to outbuf
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
         method = 'PUT'
 
@@ -7045,48 +7523,48 @@ class TestObjectController(unittest.TestCase):
                'wsgi.multiprocess': False,
                'wsgi.run_once': False}
 
-        answer = ['<html><h1>Method Not Allowed</h1><p>The method is not '
-                  'allowed for this resource.</p></html>']
+        answer = [b'<html><h1>Method Not Allowed</h1><p>The method is not '
+                  b'allowed for this resource.</p></html>']
         mock_method = replication(public(lambda x: mock.MagicMock()))
         with mock.patch.object(self.object_controller, method,
                                new=mock_method):
             mock_method.replication = True
-            with mock.patch('time.gmtime',
-                            mock.MagicMock(side_effect=[gmtime(10001.0)])):
-                with mock.patch('time.time',
-                                mock.MagicMock(side_effect=[10000.0,
-                                                            10001.0])):
-                    with mock.patch('os.getpid',
-                                    mock.MagicMock(return_value=1234)):
-                        response = self.object_controller.__call__(
-                            env, start_response)
-                        self.assertEqual(response, answer)
-                        self.assertEqual(
-                            self.logger.get_lines_for_level('info'),
-                            ['None - - [01/Jan/1970:02:46:41 +0000] "PUT'
-                             ' /sda1/p/a/c/o" 405 91 "-" "-" "-" 1.0000 "-"'
-                             ' 1234 -'])
+            with mock.patch('time.time',
+                            mock.MagicMock(side_effect=[10000.0,
+                                                        10001.0, 10001.0])):
+                with mock.patch('os.getpid',
+                                mock.MagicMock(return_value=1234)):
+                    response = self.object_controller.__call__(
+                        env, start_response)
+                    self.assertEqual(response, answer)
+                    self.assertEqual(
+                        self.logger.get_lines_for_level('info'),
+                        ['- - - [01/Jan/1970:02:46:41 +0000] "PUT'
+                         ' /sda1/p/a/c/o" 405 91 "-" "-" "-" 1.0000 "-"'
+                         ' 1234 -'])
 
-    def test_call_incorrect_replication_method(self):
-        inbuf = StringIO()
+    def test_replication_server_call_all_methods(self):
+        inbuf = WsgiBytesIO()
         errbuf = StringIO()
         outbuf = StringIO()
         self.object_controller = object_server.ObjectController(
             {'devices': self.testdir, 'mount_check': 'false',
-             'replication_server': 'true'}, logger=FakeLogger())
+             'replication_server': 'true'}, logger=debug_logger())
 
         def start_response(*args):
             """Sends args to outbuf"""
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
-        obj_methods = ['DELETE', 'PUT', 'HEAD', 'GET', 'POST', 'OPTIONS']
+        obj_methods = ['PUT', 'HEAD', 'GET', 'POST', 'DELETE', 'OPTIONS']
         for method in obj_methods:
             env = {'REQUEST_METHOD': method,
+                   'HTTP_X_TIMESTAMP': next(self.ts).internal,
                    'SCRIPT_NAME': '',
-                   'PATH_INFO': '/sda1/p/a/c',
+                   'PATH_INFO': '/sda1/p/a/c/o',
                    'SERVER_NAME': '127.0.0.1',
                    'SERVER_PORT': '8080',
                    'SERVER_PROTOCOL': 'HTTP/1.0',
+                   'CONTENT_TYPE': 'text/plain',
                    'CONTENT_LENGTH': '0',
                    'wsgi.version': (1, 0),
                    'wsgi.url_scheme': 'http',
@@ -7097,7 +7575,61 @@ class TestObjectController(unittest.TestCase):
                    'wsgi.run_once': False}
             self.object_controller(env, start_response)
             self.assertEqual(errbuf.getvalue(), '')
-            self.assertEqual(outbuf.getvalue()[:4], '405 ')
+            self.assertIn(outbuf.getvalue()[:4], ('201 ', '204 ', '200 '))
+
+    def test_create_reserved_namespace_object(self):
+        path = '/sda1/p/a/%sc/%so' % (utils.RESERVED_STR, utils.RESERVED_STR)
+        req = Request.blank(path, method='PUT', headers={
+            'X-Timestamp': next(self.ts).internal,
+            'Content-Type': 'application/x-test',
+            'Content-Length': 0,
+        })
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status, '201 Created')
+
+    def test_create_reserved_namespace_object_in_user_container(self):
+        path = '/sda1/p/a/c/%so' % utils.RESERVED_STR
+        req = Request.blank(path, method='PUT', headers={
+            'X-Timestamp': next(self.ts).internal,
+            'Content-Type': 'application/x-test',
+            'Content-Length': 0,
+        })
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status, '400 Bad Request', resp.body)
+        self.assertEqual(resp.body, b'Invalid reserved-namespace object in '
+                         b'user-namespace container')
+
+    def test_other_methods_reserved_namespace_object(self):
+        container = get_reserved_name('c')
+        obj = get_reserved_name('o', 'v1')
+        path = '/sda1/p/a/%s/%s' % (container, obj)
+        req = Request.blank(path, method='PUT', headers={
+            'X-Timestamp': next(self.ts).internal,
+            'Content-Type': 'application/x-test',
+            'Content-Length': 0,
+        })
+        resp = req.get_response(self.object_controller)
+        self.assertEqual(resp.status, '201 Created')
+
+        bad_req = Request.blank('/sda1/p/a/c/%s' % obj, method='PUT', headers={
+            'X-Timestamp': next(self.ts).internal})
+        resp = bad_req.get_response(self.object_controller)
+        self.assertEqual(resp.status, '400 Bad Request')
+        self.assertEqual(resp.body, b'Invalid reserved-namespace object '
+                         b'in user-namespace container')
+
+        for method in ('GET', 'POST', 'DELETE'):
+            req.method = method
+            req.headers['X-Timestamp'] = next(self.ts).internal
+            resp = req.get_response(self.object_controller)
+            self.assertEqual(resp.status_int // 100, 2)
+
+            bad_req.method = method
+            req.headers['X-Timestamp'] = next(self.ts).internal
+            resp = bad_req.get_response(self.object_controller)
+            self.assertEqual(resp.status, '400 Bad Request')
+            self.assertEqual(resp.body, b'Invalid reserved-namespace object '
+                             b'in user-namespace container')
 
     def test_not_utf8_and_not_logging_requests(self):
         inbuf = WsgiBytesIO()
@@ -7106,17 +7638,17 @@ class TestObjectController(unittest.TestCase):
         self.object_controller = object_server.ObjectController(
             {'devices': self.testdir, 'mount_check': 'false',
              'replication_server': 'false', 'log_requests': 'false'},
-            logger=FakeLogger())
+            logger=debug_logger())
 
         def start_response(*args):
             # Sends args to outbuf
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
         method = 'PUT'
 
         env = {'REQUEST_METHOD': method,
                'SCRIPT_NAME': '',
-               'PATH_INFO': '/sda1/p/a/c/\x00%20/%',
+               'PATH_INFO': '/sda1/p/a/c/\xd8\x3e%20/%',
                'SERVER_NAME': '127.0.0.1',
                'SERVER_PORT': '8080',
                'SERVER_PROTOCOL': 'HTTP/1.0',
@@ -7129,7 +7661,7 @@ class TestObjectController(unittest.TestCase):
                'wsgi.multiprocess': False,
                'wsgi.run_once': False}
 
-        answer = ['Invalid UTF8 or contains NULL']
+        answer = [b'Invalid UTF8 or contains NULL']
         mock_method = public(lambda x: mock.MagicMock())
         with mock.patch.object(self.object_controller, method,
                                new=mock_method):
@@ -7149,7 +7681,7 @@ class TestObjectController(unittest.TestCase):
 
         def start_response(*args):
             # Sends args to outbuf
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
         method = 'PUT'
 
@@ -7176,7 +7708,7 @@ class TestObjectController(unittest.TestCase):
                                new=mock_put_method):
             response = self.object_controller.__call__(env, start_response)
             self.assertTrue(response[0].startswith(
-                'Traceback (most recent call last):'))
+                b'Traceback (most recent call last):'))
             self.assertEqual(self.logger.get_lines_for_level('error'), [
                 'ERROR __call__ error with %(method)s %(path)s : ' % {
                     'method': 'PUT', 'path': '/sda1/p/a/c/o'},
@@ -7195,7 +7727,7 @@ class TestObjectController(unittest.TestCase):
 
         def start_response(*args):
             # Sends args to outbuf
-            outbuf.writelines(args)
+            outbuf.write(args[0])
 
         method = 'PUT'
 
@@ -7232,15 +7764,14 @@ class TestObjectController(unittest.TestCase):
             '/sda1/p/a/c/o',
             environ={'REQUEST_METHOD': 'HEAD', 'REMOTE_ADDR': '1.2.3.4'})
         self.object_controller.logger = self.logger
-        with mock.patch('time.gmtime', side_effect=[gmtime(10001.0)]), \
-                mock.patch(
-                    'time.time',
-                    side_effect=[10000.0, 10000.0, 10001.0, 10002.0]), \
+        with mock.patch('time.time',
+                        side_effect=[10000.0, 10000.0, 10001.0, 10002.0,
+                                     10002.0]), \
                 mock.patch('os.getpid', return_value=1234):
             req.get_response(self.object_controller)
         self.assertEqual(
             self.logger.get_lines_for_level('info'),
-            ['1.2.3.4 - - [01/Jan/1970:02:46:41 +0000] "HEAD /sda1/p/a/c/o" '
+            ['1.2.3.4 - - [01/Jan/1970:02:46:42 +0000] "HEAD /sda1/p/a/c/o" '
              '404 - "-" "-" "-" 2.0000 "-" 1234 -'])
 
     @patch_policies([StoragePolicy(0, 'zero', True),
@@ -7399,37 +7930,36 @@ class TestObjectController(unittest.TestCase):
                     raise NotInATimeout()
                 return WsgiBytesIO.readline(self, *a, **kw)
 
-        test_data = 'obj data'
+        test_data = b'obj data'
         footer_meta = {
             "X-Object-Sysmeta-Ec-Frag-Index": "7",
-            "Etag": md5(test_data).hexdigest(),
+            "Etag": md5(test_data, usedforsecurity=False).hexdigest(),
         }
-        footer_json = json.dumps(footer_meta)
-        footer_meta_cksum = md5(footer_json).hexdigest()
-        test_doc = "\r\n".join((
-            "--boundary123",
-            "X-Document: object body",
-            "",
+        footer_json = json.dumps(footer_meta).encode('ascii')
+        footer_meta_cksum = md5(
+            footer_json, usedforsecurity=False).hexdigest().encode('ascii')
+        test_doc = b"\r\n".join((
+            b"--boundary123",
+            b"X-Document: object body",
+            b"",
             test_data,
-            "--boundary123",
-            "X-Document: object metadata",
-            "Content-MD5: " + footer_meta_cksum,
-            "",
+            b"--boundary123",
+            b"X-Document: object metadata",
+            b"Content-MD5: " + footer_meta_cksum,
+            b"",
             footer_json,
-            "--boundary123",
-            "X-Document: we got cleverer",
-            "",
-            "stuff stuff meaningless stuuuuuuuuuuff",
-            "--boundary123",
-            "X-Document: we got even cleverer; can you believe it?",
-            "Waneshaft: ambifacient lunar",
-            "Casing: malleable logarithmic",
-            "",
-            "potato potato potato potato potato potato potato",
-            "--boundary123--"
+            b"--boundary123",
+            b"X-Document: we got cleverer",
+            b"",
+            b"stuff stuff meaningless stuuuuuuuuuuff",
+            b"--boundary123",
+            b"X-Document: we got even cleverer; can you believe it?",
+            b"Waneshaft: ambifacient lunar",
+            b"Casing: malleable logarithmic",
+            b"",
+            b"potato potato potato potato potato potato potato",
+            b"--boundary123--"
         ))
-        if six.PY3:
-            test_doc = test_doc.encode('utf-8')
 
         # phase1 - PUT request with object metadata in footer and
         # multiphase commit conversation
@@ -7456,7 +7986,7 @@ class TestObjectController(unittest.TestCase):
         self.assertEqual(resp.status_int, 201)  # sanity check
 
         in_a_timeout[0] = True  # so we can check without an exception
-        self.assertEqual(wsgi_input.read(), '')  # we read all the bytes
+        self.assertEqual(wsgi_input.read(), b'')  # we read all the bytes
 
 
 @patch_policies(test_policies)
@@ -7476,6 +8006,8 @@ class TestObjectServer(unittest.TestCase):
             'devices': self.devices,
             'swift_dir': self.tempdir,
             'mount_check': 'false',
+            # hopefully 1s is long enough to improve gate reliability?
+            'client_timeout': 1,
         }
         self.logger = debug_logger('test-object-server')
         self.app = object_server.ObjectController(
@@ -7496,7 +8028,7 @@ class TestObjectServer(unittest.TestCase):
         resp.close()
 
     def test_expect_on_put(self):
-        test_body = 'test'
+        test_body = b'test'
         headers = {
             'Expect': '100-continue',
             'Content-Length': len(test_body),
@@ -7514,7 +8046,7 @@ class TestObjectServer(unittest.TestCase):
         resp.close()
 
     def test_expect_on_put_footer(self):
-        test_body = 'test'
+        test_body = b'test'
         headers = {
             'Expect': '100-continue',
             'Content-Length': len(test_body),
@@ -7532,7 +8064,7 @@ class TestObjectServer(unittest.TestCase):
         resp.close()
 
     def test_expect_on_put_conflict(self):
-        test_body = 'test'
+        test_body = b'test'
         put_timestamp = utils.Timestamp.now()
         headers = {
             'Expect': '100-continue',
@@ -7561,7 +8093,7 @@ class TestObjectServer(unittest.TestCase):
         resp.close()
 
     def test_multiphase_put_no_mime_boundary(self):
-        test_data = 'obj data'
+        test_data = b'obj data'
         put_timestamp = utils.Timestamp.now().internal
         headers = {
             'Content-Type': 'text/plain',
@@ -7596,10 +8128,13 @@ class TestObjectServer(unittest.TestCase):
         headers = HeaderKeyDict(resp.getheaders())
         self.assertEqual(headers['X-Obj-Multiphase-Commit'], 'yes')
 
-        conn.send('c\r\n--boundary123\r\n')
+        conn.send(b'c\r\n--boundary123\r\n')
 
         # disconnect client
-        conn.sock.fd._sock.close()
+        if six.PY2:
+            conn.sock.fd._sock.close()
+        else:
+            conn.sock.fd._real_close()
         for i in range(2):
             sleep(0)
         self.assertFalse(self.logger.get_lines_for_level('error'))
@@ -7640,24 +8175,25 @@ class TestObjectServer(unittest.TestCase):
         :param finish_body: boolean, if true send "0\r\n\r\n" after test_doc
                             and wait for 100-continue before yielding context
         """
-        test_data = encode_frag_archive_bodies(POLICIES[1], 'obj data')[0]
+        test_data = encode_frag_archive_bodies(POLICIES[1], b'obj data')[0]
         footer_meta = {
             "X-Object-Sysmeta-Ec-Frag-Index": "2",
-            "Etag": md5(test_data).hexdigest(),
+            "Etag": md5(test_data, usedforsecurity=False).hexdigest(),
         }
-        footer_json = json.dumps(footer_meta)
-        footer_meta_cksum = md5(footer_json).hexdigest()
-        test_doc = test_doc or "\r\n".join((
-            "--boundary123",
-            "X-Document: object body",
-            "",
+        footer_json = json.dumps(footer_meta).encode('ascii')
+        footer_meta_cksum = md5(
+            footer_json, usedforsecurity=False).hexdigest().encode('ascii')
+        test_doc = test_doc or b"\r\n".join((
+            b"--boundary123",
+            b"X-Document: object body",
+            b"",
             test_data,
-            "--boundary123",
-            "X-Document: object metadata",
-            "Content-MD5: " + footer_meta_cksum,
-            "",
+            b"--boundary123",
+            b"X-Document: object metadata",
+            b"Content-MD5: " + footer_meta_cksum,
+            b"",
             footer_json,
-            "--boundary123",
+            b"--boundary123",
         ))
 
         # phase1 - PUT request with object metadata in footer and
@@ -7684,10 +8220,10 @@ class TestObjectServer(unittest.TestCase):
             self.assertEqual(resp.status, 100)
             expect_headers = HeaderKeyDict(resp.getheaders())
 
-            to_send = "%x\r\n%s\r\n" % (len(test_doc), test_doc)
+            to_send = b"%x\r\n%s\r\n" % (len(test_doc), test_doc)
             conn.send(to_send)
             if finish_body:
-                conn.send("0\r\n\r\n")
+                conn.send(b"0\r\n\r\n")
                 # verify 100-continue response to mark end of phase1
                 resp = conn.getexpect()
                 self.assertEqual(resp.status, 100)
@@ -7702,13 +8238,17 @@ class TestObjectServer(unittest.TestCase):
 
         # give the object server a little time to trampoline enough to
         # recognize request has finished, or socket has closed or whatever
-        sleep(0.1)
+        sleep(0.01)
 
     def test_multiphase_put_client_disconnect_right_before_commit(self):
         with self._check_multiphase_put_commit_handling() as context:
             conn = context['conn']
-            # just bail stright out
-            conn.sock.fd._sock.close()
+            # just bail straight out
+            if six.PY2:
+                conn.sock.fd._sock.close()
+            else:
+                conn.sock.fd._real_close()
+        sleep(0)
 
         put_timestamp = context['put_timestamp']
         _container_update = context['mock_container_update']
@@ -7736,19 +8276,23 @@ class TestObjectServer(unittest.TestCase):
         with self._check_multiphase_put_commit_handling() as context:
             conn = context['conn']
             # start commit confirmation to start phase2
-            commit_confirmation_doc = "\r\n".join((
-                "X-Document: put commit",
-                "",
-                "commit_confirmation",
-                "--boundary123--",
+            commit_confirmation_doc = b"\r\n".join((
+                b"X-Document: put commit",
+                b"",
+                b"commit_confirmation",
+                b"--boundary123--",
             ))
             # but don't quite the commit body
-            to_send = "%x\r\n%s" % \
+            to_send = b"%x\r\n%s" % \
                 (len(commit_confirmation_doc), commit_confirmation_doc[:-1])
             conn.send(to_send)
 
             # and then bail out
-            conn.sock.fd._sock.close()
+            if six.PY2:
+                conn.sock.fd._sock.close()
+            else:
+                conn.sock.fd._real_close()
+        sleep(0)
 
         put_timestamp = context['put_timestamp']
         _container_update = context['mock_container_update']
@@ -7773,13 +8317,13 @@ class TestObjectServer(unittest.TestCase):
         self.assertFalse(_container_update.called)
 
     def test_multiphase_put_no_metadata_replicated(self):
-        test_data = 'obj data'
-        test_doc = "\r\n".join((
-            "--boundary123",
-            "X-Document: object body",
-            "",
+        test_data = b'obj data'
+        test_doc = b"\r\n".join((
+            b"--boundary123",
+            b"X-Document: object body",
+            b"",
             test_data,
-            "--boundary123",
+            b"--boundary123",
         ))
 
         put_timestamp = utils.Timestamp.now().internal
@@ -7801,13 +8345,13 @@ class TestObjectServer(unittest.TestCase):
 
             conn = context['conn']
             # send commit confirmation to start phase2
-            commit_confirmation_doc = "\r\n".join((
-                "X-Document: put commit",
-                "",
-                "commit_confirmation",
-                "--boundary123--",
+            commit_confirmation_doc = b"\r\n".join((
+                b"X-Document: put commit",
+                b"",
+                b"commit_confirmation",
+                b"--boundary123--",
             ))
-            to_send = "%x\r\n%s\r\n0\r\n\r\n" % \
+            to_send = b"%x\r\n%s\r\n0\r\n\r\n" % \
                 (len(commit_confirmation_doc), commit_confirmation_doc)
             conn.send(to_send)
 
@@ -7840,13 +8384,13 @@ class TestObjectServer(unittest.TestCase):
 
             conn = context['conn']
             # send commit confirmation to start phase2
-            commit_confirmation_doc = "\r\n".join((
-                "X-Document: put commit",
-                "",
-                "commit_confirmation",
-                "--boundary123--",
+            commit_confirmation_doc = b"\r\n".join((
+                b"X-Document: put commit",
+                b"",
+                b"commit_confirmation",
+                b"--boundary123--",
             ))
-            to_send = "%x\r\n%s\r\n0\r\n\r\n" % \
+            to_send = b"%x\r\n%s\r\n0\r\n\r\n" % \
                 (len(commit_confirmation_doc), commit_confirmation_doc)
             conn.send(to_send)
 
@@ -7873,8 +8417,13 @@ class TestObjectServer(unittest.TestCase):
                          'X-Timestamp': put_timestamp.normal,
                          'Content-Type': 'text/plain'}
         for k, v in actual_meta.items():
-            self.assertIsInstance(k, six.binary_type)
-            self.assertIsInstance(v, six.binary_type)
+            # See diskfile.py:_decode_metadata
+            if six.PY2:
+                self.assertIsInstance(k, six.binary_type)
+                self.assertIsInstance(v, six.binary_type)
+            else:
+                self.assertIsInstance(k, six.text_type)
+                self.assertIsInstance(v, six.text_type)
         self.assertIsNotNone(actual_meta.pop('ETag', None))
         self.assertEqual(expected_meta, actual_meta)
         # but no other files
@@ -7885,13 +8434,13 @@ class TestObjectServer(unittest.TestCase):
         self.assertTrue(context['mock_container_update'].called)
 
     def test_multiphase_put_metadata_footer_disconnect(self):
-        test_data = 'obj data'
-        test_doc = "\r\n".join((
-            "--boundary123",
-            "X-Document: object body",
-            "",
+        test_data = b'obj data'
+        test_doc = b"\r\n".join((
+            b"--boundary123",
+            b"X-Document: object body",
+            b"",
             test_data,
-            "--boundary123",
+            b"--boundary123",
         ))
         # eventlet.wsgi won't return < network_chunk_size from a chunked read
         self.app.network_chunk_size = 16
@@ -7902,26 +8451,31 @@ class TestObjectServer(unittest.TestCase):
             # make footer doc
             footer_meta = {
                 "X-Object-Sysmeta-Ec-Frag-Index": "2",
-                "Etag": md5(test_data).hexdigest(),
+                "Etag": md5(test_data, usedforsecurity=False).hexdigest(),
             }
-            footer_json = json.dumps(footer_meta)
-            footer_meta_cksum = md5(footer_json).hexdigest()
+            footer_json = json.dumps(footer_meta).encode('ascii')
+            footer_meta_cksum = md5(
+                footer_json, usedforsecurity=False).hexdigest().encode('ascii')
 
             # send most of the footer doc
-            footer_doc = "\r\n".join((
-                "X-Document: object metadata",
-                "Content-MD5: " + footer_meta_cksum,
-                "",
+            footer_doc = b"\r\n".join((
+                b"X-Document: object metadata",
+                b"Content-MD5: " + footer_meta_cksum,
+                b"",
                 footer_json,
             ))
 
             # but don't send final boundary nor last chunk
-            to_send = "%x\r\n%s\r\n" % \
+            to_send = b"%x\r\n%s\r\n" % \
                 (len(footer_doc), footer_doc)
             conn.send(to_send)
 
             # and then bail out
-            conn.sock.fd._sock.close()
+            if six.PY2:
+                conn.sock.fd._sock.close()
+            else:
+                conn.sock.fd._real_close()
+        sleep(0)
 
         # and make sure it demonstrates the client disconnect
         log_lines = self.logger.get_lines_for_level('info')
@@ -7936,13 +8490,13 @@ class TestObjectServer(unittest.TestCase):
         self.assertFalse(_container_update.called)
 
     def test_multiphase_put_ec_fragment_in_headers_no_footers(self):
-        test_data = 'obj data'
-        test_doc = "\r\n".join((
-            "--boundary123",
-            "X-Document: object body",
-            "",
+        test_data = b'obj data'
+        test_doc = b"\r\n".join((
+            b"--boundary123",
+            b"X-Document: object body",
+            b"",
             test_data,
-            "--boundary123",
+            b"--boundary123",
         ))
 
         # phase1 - PUT request with multiphase commit conversation
@@ -7972,13 +8526,13 @@ class TestObjectServer(unittest.TestCase):
 
             conn = context['conn']
             # send commit confirmation to start phase2
-            commit_confirmation_doc = "\r\n".join((
-                "X-Document: put commit",
-                "",
-                "commit_confirmation",
-                "--boundary123--",
+            commit_confirmation_doc = b"\r\n".join((
+                b"X-Document: put commit",
+                b"",
+                b"commit_confirmation",
+                b"--boundary123--",
             ))
-            to_send = "%x\r\n%s\r\n0\r\n\r\n" % \
+            to_send = b"%x\r\n%s\r\n0\r\n\r\n" % \
                 (len(commit_confirmation_doc), commit_confirmation_doc)
             conn.send(to_send)
 
@@ -8007,11 +8561,11 @@ class TestObjectServer(unittest.TestCase):
         with self._check_multiphase_put_commit_handling() as context:
             conn = context['conn']
             # send commit confirmation to start phase2
-            commit_confirmation_doc = "\r\n".join((
-                "junkjunk",
-                "--boundary123--",
+            commit_confirmation_doc = b"\r\n".join((
+                b"junkjunk",
+                b"--boundary123--",
             ))
-            to_send = "%x\r\n%s\r\n0\r\n\r\n" % \
+            to_send = b"%x\r\n%s\r\n0\r\n\r\n" % \
                 (len(commit_confirmation_doc), commit_confirmation_doc)
             conn.send(to_send)
             resp = conn.getresponse()
@@ -8038,23 +8592,23 @@ class TestObjectServer(unittest.TestCase):
         with self._check_multiphase_put_commit_handling() as context:
             conn = context['conn']
             # send commit confirmation to start phase2
-            commit_confirmation_doc = "\r\n".join((
-                "X-Document: put commit",
-                "",
-                "commit_confirmation",
-                "--boundary123",
-                "X-Document: we got cleverer",
-                "",
-                "stuff stuff meaningless stuuuuuuuuuuff",
-                "--boundary123",
-                "X-Document: we got even cleverer; can you believe it?",
-                "Waneshaft: ambifacient lunar",
-                "Casing: malleable logarithmic",
-                "",
-                "potato potato potato potato potato potato potato",
-                "--boundary123--",
+            commit_confirmation_doc = b"\r\n".join((
+                b"X-Document: put commit",
+                b"",
+                b"commit_confirmation",
+                b"--boundary123",
+                b"X-Document: we got cleverer",
+                b"",
+                b"stuff stuff meaningless stuuuuuuuuuuff",
+                b"--boundary123",
+                b"X-Document: we got even cleverer; can you believe it?",
+                b"Waneshaft: ambifacient lunar",
+                b"Casing: malleable logarithmic",
+                b"",
+                b"potato potato potato potato potato potato potato",
+                b"--boundary123--",
             ))
-            to_send = "%x\r\n%s\r\n0\r\n\r\n" % \
+            to_send = b"%x\r\n%s\r\n0\r\n\r\n" % \
                 (len(commit_confirmation_doc), commit_confirmation_doc)
             conn.send(to_send)
 
@@ -8089,20 +8643,20 @@ class TestObjectServer(unittest.TestCase):
         self.assertTrue(context['mock_container_update'].called)
 
     def test_multiphase_put_drains_extra_commit_junk_disconnect(self):
-        commit_confirmation_doc = "\r\n".join((
-            "X-Document: put commit",
-            "",
-            "commit_confirmation",
-            "--boundary123",
-            "X-Document: we got cleverer",
-            "",
-            "stuff stuff meaningless stuuuuuuuuuuff",
-            "--boundary123",
-            "X-Document: we got even cleverer; can you believe it?",
-            "Waneshaft: ambifacient lunar",
-            "Casing: malleable logarithmic",
-            "",
-            "potato potato potato potato potato potato potato",
+        commit_confirmation_doc = b"\r\n".join((
+            b"X-Document: put commit",
+            b"",
+            b"commit_confirmation",
+            b"--boundary123",
+            b"X-Document: we got cleverer",
+            b"",
+            b"stuff stuff meaningless stuuuuuuuuuuff",
+            b"--boundary123",
+            b"X-Document: we got even cleverer; can you believe it?",
+            b"Waneshaft: ambifacient lunar",
+            b"Casing: malleable logarithmic",
+            b"",
+            b"potato potato potato potato potato potato potato",
         ))
         # eventlet.wsgi won't return < network_chunk_size from a chunked read
         self.app.network_chunk_size = 16
@@ -8110,17 +8664,33 @@ class TestObjectServer(unittest.TestCase):
             conn = context['conn']
             # send commit confirmation and some other stuff
             # but don't send final boundary or last chunk
-            to_send = "%x\r\n%s\r\n" % \
+            to_send = b"%x\r\n%s\r\n" % \
                 (len(commit_confirmation_doc), commit_confirmation_doc)
             conn.send(to_send)
 
             # and then bail out
-            conn.sock.fd._sock.close()
+            if six.PY2:
+                conn.sock.fd._sock.close()
+            else:
+                conn.sock.fd._real_close()
 
-        # and make sure it demonstrates the client disconnect
-        log_lines = self.logger.get_lines_for_level('info')
-        self.assertEqual(len(log_lines), 1)
-        self.assertIn(' 499 ', log_lines[0])
+        # the object server needs to recognize the socket is closed
+        # or at least timeout, we'll have to wait
+        timeout = time() + (self.conf['client_timeout'] + 1)
+        while True:
+            try:
+                # and make sure it demonstrates the client disconnect
+                log_lines = self.logger.get_lines_for_level('info')
+                self.assertEqual(len(log_lines), 1)
+            except AssertionError:
+                if time() < timeout:
+                    sleep(0.01)
+                else:
+                    raise
+            else:
+                break
+        status = log_lines[0].split()[7]
+        self.assertEqual(status, '499')
 
         # verify successful object data and durable state file write
         put_timestamp = context['put_timestamp']
@@ -8197,12 +8767,12 @@ class TestZeroCopy(unittest.TestCase):
         response = self.http_conn.getresponse()
         self.assertEqual(response.status, 200)
         contents = response.read()
-        self.assertEqual(contents, 'obj contents')
+        self.assertEqual(contents, b'obj contents')
 
     def test_GET_big(self):
         # Test with a large-ish object to make sure we handle full socket
         # buffers correctly.
-        obj_contents = 'A' * 4 * 1024 * 1024  # 4 MiB
+        obj_contents = b'A' * 4 * 1024 * 1024  # 4 MiB
         url_path = '/sda1/2100/a/c/o'
 
         self.http_conn.request('PUT', url_path, obj_contents,
@@ -8223,7 +8793,7 @@ class TestZeroCopy(unittest.TestCase):
         url_path = '/sda1/2100/a/c/o'
         ts = '1402601849.47475'
 
-        self.http_conn.request('PUT', url_path, 'obj contents',
+        self.http_conn.request('PUT', url_path, b'obj contents',
                                {'X-Timestamp': ts,
                                 'Content-Type': 'application/test'})
         response = self.http_conn.getresponse()
@@ -8235,13 +8805,13 @@ class TestZeroCopy(unittest.TestCase):
                              obj_hash[-3:], obj_hash, ts + '.data')
 
         with open(fname, 'rb+') as fh:
-            fh.write('XYZ')
+            fh.write(b'XYZ')
 
         self.http_conn.request('GET', url_path)
         response = self.http_conn.getresponse()
         self.assertEqual(response.status, 200)
         contents = response.read()
-        self.assertEqual(contents, 'XYZ contents')
+        self.assertEqual(contents, b'XYZ contents')
 
         self.http_conn.request('GET', url_path)
         response = self.http_conn.getresponse()
@@ -8266,13 +8836,13 @@ class TestZeroCopy(unittest.TestCase):
         response = self.http_conn.getresponse()
         self.assertEqual(response.status, 200)
         contents = response.read()
-        self.assertEqual(contents, '')
+        self.assertEqual(contents, b'')
 
         self.http_conn.request('GET', url_path)
         response = self.http_conn.getresponse()
         self.assertEqual(response.status, 200)  # still there
         contents = response.read()
-        self.assertEqual(contents, '')
+        self.assertEqual(contents, b'')
 
 
 class TestConfigOptionHandling(unittest.TestCase):

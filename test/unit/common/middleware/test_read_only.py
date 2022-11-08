@@ -18,12 +18,13 @@ import unittest
 
 from swift.common.middleware import read_only
 from swift.common.swob import Request
-from test.unit import FakeLogger
+from test.debug_logger import debug_logger
 
 
 class FakeApp(object):
     def __call__(self, env, start_response):
-        return ['204 No Content']
+        start_response('200 OK', [])
+        return [b'Some Content']
 
 
 def start_response(*args):
@@ -32,7 +33,7 @@ def start_response(*args):
 
 read_methods = 'GET HEAD'.split()
 write_methods = 'COPY DELETE POST PUT'.split()
-ro_resp = ['Writes are disabled for this account.']
+ro_resp = [b'Writes are disabled for this account.']
 
 
 class TestReadOnly(unittest.TestCase):
@@ -42,15 +43,15 @@ class TestReadOnly(unittest.TestCase):
         }
 
         ro = read_only.filter_factory(conf)(FakeApp())
-        ro.logger = FakeLogger()
+        ro.logger = debug_logger()
 
         with mock.patch('swift.common.middleware.read_only.get_info',
                         return_value={}):
             for method in read_methods + write_methods:
-                req = Request.blank('/v/a')
+                req = Request.blank('/v1/a')
                 req.method = method
                 resp = ro(req.environ, start_response)
-                self.assertTrue(resp[0].startswith('204'))
+                self.assertEqual(resp, [b'Some Content'])
 
     def test_global_read_only_on(self):
         conf = {
@@ -58,18 +59,18 @@ class TestReadOnly(unittest.TestCase):
         }
 
         ro = read_only.filter_factory(conf)(FakeApp())
-        ro.logger = FakeLogger()
+        ro.logger = debug_logger()
 
         with mock.patch('swift.common.middleware.read_only.get_info',
                         return_value={}):
             for method in read_methods:
-                req = Request.blank('/v/a')
+                req = Request.blank('/v1/a')
                 req.method = method
                 resp = ro(req.environ, start_response)
-                self.assertTrue(resp[0].startswith('204'))
+                self.assertEqual(resp, [b'Some Content'])
 
             for method in write_methods:
-                req = Request.blank('/v/a')
+                req = Request.blank('/v1/a')
                 req.method = method
                 resp = ro(req.environ, start_response)
                 self.assertEqual(ro_resp, resp)
@@ -78,18 +79,18 @@ class TestReadOnly(unittest.TestCase):
         conf = {}
 
         ro = read_only.filter_factory(conf)(FakeApp())
-        ro.logger = FakeLogger()
+        ro.logger = debug_logger()
 
         with mock.patch('swift.common.middleware.read_only.get_info',
                         return_value={'sysmeta': {'read-only': 'true'}}):
             for method in read_methods:
-                req = Request.blank('/v/a')
+                req = Request.blank('/v1/a')
                 req.method = method
                 resp = ro(req.environ, start_response)
-                self.assertTrue(resp[0].startswith('204'))
+                self.assertEqual(resp, [b'Some Content'])
 
             for method in write_methods:
-                req = Request.blank('/v/a')
+                req = Request.blank('/v1/a')
                 req.method = method
                 resp = ro(req.environ, start_response)
                 self.assertEqual(ro_resp, resp)
@@ -98,15 +99,15 @@ class TestReadOnly(unittest.TestCase):
         conf = {}
 
         ro = read_only.filter_factory(conf)(FakeApp())
-        ro.logger = FakeLogger()
+        ro.logger = debug_logger()
 
         with mock.patch('swift.common.middleware.read_only.get_info',
                         return_value={'sysmeta': {'read-only': 'false'}}):
             for method in read_methods + write_methods:
-                req = Request.blank('/v/a')
+                req = Request.blank('/v1/a')
                 req.method = method
                 resp = ro(req.environ, start_response)
-                self.assertTrue(resp[0].startswith('204'))
+                self.assertEqual(resp, [b'Some Content'])
 
     def test_global_read_only_on_account_off(self):
         conf = {
@@ -114,15 +115,15 @@ class TestReadOnly(unittest.TestCase):
         }
 
         ro = read_only.filter_factory(conf)(FakeApp())
-        ro.logger = FakeLogger()
+        ro.logger = debug_logger()
 
         with mock.patch('swift.common.middleware.read_only.get_info',
                         return_value={'sysmeta': {'read-only': 'false'}}):
             for method in read_methods + write_methods:
-                req = Request.blank('/v/a')
+                req = Request.blank('/v1/a')
                 req.method = method
                 resp = ro(req.environ, start_response)
-                self.assertTrue(resp[0].startswith('204'))
+                self.assertEqual(resp, [b'Some Content'])
 
     def test_global_read_only_on_allow_deletes(self):
         conf = {
@@ -131,14 +132,14 @@ class TestReadOnly(unittest.TestCase):
         }
 
         ro = read_only.filter_factory(conf)(FakeApp())
-        ro.logger = FakeLogger()
+        ro.logger = debug_logger()
 
         with mock.patch('swift.common.middleware.read_only.get_info',
                         return_value={}):
-            req = Request.blank('/v/a')
+            req = Request.blank('/v1/a')
             req.method = "DELETE"
             resp = ro(req.environ, start_response)
-            self.assertTrue(resp[0].startswith('204'))
+            self.assertEqual(resp, [b'Some Content'])
 
     def test_account_read_only_on_allow_deletes(self):
         conf = {
@@ -146,14 +147,14 @@ class TestReadOnly(unittest.TestCase):
         }
 
         ro = read_only.filter_factory(conf)(FakeApp())
-        ro.logger = FakeLogger()
+        ro.logger = debug_logger()
 
         with mock.patch('swift.common.middleware.read_only.get_info',
                         return_value={'sysmeta': {'read-only': 'on'}}):
-            req = Request.blank('/v/a')
+            req = Request.blank('/v1/a')
             req.method = "DELETE"
             resp = ro(req.environ, start_response)
-            self.assertTrue(resp[0].startswith('204'))
+            self.assertEqual(resp, [b'Some Content'])
 
     def test_global_read_only_on_destination_account_off_on_copy(self):
         conf = {
@@ -161,7 +162,7 @@ class TestReadOnly(unittest.TestCase):
         }
 
         ro = read_only.filter_factory(conf)(FakeApp())
-        ro.logger = FakeLogger()
+        ro.logger = debug_logger()
 
         def get_fake_read_only(*args, **kwargs):
             if 'b' in args:
@@ -171,16 +172,16 @@ class TestReadOnly(unittest.TestCase):
         with mock.patch('swift.common.middleware.read_only.get_info',
                         get_fake_read_only):
             headers = {'Destination-Account': 'b'}
-            req = Request.blank('/v/a', headers=headers)
+            req = Request.blank('/v1/a', headers=headers)
             req.method = "COPY"
             resp = ro(req.environ, start_response)
-            self.assertTrue(resp[0].startswith('204'))
+            self.assertEqual(resp, [b'Some Content'])
 
     def test_global_read_only_off_destination_account_on_on_copy(self):
         conf = {}
 
         ro = read_only.filter_factory(conf)(FakeApp())
-        ro.logger = FakeLogger()
+        ro.logger = debug_logger()
 
         def get_fake_read_only(*args, **kwargs):
             if 'b' in args:
@@ -190,7 +191,7 @@ class TestReadOnly(unittest.TestCase):
         with mock.patch('swift.common.middleware.read_only.get_info',
                         get_fake_read_only):
             headers = {'Destination-Account': 'b'}
-            req = Request.blank('/v/a', headers=headers)
+            req = Request.blank('/v1/a', headers=headers)
             req.method = "COPY"
             resp = ro(req.environ, start_response)
             self.assertEqual(ro_resp, resp)
@@ -199,7 +200,7 @@ class TestReadOnly(unittest.TestCase):
         conf = {}
 
         ro = read_only.filter_factory(conf)(FakeApp())
-        ro.logger = FakeLogger()
+        ro.logger = debug_logger()
 
         def fake_account_read_only(self, req, account):
             if account == 'a':
@@ -211,26 +212,54 @@ class TestReadOnly(unittest.TestCase):
                 'account_read_only',
                 fake_account_read_only):
             headers = {'Destination-Account': 'b'}
-            req = Request.blank('/v/a', headers=headers)
+            req = Request.blank('/v1/a', headers=headers)
             req.method = "COPY"
             resp = ro(req.environ, start_response)
-            self.assertTrue(resp[0].startswith('204'))
+            self.assertEqual(resp, [b'Some Content'])
 
     def test_global_read_only_off_src_acct_on_dest_acct_on_on_copy(self):
         conf = {}
 
         ro = read_only.filter_factory(conf)(FakeApp())
-        ro.logger = FakeLogger()
+        ro.logger = debug_logger()
 
         with mock.patch(
                 'swift.common.middleware.read_only.ReadOnlyMiddleware.' +
                 'account_read_only',
                 return_value='true'):
             headers = {'Destination-Account': 'b'}
-            req = Request.blank('/v/a', headers=headers)
+            req = Request.blank('/v1/a', headers=headers)
             req.method = "COPY"
             resp = ro(req.environ, start_response)
             self.assertEqual(ro_resp, resp)
+
+    def test_global_read_only_non_swift_path(self):
+        conf = {}
+
+        ro = read_only.filter_factory(conf)(FakeApp())
+        ro.logger = debug_logger()
+
+        def fake_account_read_only(self, req, account):
+            return 'on'
+
+        with mock.patch(
+                'swift.common.middleware.read_only.ReadOnlyMiddleware.' +
+                'account_read_only',
+                fake_account_read_only):
+            req = Request.blank('/auth/v3.14')
+            req.method = "POST"
+            resp = ro(req.environ, start_response)
+            self.assertEqual(resp, [b'Some Content'])
+
+            req = Request.blank('/v1')
+            req.method = "PUT"
+            resp = ro(req.environ, start_response)
+            self.assertEqual(resp, [b'Some Content'])
+
+            req = Request.blank('/v1.0/')
+            req.method = "DELETE"
+            resp = ro(req.environ, start_response)
+            self.assertEqual(resp, [b'Some Content'])
 
 
 if __name__ == '__main__':

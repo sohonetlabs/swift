@@ -15,10 +15,13 @@
 # limitations under the License.
 
 import functools
-from unittest2 import SkipTest
+import six
+from unittest import SkipTest
+from six.moves.urllib.parse import unquote
+from swift.common.utils import quote
+from swift.common.swob import str_to_wsgi
 import test.functional as tf
-from test.functional import cluster_info
-from test.functional.tests import Utils, Base, BaseEnv
+from test.functional.tests import Utils, Base, Base2, BaseEnv
 from test.functional.swift_test_client import Account, Connection, \
     ResponseError
 
@@ -34,7 +37,7 @@ def tearDownModule():
 def requires_domain_remap(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
-        if 'domain_remap' not in cluster_info:
+        if 'domain_remap' not in tf.cluster_info:
             raise SkipTest('Domain Remap is not enabled')
         # domain_remap middleware does not advertise its storage_domain values
         # in swift /info responses so a storage_domain must be configured in
@@ -56,7 +59,7 @@ class TestStaticWebEnv(BaseEnv):
         cls.conn.authenticate()
 
         if cls.static_web_enabled is None:
-            cls.static_web_enabled = 'staticweb' in cluster_info
+            cls.static_web_enabled = 'staticweb' in tf.cluster_info
             if not cls.static_web_enabled:
                 return
 
@@ -74,8 +77,8 @@ class TestStaticWebEnv(BaseEnv):
                    'listings_css',
                    'dir/',
                    'dir/obj',
-                   'dir/subdir/',
-                   'dir/subdir/obj']
+                   'dir/some sub%dir/',
+                   'dir/some sub%dir/obj']
 
         cls.objects = {}
         for item in sorted(objects):
@@ -92,7 +95,7 @@ class TestStaticWebEnv(BaseEnv):
                     'Content-Type': 'application/directory'})
             else:
                 cls.objects[item] = cls.container.file(path)
-                cls.objects[item].write('%s contents' % item)
+                cls.objects[item].write(('%s contents' % item).encode('utf8'))
 
 
 class TestStaticWeb(Base):
@@ -118,7 +121,7 @@ class TestStaticWeb(Base):
 
     @property
     def domain_remap_cont(self):
-        # the storage_domain option is test.conf must be set to one of the
+        # the storage_domain option in test.conf must be set to one of the
         # domain_remap middleware storage_domain values
         return '.'.join(
             (self.env.container.name, self.env.account.conn.account_name,
@@ -153,11 +156,10 @@ class TestStaticWeb(Base):
 
     def _test_redirect_with_slash(self, host, path, anonymous=False):
         self._set_staticweb_headers(listings=True)
-        self.env.account.conn.make_request('GET', path,
-                                           hdrs={'X-Web-Mode': not anonymous,
-                                                 'Host': host},
-                                           cfg={'no_auth_token': anonymous,
-                                                'absolute_path': True})
+        self.env.account.conn.make_request(
+            'GET', path,
+            hdrs={'X-Web-Mode': str(not anonymous), 'Host': host},
+            cfg={'no_auth_token': anonymous, 'absolute_path': True})
 
         self.assert_status(301)
         expected = '%s://%s%s/' % (
@@ -168,12 +170,12 @@ class TestStaticWeb(Base):
     def _test_redirect_slash_direct(self, anonymous):
         host = self.env.account.conn.storage_netloc
         path = '%s/%s' % (self.env.account.conn.storage_path,
-                          self.env.container.name)
+                          quote(self.env.container.name))
         self._test_redirect_with_slash(host, path, anonymous=anonymous)
 
         path = '%s/%s/%s' % (self.env.account.conn.storage_path,
-                             self.env.container.name,
-                             self.env.objects['dir/'].name)
+                             quote(self.env.container.name),
+                             quote(self.env.objects['dir/'].name))
         self._test_redirect_with_slash(host, path, anonymous=anonymous)
 
     def test_redirect_slash_auth_direct(self):
@@ -185,11 +187,11 @@ class TestStaticWeb(Base):
     @requires_domain_remap
     def _test_redirect_slash_remap_acct(self, anonymous):
         host = self.domain_remap_acct
-        path = '/%s' % self.env.container.name
+        path = '/%s' % quote(self.env.container.name)
         self._test_redirect_with_slash(host, path, anonymous=anonymous)
 
-        path = '/%s/%s' % (self.env.container.name,
-                           self.env.objects['dir/'].name)
+        path = '/%s/%s' % (quote(self.env.container.name),
+                           quote(self.env.objects['dir/'].name))
         self._test_redirect_with_slash(host, path, anonymous=anonymous)
 
     def test_redirect_slash_auth_remap_acct(self):
@@ -212,13 +214,14 @@ class TestStaticWeb(Base):
 
     def _test_get_path(self, host, path, anonymous=False, expected_status=200,
                        expected_in=[], expected_not_in=[]):
-        self.env.account.conn.make_request('GET', path,
-                                           hdrs={'X-Web-Mode': not anonymous,
-                                                 'Host': host},
-                                           cfg={'no_auth_token': anonymous,
-                                                'absolute_path': True})
+        self.env.account.conn.make_request(
+            'GET', str_to_wsgi(path),
+            hdrs={'X-Web-Mode': str(not anonymous), 'Host': host},
+            cfg={'no_auth_token': anonymous, 'absolute_path': True})
         self.assert_status(expected_status)
         body = self.env.account.conn.response.read()
+        if not six.PY2:
+            body = body.decode('utf8')
         for string in expected_in:
             self.assertIn(string, body)
         for string in expected_not_in:
@@ -229,13 +232,14 @@ class TestStaticWeb(Base):
         self._set_staticweb_headers(listings=True,
                                     listings_css=(css is not None))
         if title is None:
-            title = path
+            title = unquote(path)
         expected_in = ['Listing of %s' % title] + [
-            '<a href="{0}">{0}</a>'.format(link) for link in links]
+            '<a href="{0}">{1}</a>'.format(quote(link), link)
+            for link in links]
         expected_not_in = notins
         if css:
             expected_in.append('<link rel="stylesheet" type="text/css" '
-                               'href="%s" />' % css)
+                               'href="%s" />' % quote(css))
         self._test_get_path(host, path, anonymous=anonymous,
                             expected_in=expected_in,
                             expected_not_in=expected_not_in)
@@ -244,7 +248,7 @@ class TestStaticWeb(Base):
         objects = self.env.objects
         host = self.env.account.conn.storage_netloc
         path = '%s/%s/' % (self.env.account.conn.storage_path,
-                           self.env.container.name)
+                           quote(self.env.container.name))
         css = objects['listings_css'].name if listings_css else None
         self._test_listing(host, path, anonymous=True, css=css,
                            links=[objects['index'].name,
@@ -252,15 +256,15 @@ class TestStaticWeb(Base):
                            notins=[objects['dir/obj'].name])
 
         path = '%s/%s/%s/' % (self.env.account.conn.storage_path,
-                              self.env.container.name,
-                              objects['dir/'].name)
+                              quote(self.env.container.name),
+                              quote(objects['dir/'].name))
         css = '../%s' % objects['listings_css'].name if listings_css else None
-        self._test_listing(host, path, anonymous=anonymous, css=css,
-                           links=[objects['dir/obj'].name.split('/')[-1],
-                                  objects['dir/subdir/'].name.split('/')[-1]
-                                  + '/'],
-                           notins=[objects['index'].name,
-                                   objects['dir/subdir/obj'].name])
+        self._test_listing(
+            host, path, anonymous=anonymous, css=css,
+            links=[objects['dir/obj'].name.split('/')[-1],
+                   objects['dir/some sub%dir/'].name.split('/')[-1] + '/'],
+            notins=[objects['index'].name,
+                    objects['dir/some sub%dir/obj'].name])
 
     def test_listing_auth_direct_without_css(self):
         self._test_listing_direct(False, False)
@@ -293,13 +297,12 @@ class TestStaticWeb(Base):
         title = '%s/%s/%s/' % (self.env.account.conn.storage_path,
                                self.env.container.name,
                                objects['dir/'])
-        self._test_listing(host, path, title=title, anonymous=anonymous,
-                           css=css,
-                           links=[objects['dir/obj'].name.split('/')[-1],
-                                  objects['dir/subdir/'].name.split('/')[-1]
-                                  + '/'],
-                           notins=[objects['index'].name,
-                                   objects['dir/subdir/obj'].name])
+        self._test_listing(
+            host, path, title=title, anonymous=anonymous, css=css,
+            links=[objects['dir/obj'].name.split('/')[-1],
+                   objects['dir/some sub%dir/'].name.split('/')[-1] + '/'],
+            notins=[objects['index'].name,
+                    objects['dir/some sub%dir/obj'].name])
 
     def test_listing_auth_remap_acct_without_css(self):
         self._test_listing_remap_acct(False, False)
@@ -332,13 +335,12 @@ class TestStaticWeb(Base):
         title = '%s/%s/%s/' % (self.env.account.conn.storage_path,
                                self.env.container.name,
                                objects['dir/'])
-        self._test_listing(host, path, title=title, anonymous=anonymous,
-                           css=css,
-                           links=[objects['dir/obj'].name.split('/')[-1],
-                                  objects['dir/subdir/'].name.split('/')[-1]
-                                  + '/'],
-                           notins=[objects['index'].name,
-                                   objects['dir/subdir/obj'].name])
+        self._test_listing(
+            host, path, title=title, anonymous=anonymous, css=css,
+            links=[objects['dir/obj'].name.split('/')[-1],
+                   objects['dir/some sub%dir/'].name.split('/')[-1] + '/'],
+            notins=[objects['index'].name,
+                    objects['dir/some sub%dir/obj'].name])
 
     def test_listing_auth_remap_cont_without_css(self):
         self._test_listing_remap_cont(False, False)
@@ -369,12 +371,12 @@ class TestStaticWeb(Base):
         objects = self.env.objects
         host = self.env.account.conn.storage_netloc
         path = '%s/%s/' % (self.env.account.conn.storage_path,
-                           self.env.container.name)
+                           quote(self.env.container.name))
         self._test_index(host, path, anonymous=anonymous)
 
         path = '%s/%s/%s/' % (self.env.account.conn.storage_path,
-                              self.env.container.name,
-                              objects['dir/'].name)
+                              quote(self.env.container.name),
+                              quote(objects['dir/'].name))
         self._test_index(host, path, anonymous=anonymous, expected_status=404)
 
     def test_index_auth_direct(self):
@@ -414,3 +416,11 @@ class TestStaticWeb(Base):
 
     def test_index_anon_remap_cont(self):
         self._test_index_remap_cont(True)
+
+
+class TestStaticWebUTF8(Base2, TestStaticWeb):
+    def test_redirect_slash_auth_remap_cont(self):
+        self.skipTest("Can't remap UTF8 containers")
+
+    def test_redirect_slash_anon_remap_cont(self):
+        self.skipTest("Can't remap UTF8 containers")

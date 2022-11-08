@@ -1,6 +1,7 @@
 [DEFAULT]
 # bind_ip = 0.0.0.0
 bind_port = 8080
+# keep_idle = 600
 # bind_timeout = 30
 # backlog = 4096
 # swift_dir = /etc/swift
@@ -15,12 +16,13 @@ bind_port = 8080
 #
 # Allows the ability to withhold sections from showing up in the public calls
 # to /info.  You can withhold subsections by separating the dict level with a
-# ".".  The following would cause the sections 'container_quotas' and 'tempurl'
-# to not be listed, and the key max_failed_deletes would be removed from
-# bulk_delete.  Default value is 'swift.valid_api_versions' which allows all
-# registered features to be listed via HTTP GET /info except
-# swift.valid_api_versions information
-# disallowed_sections = swift.valid_api_versions, container_quotas, tempurl
+# ".". Default value is 'swift.valid_api_versions, swift.auto_create_account_prefix'
+# which allows all registered features to be listed via HTTP GET /info except
+# swift.valid_api_versions and swift.auto_create_account_prefix information.
+# As an example, the following would cause the sections 'container_quotas' and
+# 'tempurl' to not be listed, and the key max_failed_deletes would be removed from
+# bulk_delete.
+# disallowed_sections = swift.valid_api_versions, container_quotas, tempurl, bulk_delete.max_failed_deletes
 
 # Use an integer to override the number of pre-forked processes that will
 # accept connections.  Should default to the number of effective cpu
@@ -69,14 +71,24 @@ bind_port = 8080
 # log_statsd_sample_rate_factor = 1.0
 # log_statsd_metric_prefix =
 #
+# List of origin hosts that are allowed for CORS requests in addition to what
+# the container has set.
 # Use a comma separated list of full URL (http://foo.bar:1234,https://foo.bar)
 # cors_allow_origin =
+
+# If True (default) then CORS requests are only allowed if their Origin header
+# matches an allowed origin. Otherwise, any Origin is allowed.
 # strict_cors_mode = True
 #
-# Comma separated list of headers to expose through Access-Control-Expose-Headers
+# Comma separated list of headers to expose through Access-Control-Expose-Headers,
+# in addition to the defaults and any headers set in container metadata (see
+# CORS documentation).
 # cors_expose_headers =
 #
-# client_timeout = 60
+# client_timeout = 60.0
+#
+# Note: enabling evenlet_debug might reveal sensitive information, for example
+# signatures for temp urls
 # eventlet_debug = false
 #
 # You can set scheduling priority of processes. Niceness values range from -20
@@ -121,6 +133,31 @@ use = egg:swift#proxy
 # log_handoffs = true
 # recheck_account_existence = 60
 # recheck_container_existence = 60
+#
+# How long the proxy should cache a set of shard ranges for a container when
+# the set is to be used for directing object updates.
+# Note that stale shard range info should be fine; updates will still
+# eventually make their way to the correct shard. As a result, you can
+# usually set this much higher than the existence checks above.
+# recheck_updating_shard_ranges = 3600
+#
+# How long the proxy should cache a set of shard ranges for a container when
+# the set is to be used for gathering object listings.
+# Note that stale shard range info might result in incomplete object listings
+# so this value should be set less than recheck_updating_shard_ranges.
+# recheck_listing_shard_ranges = 600
+#
+# For particularly active containers, having information age out of cache can
+# be quite painful: suddenly thousands of requests per second all miss and
+# have to go to disk. By (rarely) going direct to disk regardless of whether
+# data is present in memcache, we can periodically refresh the data in memcache
+# without causing a thundering herd. Values around 0.0 - 0.1 (i.e., one in
+# every thousand requests skips cache, or fewer) are recommended.
+# container_existence_skip_cache_pct = 0.0
+# container_updating_shard_ranges_skip_cache_pct = 0.0
+# container_listing_shard_ranges_skip_cache_pct = 0.0
+# account_existence_skip_cache_pct = 0.0
+#
 # object_chunk_size = 65536
 # client_chunk_size = 65536
 #
@@ -144,7 +181,8 @@ use = egg:swift#proxy
 #
 # How long without an error before a node's error count is reset. This will
 # also be how long before a node is reenabled after suppression is triggered.
-# error_suppression_interval = 60
+# Set to 0 to disable error-limiting.
+# error_suppression_interval = 60.0
 #
 # How many errors can accumulate before a node is temporarily ignored.
 # error_suppression_limit = 10
@@ -170,12 +208,6 @@ use = egg:swift#proxy
 # Comma separated list of Host headers to which the proxy will deny requests.
 # deny_host_headers =
 #
-# Prefix used when automatically creating accounts.
-# auto_create_account_prefix = .
-#
-# Depth of the proxy put queue.
-# put_queue_depth = 10
-#
 # During GET and HEAD requests, storage nodes can be chosen at random
 # (shuffle), by using timing measurements (timing), or by using an explicit
 # region/zone match (affinity). Using timing measurements may allow for lower
@@ -190,12 +222,20 @@ use = egg:swift#proxy
 # the number of seconds configured by timing_expiry.
 # timing_expiry = 300
 #
-# By default on a GET/HEAD swift will connect to a storage node one at a time
-# in a single thread. There is smarts in the order they are hit however. If you
-# turn on concurrent_gets below, then replica count threads will be used.
-# With addition of the concurrency_timeout option this will allow swift to send
-# out GET/HEAD requests to the storage nodes concurrently and answer with the
-# first to respond. With an EC policy the parameter only affects HEAD requests.
+# Normally, you should only be moving one replica's worth of data at a time
+# when rebalancing. If you're rebalancing more aggressively, increase this
+# to avoid erroneously returning a 404 when the primary assignments that
+# *didn't* change get overloaded.
+# rebalance_missing_suppression_count = 1
+#
+# By default on a GET/HEAD swift will connect to a minimum number storage nodes
+# in a minimum number of threads - for replicated data just a single request to
+# a single node one at a time.  When enabled concurrent_gets allows the proxy
+# to use up to replica count threads when waiting on a response.  In
+# conjunction with the concurrency_timeout option this will allow swift to send
+# out GET/HEAD requests to the storage nodes concurrently and answer as soon as
+# the minimum number of backend responses are available - in replicated
+# contexts this will be the first backend replica to respond.
 # concurrent_gets = off
 #
 # This parameter controls how long to wait before firing off the next
@@ -204,6 +244,13 @@ use = egg:swift#proxy
 # between 0 and node_timeout. The default is what ever you set for the
 # conn_timeout parameter.
 # concurrency_timeout = 0.5
+#
+# By default on a EC GET request swift will connect to a minimum number of
+# storage nodes in a minimum number of threads - for erasure coded data, ndata
+# requests to primary nodes are started at the same time.  When greater than
+# zero this option provides additional robustness and may reduce first byte
+# latency by starting additional requests - up to as many as nparity.
+# concurrent_ec_extra_requests = 0
 #
 # Set to the number of nodes to contact for a normal request. You can use
 # '* replicas' at the end to have it use the number given times the number of
@@ -275,6 +322,16 @@ use = egg:swift#proxy
 # Work only with ionice_class.
 # ionice_class =
 # ionice_priority =
+#
+# When upgrading from liberasurecode<=1.5.0, you may want to continue writing
+# legacy CRCs until all nodes are upgraded and capabale of reading fragments
+# with zlib CRCs. liberasurecode>=1.6.2 checks for the environment variable
+# LIBERASURECODE_WRITE_LEGACY_CRC; if set (value doesn't matter), it will use
+# its legacy CRC. Set this option to true or false to ensure the environment
+# variable is or is not set. Leave the option blank or absent to not touch
+# the environment (default). For more information, see
+# https://bugs.launchpad.net/liberasurecode/+bug/1886088
+# write_legacy_ec_crc =
 
 # Some proxy-server configuration options may be overridden on a per-policy
 # basis by including per-policy config section(s). The value of any option
@@ -288,6 +345,10 @@ use = egg:swift#proxy
 # write_affinity =
 # write_affinity_node_count =
 # write_affinity_handoff_delete_count =
+# rebalance_missing_suppression_count = 1
+# concurrent_gets = off
+# concurrency_timeout = 0.5
+# concurrent_ec_extra_requests = 0
 
 [filter:tempauth]
 use = egg:swift#tempauth
@@ -341,8 +402,9 @@ use = egg:swift#tempauth
 #   user64_<account_b64>_<user_b64> = <key> [group] [group] [...] [storage_url]
 # There are special groups of:
 #   .reseller_admin = can do anything to any account for this auth
+#   .reseller_reader = can GET/HEAD anything in any account for this auth
 #   .admin = can do anything within the account
-# If neither of these groups are specified, the user can only access containers
+# If none of these groups are specified, the user can only access containers
 # that have been explicitly allowed for them by a .admin or .reseller_admin.
 # The trailing optional storage_url allows you to specify an alternate url to
 # hand back to the user upon authentication. If not specified, this defaults to
@@ -350,9 +412,11 @@ use = egg:swift#tempauth
 # to what the requester would need to use to reach this host.
 # Here are example entries, required for running the tests:
 user_admin_admin = admin .admin .reseller_admin
+user_admin_auditor = admin_ro .reseller_reader
 user_test_tester = testing .admin
-user_test2_tester2 = testing2 .admin
+user_test_tester2 = testing2 .admin
 user_test_tester3 = testing3
+user_test2_tester2 = testing2 .admin
 user_test5_tester5 = testing5 service
 
 # To enable Keystone authentication you need to have the auth token
@@ -371,7 +435,7 @@ user_test5_tester5 = testing5 service
 # [filter:authtoken]
 # paste.filter_factory = keystonemiddleware.auth_token:filter_factory
 # www_authenticate_uri = http://keystonehost:5000
-# auth_url = http://keystonehost:35357
+# auth_url = http://keystonehost:5000
 # auth_plugin = password
 # The following credentials must match the Keystone credentials for the Swift
 # service and may need to be changed to match your Keystone configuration. The
@@ -450,6 +514,19 @@ user_test5_tester5 = testing5 service
 # move between domains, you should disable backwards compatible name matching
 # in ACLs by setting allow_names_in_acls to false:
 # allow_names_in_acls = true
+#
+# In OpenStack terms, these reader roles are scoped for system: they
+# can read anything across projects and domains.
+# They are used for auditing and compliance fuctions.
+# In Swift terms, these roles are as powerful as the reseller_admin_role,
+# only do not modify the cluster.
+# By default the list of reader roles is empty.
+# system_reader_roles =
+#
+# This is a reader role scoped for a Keystone project.
+# An identity that has this role can read anything in a project, so it is
+# basically a swiftoperator, but read-only.
+# project_reader_roles =
 
 [filter:s3api]
 use = egg:swift#s3api
@@ -459,7 +536,10 @@ use = egg:swift#s3api
 # With either tempauth or your custom auth:
 # - Put s3api just before your auth filter(s) in the pipeline
 # With keystone:
-# - Put s3api and s3token before keystoneauth in the pipeline
+# - Put s3api and s3token before keystoneauth in the pipeline, but after
+#   auth_token
+# If you have ratelimit enabled for Swift requests, you may want to place a
+# second copy after auth to also ratelimit S3 requests.
 #
 # Swift has no concept of the S3's resource owner; the resources
 # (i.e. containers and objects) created via the Swift API have no owner
@@ -475,7 +555,7 @@ use = egg:swift#s3api
 # Set a region name of your Swift cluster.  Note that the s3api doesn't choose
 # a region of the newly created bucket.  This value is used for the
 # GET Bucket location API and v4 signatures calculation.
-# location = US
+# location = us-east-1
 #
 # Set whether to enforce DNS-compliant bucket names. Note that S3 enforces
 # these conventions in all regions except the US Standard region.
@@ -495,6 +575,10 @@ use = egg:swift#s3api
 # operation.
 # max_multi_delete_objects = 1000
 #
+# Set the number of objects to delete at a time with the Multi-Object Delete
+# operation.
+# multi_delete_concurrency = 2
+#
 # If set to 'true', s3api uses its own metadata for ACLs
 # (e.g. X-Container-Sysmeta-S3Api-Acl) to achieve the best S3 compatibility.
 # If set to 'false', s3api tries to use Swift ACLs (e.g. X-Container-Read)
@@ -513,8 +597,8 @@ use = egg:swift#s3api
 # you don't expect.
 # s3_acl = false
 #
-# Specify a host name of your Swift cluster.  This enables virtual-hosted style
-# requests.
+# Specify a (comma-separated) list of host names for your Swift cluster.
+# This enables virtual-hosted style requests.
 # storage_domain =
 #
 # Enable pipeline order check for SLO, s3token, authtoken, keystoneauth
@@ -528,7 +612,9 @@ use = egg:swift#s3api
 # Enable multi-part uploads. (default: true)
 # This is required to store files larger than Swift's max_file_size (by
 # default, 5GiB). Note that has performance implications when deleting objects,
-# as we now have to check for whether there are also segments to delete.
+# as we now have to check for whether there are also segments to delete. The
+# SLO middleware must be in the pipeline after s3api for this option to have
+# effect.
 # allow_multipart_uploads = True
 #
 # Set the maximum number of parts for Upload Part operation.(default: 1000)
@@ -558,6 +644,21 @@ use = egg:swift#s3api
 # AWS S3 document says that each part must be at least 5 MB in a multipart
 # upload, except the last part.
 # min_segment_size = 5242880
+#
+# AWS allows clock skew up to 15 mins; note that older versions of swift/swift3
+# allowed at most 5 mins.
+# allowable_clock_skew = 900
+#
+# CORS preflight requests don't contain enough information for us to
+# identify the account that should be used for the real request, so
+# the allowed origins must be set cluster-wide. (default: blank; all
+# preflight requests will be denied)
+# cors_preflight_allow_origin =
+#
+# AWS will return a 503 Slow Down when clients are making too many requests,
+# but that can make client logs confusing if they only log/give metrics on
+# status ints. Turn this on to return 429 instead.
+# ratelimit_as_client_error = false
 
 # You can override the default log routing for this filter here:
 # log_name = s3api
@@ -576,11 +677,23 @@ reseller_prefix = AUTH_
 # useful if there are multiple auth systems in the proxy pipeline.
 delay_auth_decision = False
 
-# Keystone server details
-auth_uri = http://keystonehost:35357/v3
+# Keystone server details. Note that this differs from how swift3 was
+# configured: in particular, the Keystone API version must be included.
+auth_uri = http://keystonehost:5000/v3
 
 # Connect/read timeout to use when communicating with Keystone
 http_timeout = 10.0
+
+# Number of seconds to cache the S3 secret. By setting this to a positive
+# number, the S3 authorization validation checks can happen locally.
+# secret_cache_duration = 0
+
+# If S3 secret caching is enabled, Keystone auth credentials to be used to
+# validate S3 authorization must be provided here. The appropriate options
+# are the same as used in the authtoken middleware above. The values are
+# likely the same as used in the authtoken middleware.
+# Note that the Keystone auth credentials used by s3token will need to be
+# able to view all project credentials too.
 
 # SSL-related options
 # insecure = False
@@ -589,6 +702,20 @@ http_timeout = 10.0
 
 # You can override the default log routing for this filter here:
 # log_name = s3token
+
+# Secrets may be cached to reduce latency for the client and load on Keystone.
+# Set this to some number of seconds greater than zero to enable caching.
+# secret_cache_duration = 0
+
+# Secret caching requires Keystone credentials similar to the authtoken middleware;
+# these credentials require access to view all project credentials.
+# auth_url = http://keystonehost:5000
+# auth_type = password
+# project_domain_id = default
+# project_name = service
+# user_domain_id = default
+# username = swift
+# password = password
 
 [filter:healthcheck]
 use = egg:swift#healthcheck
@@ -615,20 +742,20 @@ use = egg:swift#memcache
 # follow rfc3986 section-3.2.2, i.e. [::1]:11211)
 # memcache_servers = 127.0.0.1:11211
 #
-# Sets how memcache values are serialized and deserialized:
-# 0 = older, insecure pickle serialization
-# 1 = json serialization but pickles can still be read (still insecure)
-# 2 = json serialization only (secure and the default)
-# If not set here, the value for memcache_serialization_support will be read
-# from /etc/swift/memcache.conf (see memcache.conf-sample).
-# To avoid an instant full cache flush, existing installations should
-# upgrade with 0, then set to 1 and reload, then after some time (24 hours)
-# set to 2 and reload.
-# In the future, the ability to use pickle serialization will be removed.
-# memcache_serialization_support = 2
-#
 # Sets the maximum number of connections to each memcached server per worker
 # memcache_max_connections = 2
+#
+# How long without an error before a server's error count is reset. This will
+# also be how long before a server is reenabled after suppression is triggered.
+# Set to 0 to disable error-limiting.
+# error_suppression_interval = 60.0
+#
+# How many errors can accumulate before a server is temporarily ignored.
+# error_suppression_limit = 10
+#
+# (Optional) Global toggle for TLS usage when comunicating with
+# the caching servers.
+# tls_enabled =
 #
 # More options documented in memcache.conf-sample
 
@@ -687,6 +814,8 @@ use = egg:swift#read_only
 # allow_deletes = false
 # Note: Put after ratelimit in the pipeline.
 
+# Note: needs to be placed before listing_formats;
+# otherwise remapped listings will always be JSON
 [filter:domain_remap]
 use = egg:swift#domain_remap
 # You can override the default log routing for this filter here:
@@ -818,6 +947,17 @@ use = egg:swift#name_check
 # maximum_length = 255
 # forbidden_regexp = /\./|/\.\./|/\.$|/\.\.$
 
+# Note: Etag quoter should be placed just after cache in the pipeline.
+[filter:etag-quoter]
+use = egg:swift#etag_quoter
+# Historically, Swift has emitted bare MD5 hex digests as ETags, which is not
+# RFC compliant. With this middleware in the pipeline, users can opt-in to
+# RFC-compliant ETags on a per-account or per-container basis.
+#
+# Set to true to enable RFC-compliant ETags cluster-wide by default. Users
+# can still opt-out by setting appropriate account or container metadata.
+# enable_by_default = false
+
 [filter:list-endpoints]
 use = egg:swift#list_endpoints
 # list_endpoints_path = /endpoints/
@@ -829,6 +969,10 @@ use = egg:swift#proxy_logging
 # access_log_facility = LOG_LOCAL0
 # access_log_level = INFO
 # access_log_address = /dev/log
+#
+# Log route for this filter. Useful if you want to have different configs for
+# the two proxy-logging filters.
+# access_log_route = proxy-server
 #
 # If set, access_log_udp_host will override access_log_address
 # access_log_udp_host =
@@ -847,16 +991,17 @@ use = egg:swift#proxy_logging
 # list like this: access_log_headers_only = Host, X-Object-Meta-Mtime
 # access_log_headers_only =
 #
-# By default, the X-Auth-Token is logged. To obscure the value,
-# set reveal_sensitive_prefix to the number of characters to log.
-# For example, if set to 12, only the first 12 characters of the
-# token appear in the log. An unauthorized access of the log file
-# won't allow unauthorized usage of the token. However, the first
-# 12 or so characters is unique enough that you can trace/debug
-# token usage. Set to 0 to suppress the token completely (replaced
-# by '...' in the log).
-# Note: reveal_sensitive_prefix will not affect the value
-# logged with access_log_headers=True.
+# The default log format includes several sensitive values in logs:
+#   * X-Auth-Token header
+#   * temp_url_sig query parameter
+#   * Authorization header
+#   * X-Amz-Signature query parameter
+# To prevent an unauthorized access of the log file leading to an unauthorized
+# access of cluster data, only a portion of these values are written, with the
+# remainder replaced by '...' in the log. Set reveal_sensitive_prefix to the
+# number of characters to log.  Set to 0 to suppress the values entirely; set
+# to something large (1000, say) to write full values. Note that some values
+# may start appearing in full at values as low as 33.
 # reveal_sensitive_prefix = 16
 #
 # What HTTP methods are allowed for StatsD logging (comma-sep); request methods
@@ -868,6 +1013,17 @@ use = egg:swift#proxy_logging
 # middleware and never made it through to the right-most middleware (and
 # proxy server). Double logging is prevented for normal requests. See
 # proxy-logging docs.
+#
+# Hashing algorithm for log anonymization. Must be one of algorithms supported
+# by Python's hashlib.
+# log_anonymization_method = MD5
+#
+# Salt added during log anonymization
+# log_anonymization_salt =
+#
+# Template used to format access logs. All words surrounded by curly brackets
+# will be substituted with the appropriate values
+# log_msg_template = {client_ip} {remote_addr} {end_time.datetime} {method} {path} {protocol} {status_int} {referer} {user_agent} {auth_token} {bytes_recvd} {bytes_sent} {client_etag} {transaction_id} {headers} {request_time} {source} {log_info} {start_time} {end_time} {policy_index}
 
 # Note: Put before both ratelimit and auth in the pipeline.
 [filter:bulk]
@@ -931,6 +1087,13 @@ use = egg:swift#slo
 # clients may request that Swift send whitespace ahead of the final response
 # body. This whitespace will be yielded at most every yield_frequency seconds.
 # yield_frequency = 10
+#
+# Since SLOs may have thousands of segments, clients may request that the
+# object-expirer handle the deletion of segments using query params like
+# `?multipart-manifest=delete&async=on`. You may want to keep this off if it
+# negatively impacts your expirers; in that case, the deletes will still
+# be done as part of the client request.
+# allow_async_delete = false
 
 # Note: Put after auth and staticweb in the pipeline.
 # If you don't put it in the pipeline, it will be inserted for you.
@@ -962,6 +1125,11 @@ use = egg:swift#gatekeeper
 # from a previous storage system, but risks allowing users to upload
 # difficult-to-delete data.
 # shunt_inbound_x_timestamp = true
+#
+# Set this to true if you want to allow clients to access and manipulate the
+# (normally internal-to-swift) null namespace by including a header like
+#    X-Allow-Reserved-Names: true
+# allow_reserved_names_header = false
 #
 # You can override the default log routing for this filter here:
 # set log_name = gatekeeper
@@ -1024,6 +1192,8 @@ use = egg:swift#versioned_writes
 # in the container configuration file, which will be eventually
 # deprecated. See documentation for more details.
 # allow_versioned_writes = false
+# Enables Swift object-versioning API
+# allow_object_versioning = false
 
 # Note: Put after auth and before dlo and slo middlewares.
 # If you don't put it in the pipeline, it will be inserted for you.
@@ -1038,6 +1208,18 @@ use = egg:swift#copy
 [filter:keymaster]
 use = egg:swift#keymaster
 
+# Over time, the format of crypto metadata on disk may change slightly to resolve
+# ambiguities. In general, you want to be writing the newest version, but to
+# ensure that all writes can still be read during rolling upgrades, there's the
+# option to write older formats as well.
+# Before upgrading from Swift 2.20.0 or Swift 2.19.1 or earlier, ensure this is set to 1
+# Before upgrading from Swift 2.25.0 or earlier, ensure this is set to at most 2
+# After upgrading all proxy servers, set this to 3 (currently the highest version)
+#
+# The default is currently 2 to support upgrades with no configuration changes,
+# but may change to 3 in the future.
+meta_version_to_write = 2
+
 # Sets the root secret from which encryption keys are derived. This must be set
 # before first use to a value that is a base64 encoding of at least 32 bytes.
 # The security of all encrypted data critically depends on this key, therefore
@@ -1046,6 +1228,19 @@ use = egg:swift#keymaster
 # cryptographically secure random number generator. Changing the root secret is
 # likely to result in data loss.
 encryption_root_secret = changeme
+
+# Multiple root secrets may be configured using options named
+# 'encryption_root_secret_<secret_id>' where 'secret_id' is a unique
+# identifier. This enables the root secret to be changed from time to time.
+# Only one root secret is used for object PUTs or POSTs at any moment in time.
+# This is specified by the 'active_root_secret_id' option. If
+# 'active_root_secret_id' is not specified then the root secret specified by
+# 'encryption_root_secret' is considered to be the default. Once a root secret
+# has been used as the default root secret it must remain in the config file in
+# order that any objects that were encrypted with it may be subsequently
+# decrypted. The secret_id used to identify the key cannot change.
+# encryption_root_secret_myid = changeme
+# active_root_secret_id = myid
 
 # Sets the path from which the keymaster config options should be read. This
 # allows multiple processes which need to be encryption-aware (for example,
@@ -1071,6 +1266,25 @@ use = egg:swift#kms_keymaster
 # that the encryption keys used are the same. The format expected is similar
 # to other config files, with a single [kms_keymaster] section. See the
 # keymaster.conf-sample file for details on the kms_keymaster configuration
+# options.
+# keymaster_config_path =
+
+# kmip_keymaster middleware may be used to fetch an encryption root secret from
+# a KMIP service. It should replace, in the same position, any other keymaster
+# middleware in the proxy-server pipeline, so that the middleware order is as
+# shown in this example:
+# <other middleware> kmip_keymaster encryption proxy-logging proxy-server
+[filter:kmip_keymaster]
+use = egg:swift#kmip_keymaster
+
+# Sets the path from which the keymaster config options should be read. This
+# allows multiple processes which need to be encryption-aware (for example,
+# proxy-server and container-sync) to share the same config file, ensuring
+# that the encryption keys used are the same. As an added benefit the
+# keymaster configuration file can have different permissions than the
+# `proxy-server.conf` file. The format expected is similar
+# to other config files, with a single [kmip_keymaster] section. See the
+# keymaster.conf-sample file for details on the kmip_keymaster configuration
 # options.
 # keymaster_config_path =
 

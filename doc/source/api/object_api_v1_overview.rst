@@ -97,14 +97,14 @@ interact with the Object Storage API.
 Specifically, the resource path reflects this structure and has this
 format:
 
-.. code::
+.. code:: none
 
     /v1/{account}/{container}/{object}
 
 For example, for the ``flowers/rose.jpg`` object in the ``images``
 container in the ``12345678912345`` account, the resource path is:
 
-.. code::
+.. code:: none
 
     /v1/12345678912345/images/flowers/rose.jpg
 
@@ -133,7 +133,7 @@ parameter ``reverse``, noting that your marker and end_markers should be
 switched when applied to a reverse listing. I.e, for a list of objects
 ``[a, b, c, d, e]`` the non-reversed could be:
 
-.. code::
+.. code:: none
 
   /v1/{account}/{container}/?marker=a&end_marker=d
   b
@@ -141,7 +141,7 @@ switched when applied to a reverse listing. I.e, for a list of objects
 
 However, when reversed marker and end_marker are applied to a reversed list:
 
-.. code::
+.. code:: none
 
   /v1/{account}/{container}/?marker=d&end_marker=a&reverse=on
   c
@@ -171,14 +171,14 @@ The API Reference describes the operations that you can perform with the
 Object Storage API:
 
 -  `Storage
-   accounts <https://developer.openstack.org/api-ref/object-store/index.html#accounts>`__:
+   accounts <https://docs.openstack.org/api-ref/object-store/index.html#accounts>`__:
    Use to perform account-level tasks.
 
    Lists containers for a specified account. Creates, updates, and
    deletes account metadata. Shows account metadata.
 
 -  `Storage
-   containers <https://developer.openstack.org/api-ref/object-store/index.html#containers>`__:
+   containers <https://docs.openstack.org/api-ref/object-store/index.html#containers>`__:
    Use to perform container-level tasks.
 
    Lists objects in a specified container. Creates, shows details for,
@@ -186,7 +186,7 @@ Object Storage API:
    container metadata.
 
 -  `Storage
-   objects <https://developer.openstack.org/api-ref/object-store/index.html#objects>`__:
+   objects <https://docs.openstack.org/api-ref/object-store/index.html#objects>`__:
    Use to perform object-level tasks.
 
    Creates, replaces, shows details for, and deletes objects. Copies

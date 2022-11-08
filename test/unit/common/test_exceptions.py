@@ -26,11 +26,8 @@ class TestExceptions(unittest.TestCase):
         self.assertEqual(str(exceptions.ReplicationException('test')), 'test')
 
     def test_replication_lock_timeout(self):
-        exc = exceptions.ReplicationLockTimeout(15, 'test')
-        try:
+        with exceptions.ReplicationLockTimeout(15, 'test') as exc:
             self.assertTrue(isinstance(exc, exceptions.MessageTimeout))
-        finally:
-            exc.cancel()
 
     def test_client_exception(self):
         strerror = 'test: HTTP://random:888/randompath?foo=1 666 reason: ' \
@@ -45,6 +42,7 @@ class TestExceptions(unittest.TestCase):
                                          http_device='/sdb1',
                                          http_response_content='content')
         self.assertEqual(str(exc), strerror)
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -20,8 +20,8 @@ from textwrap import dedent
 
 import mock
 import errno
-from swift.common.utils import Timestamp
-from test.unit import debug_logger
+from swift.common.utils import Timestamp, readconf
+from test.debug_logger import debug_logger
 from swift.container import sync
 from swift.common.db import DatabaseConnectionError
 from swift.common import utils
@@ -31,8 +31,8 @@ from swift.common.storage_policy import StoragePolicy
 import test
 from test.unit import patch_policies, with_tempdir
 
-utils.HASH_PATH_SUFFIX = 'endcap'
-utils.HASH_PATH_PREFIX = 'endcap'
+utils.HASH_PATH_SUFFIX = b'endcap'
+utils.HASH_PATH_PREFIX = b'endcap'
 
 
 class FakeRing(object):
@@ -86,8 +86,8 @@ class TestContainerSync(unittest.TestCase):
     def test_FileLikeIter(self):
         # Retained test to show new FileLikeIter acts just like the removed
         # _Iter2FileLikeObject did.
-        flo = sync.FileLikeIter(iter(['123', '4567', '89', '0']))
-        expect = '1234567890'
+        flo = sync.FileLikeIter(iter([b'123', b'4567', b'89', b'0']))
+        expect = b'1234567890'
 
         got = flo.read(2)
         self.assertTrue(len(got) <= 2)
@@ -100,13 +100,13 @@ class TestContainerSync(unittest.TestCase):
         expect = expect[len(got):]
 
         self.assertEqual(flo.read(), expect)
-        self.assertEqual(flo.read(), '')
-        self.assertEqual(flo.read(2), '')
+        self.assertEqual(flo.read(), b'')
+        self.assertEqual(flo.read(2), b'')
 
-        flo = sync.FileLikeIter(iter(['123', '4567', '89', '0']))
-        self.assertEqual(flo.read(), '1234567890')
-        self.assertEqual(flo.read(), '')
-        self.assertEqual(flo.read(2), '')
+        flo = sync.FileLikeIter(iter([b'123', b'4567', b'89', b'0']))
+        self.assertEqual(flo.read(), b'1234567890')
+        self.assertEqual(flo.read(), b'')
+        self.assertEqual(flo.read(2), b'')
 
     def assertLogMessage(self, msg_level, expected, skip=0):
         for line in self.logger.get_lines_for_level(msg_level)[skip:]:
@@ -154,9 +154,29 @@ class TestContainerSync(unittest.TestCase):
         sample_conf_filename = os.path.join(
             os.path.dirname(test.__file__),
             '../etc/internal-client.conf-sample')
-        with open(sample_conf_filename) as sample_conf_file:
-            sample_conf = sample_conf_file.read()
-        self.assertEqual(contents, sample_conf)
+        actual_conf = readconf(ConfigString(contents))
+        expected_conf = readconf(sample_conf_filename)
+        actual_conf.pop('__file__')
+        expected_conf.pop('__file__')
+        self.assertEqual(expected_conf, actual_conf)
+
+    def test_init_internal_client_log_name(self):
+        def _do_test_init_ic_log_name(conf, exp_internal_client_log_name):
+            with mock.patch(
+                    'swift.container.sync.InternalClient') \
+                    as mock_ic:
+                sync.ContainerSync(conf, container_ring='dummy object')
+            mock_ic.assert_called_once_with(
+                'conf-path',
+                'Swift Container Sync', 3,
+                global_conf={'log_name': exp_internal_client_log_name},
+                use_replication_network=True)
+
+        _do_test_init_ic_log_name({'internal_client_conf_path': 'conf-path'},
+                                  'container-sync-ic')
+        _do_test_init_ic_log_name({'internal_client_conf_path': 'conf-path',
+                                   'log_name': 'my-container-sync'},
+                                  'my-container-sync-ic')
 
     def test_run_forever(self):
         # This runs runs_forever with fakes to succeed for two loops, the first
@@ -189,7 +209,7 @@ class TestContainerSync(unittest.TestCase):
                 mock.patch('swift.container.sync.sleep', fake_sleep), \
                 mock.patch(gen_func) as fake_generator, \
                 mock.patch('swift.container.sync.ContainerBroker',
-                           lambda p: FakeContainerBroker(p, info={
+                           lambda p, logger: FakeContainerBroker(p, info={
                                'account': 'a', 'container': 'c',
                                'storage_policy_index': 0})):
             fake_generator.side_effect = [iter(['container.db']),
@@ -235,7 +255,7 @@ class TestContainerSync(unittest.TestCase):
                 mock.patch('swift.container.sync.time', fake_time), \
                 mock.patch(gen_func) as fake_generator, \
                 mock.patch('swift.container.sync.ContainerBroker',
-                           lambda p: FakeContainerBroker(p, info={
+                           lambda p, logger: FakeContainerBroker(p, info={
                                'account': 'a', 'container': 'c',
                                'storage_policy_index': 0})):
             fake_generator.side_effect = [iter(['container.db']),
@@ -337,7 +357,7 @@ class TestContainerSync(unittest.TestCase):
             self.assertEqual(['10.0.0.0'], cs._myips)
         orig_ContainerBroker = sync.ContainerBroker
         try:
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0})
             cs._myips = ['127.0.0.1']   # No match
@@ -370,7 +390,7 @@ class TestContainerSync(unittest.TestCase):
             cs = sync.ContainerSync({}, container_ring=cring)
         orig_ContainerBroker = sync.ContainerBroker
         try:
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0}, deleted=False)
             cs._myips = ['10.0.0.0']    # Match
@@ -380,7 +400,7 @@ class TestContainerSync(unittest.TestCase):
             cs.container_sync('isa.db')
             self.assertEqual(cs.container_failures, 1)
 
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0}, deleted=True)
             # This complete match will not cause any more container failures
@@ -396,7 +416,7 @@ class TestContainerSync(unittest.TestCase):
             cs = sync.ContainerSync({}, container_ring=cring)
         orig_ContainerBroker = sync.ContainerBroker
         try:
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0,
                          'x_container_sync_point1': -1,
@@ -409,7 +429,7 @@ class TestContainerSync(unittest.TestCase):
             self.assertEqual(cs.container_failures, 0)
             self.assertEqual(cs.container_skips, 1)
 
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0,
                          'x_container_sync_point1': -1,
@@ -423,7 +443,7 @@ class TestContainerSync(unittest.TestCase):
             self.assertEqual(cs.container_failures, 0)
             self.assertEqual(cs.container_skips, 2)
 
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0,
                          'x_container_sync_point1': -1,
@@ -437,7 +457,7 @@ class TestContainerSync(unittest.TestCase):
             self.assertEqual(cs.container_failures, 0)
             self.assertEqual(cs.container_skips, 3)
 
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0,
                          'x_container_sync_point1': -1,
@@ -453,7 +473,7 @@ class TestContainerSync(unittest.TestCase):
             self.assertEqual(cs.container_failures, 1)
             self.assertEqual(cs.container_skips, 3)
 
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0,
                          'x_container_sync_point1': -1,
@@ -478,7 +498,7 @@ class TestContainerSync(unittest.TestCase):
         orig_ContainerBroker = sync.ContainerBroker
         orig_time = sync.time
         try:
-            sync.ContainerBroker = lambda p: FakeContainerBroker(
+            sync.ContainerBroker = lambda p, logger: FakeContainerBroker(
                 p, info={'account': 'a', 'container': 'c',
                          'storage_policy_index': 0,
                          'x_container_sync_point1': -1,
@@ -534,7 +554,7 @@ class TestContainerSync(unittest.TestCase):
                       'x-container-sync-key': ('key', 1)},
             items_since=[{'ROWID': 1, 'name': 'o'}])
         with mock.patch('swift.container.sync.ContainerBroker',
-                        lambda p: fcb), \
+                        lambda p, logger: fcb), \
                 mock.patch('swift.container.sync.hash_path', fake_hash_path):
             cs._myips = ['10.0.0.0']    # Match
             cs._myport = 1000           # Match
@@ -561,7 +581,7 @@ class TestContainerSync(unittest.TestCase):
                                             ('key', 1)},
                                   items_since=[{'ROWID': 1, 'name': 'o'}])
         with mock.patch('swift.container.sync.ContainerBroker',
-                        lambda p: fcb), \
+                        lambda p, logger: fcb), \
                 mock.patch('swift.container.sync.hash_path', fake_hash_path):
             cs._myips = ['10.0.0.0']    # Match
             cs._myport = 1000           # Match
@@ -582,7 +602,8 @@ class TestContainerSync(unittest.TestCase):
             metadata={'x-container-sync-to': ('http://127.0.0.1/a/c', 1),
                       'x-container-sync-key': ('key', 1)},
             items_since=[{'ROWID': 1, 'name': 'o'}])
-        with mock.patch('swift.container.sync.ContainerBroker', lambda p: fcb):
+        with mock.patch('swift.container.sync.ContainerBroker',
+                        lambda p, logger: fcb):
             cs._myips = ['10.0.0.0']    # Match
             cs._myport = 1000           # Match
             cs.allowed_sync_hosts = ['127.0.0.1']
@@ -607,7 +628,7 @@ class TestContainerSync(unittest.TestCase):
             items_since=[{'ROWID': 1, 'name': 'o', 'created_at': '1.2',
                           'deleted': True}])
         with mock.patch('swift.container.sync.ContainerBroker',
-                        lambda p: fcb), \
+                        lambda p, logger: fcb), \
                 mock.patch('swift.container.sync.delete_object',
                            fake_delete_object):
             cs._myips = ['10.0.0.0']    # Match
@@ -631,7 +652,7 @@ class TestContainerSync(unittest.TestCase):
             items_since=[{'ROWID': 1, 'name': 'o', 'created_at': '1.2',
                           'deleted': True}])
         with mock.patch('swift.container.sync.ContainerBroker',
-                        lambda p: fcb), \
+                        lambda p, logger: fcb), \
                 mock.patch('swift.container.sync.delete_object',
                            lambda *x, **y: None):
             cs._myips = ['10.0.0.0']    # Match
@@ -659,7 +680,7 @@ class TestContainerSync(unittest.TestCase):
             def fake_hash_path(account, container, obj, raw_digest=False):
                 # Ensures that no rows match for second loop, ordinal is 0 and
                 # all hashes are 1
-                return '\x01' * 16
+                return b'\x01' * 16
 
             sync.hash_path = fake_hash_path
             fcb = FakeContainerBroker(
@@ -671,7 +692,7 @@ class TestContainerSync(unittest.TestCase):
                 metadata={'x-container-sync-to': ('http://127.0.0.1/a/c', 1),
                           'x-container-sync-key': ('key', 1)},
                 items_since=[{'ROWID': 1, 'name': 'o'}])
-            sync.ContainerBroker = lambda p: fcb
+            sync.ContainerBroker = lambda p, logger: fcb
             cs._myips = ['10.0.0.0']    # Match
             cs._myport = 1000           # Match
             cs.allowed_sync_hosts = ['127.0.0.1']
@@ -685,7 +706,7 @@ class TestContainerSync(unittest.TestCase):
             def fake_hash_path(account, container, obj, raw_digest=False):
                 # Ensures that all rows match for second loop, ordinal is 0 and
                 # all hashes are 0
-                return '\x00' * 16
+                return b'\x00' * 16
 
             def fake_delete_object(*args, **kwargs):
                 pass
@@ -701,7 +722,7 @@ class TestContainerSync(unittest.TestCase):
                 metadata={'x-container-sync-to': ('http://127.0.0.1/a/c', 1),
                           'x-container-sync-key': ('key', 1)},
                 items_since=[{'ROWID': 1, 'name': 'o'}])
-            sync.ContainerBroker = lambda p: fcb
+            sync.ContainerBroker = lambda p, logger: fcb
             cs._myips = ['10.0.0.0']    # Match
             cs._myport = 1000           # Match
             cs.allowed_sync_hosts = ['127.0.0.1']
@@ -723,7 +744,7 @@ class TestContainerSync(unittest.TestCase):
                           'x-container-sync-key': ('key', 1)},
                 items_since=[{'ROWID': 1, 'name': 'o', 'created_at': '1.2',
                               'deleted': True}])
-            sync.ContainerBroker = lambda p: fcb
+            sync.ContainerBroker = lambda p, logger: fcb
             cs._myips = ['10.0.0.0']    # Match
             cs._myport = 1000           # Match
             cs.allowed_sync_hosts = ['127.0.0.1']
@@ -779,7 +800,7 @@ class TestContainerSync(unittest.TestCase):
                 mock.patch('swift.container.sync.hash_path',
                            fake_hash_path), \
                 mock.patch('swift.container.sync.ContainerBroker',
-                           lambda p: fcb):
+                           lambda p, logger: fcb):
             cring = FakeRing()
             cs = sync.ContainerSync({}, container_ring=cring,
                                     logger=self.logger)
@@ -787,18 +808,19 @@ class TestContainerSync(unittest.TestCase):
             cs._myips = ['10.0.0.0']    # Match
             cs._myport = 1000           # Match
             cs.allowed_sync_hosts = ['127.0.0.1']
-            funcType = type(sync.ContainerSync.container_sync_row)
-            cs.container_sync_row = funcType(fake_container_sync_row,
-                                             cs, sync.ContainerSync)
-            cs.container_sync('isa.db')
+            with mock.patch.object(cs, 'container_sync_row',
+                                   fake_container_sync_row):
+                cs.container_sync('isa.db')
             # Succeeds because no rows match
             log_line = cs.logger.get_lines_for_level('info')[0]
             lines = log_line.split(',')
-            self.assertTrue('sync_point2: 5', lines.pop().strip())
-            self.assertTrue('sync_point1: 5', lines.pop().strip())
-            self.assertTrue('bytes: 1100', lines.pop().strip())
-            self.assertTrue('deletes: 2', lines.pop().strip())
-            self.assertTrue('puts: 3', lines.pop().strip())
+            self.assertEqual('total_rows: 1', lines.pop().strip())
+            self.assertEqual('sync_point2: None', lines.pop().strip())
+            self.assertEqual('sync_point1: 5', lines.pop().strip())
+            self.assertEqual('bytes: 0', lines.pop().strip())
+            self.assertEqual('deletes: 0', lines.pop().strip())
+            self.assertEqual('posts: 0', lines.pop().strip())
+            self.assertEqual('puts: 0', lines.pop().strip())
 
     def test_container_sync_row_delete(self):
         self._test_container_sync_row_delete(None, None)
@@ -907,6 +929,24 @@ class TestContainerSync(unittest.TestCase):
             self.assertEqual(cs.container_deletes, 2)
             self.assertEqual(len(exc), 3)
             self.assertEqual(str(exc[-1]), 'test client exception: 404')
+
+            def fake_delete_object(*args, **kwargs):
+                exc.append(ClientException('test client exception',
+                                           http_status=409))
+                raise exc[-1]
+
+            sync.delete_object = fake_delete_object
+            # Success because our tombstone is out of date
+            self.assertTrue(cs.container_sync_row(
+                {'deleted': True,
+                 'name': 'object',
+                 'created_at': '1.2'}, 'http://sync/to/path',
+                'key', FakeContainerBroker('broker'),
+                {'account': 'a', 'container': 'c', 'storage_policy_index': 0},
+                realm, realm_key))
+            self.assertEqual(cs.container_deletes, 3)
+            self.assertEqual(len(exc), 4)
+            self.assertEqual(str(exc[-1]), 'test client exception: 409')
         finally:
             sync.uuid = orig_uuid
             sync.delete_object = orig_delete_object
@@ -954,7 +994,7 @@ class TestContainerSync(unittest.TestCase):
                         'x-container-sync-key': 'key'})
                 expected_headers.update(extra_headers)
                 self.assertDictEqual(expected_headers, headers)
-                self.assertEqual(contents.read(), 'contents')
+                self.assertEqual(contents.read(), b'contents')
                 self.assertEqual(proxy, 'http://proxy')
                 self.assertEqual(timeout, 5.0)
                 self.assertEqual(logger, self.logger)
@@ -978,7 +1018,7 @@ class TestContainerSync(unittest.TestCase):
                          'etag': '"etagvalue"',
                          'x-timestamp': timestamp.internal,
                          'content-type': 'text/plain; swift_bytes=123'},
-                        iter('contents'))
+                        iter([b'contents']))
 
             cs.swift.get_object = fake_get_object
             # Success as everything says it worked.
@@ -1019,7 +1059,7 @@ class TestContainerSync(unittest.TestCase):
                          'other-header': 'other header value',
                          'etag': '"etagvalue"',
                          'content-type': 'text/plain; swift_bytes=123'},
-                        iter('contents'))
+                        iter([b'contents']))
 
             cs.swift.get_object = fake_get_object
 
@@ -1073,7 +1113,7 @@ class TestContainerSync(unittest.TestCase):
                          'etag': '"etagvalue"',
                          'x-static-large-object': 'true',
                          'content-type': 'text/plain; swift_bytes=123'},
-                        iter('contents'))
+                        iter([b'contents']))
 
             cs.swift.get_object = fake_get_object
 
@@ -1156,7 +1196,7 @@ class TestContainerSync(unittest.TestCase):
                 return (200, {'other-header': 'other header value',
                               'x-timestamp': timestamp.internal,
                               'etag': '"etagvalue"'},
-                        iter('contents'))
+                        iter([b'contents']))
 
             def fake_put_object(*args, **kwargs):
                 raise ClientException('test client exception', http_status=401)
